@@ -1,0 +1,17 @@
+{
+  "name": "TechReserve",
+  "short_name": "TechReserve",
+  "description": "Sistema de Gestão de Reserva de Espaços - TechReserve Solutions",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#800000",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/lucide-react/lucide/main/icons/building-2.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

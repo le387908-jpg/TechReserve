@@ -1,0 +1,13 @@
+{
+  "name": "Remix: TechReserve",
+  "description": "Sistema de Gestão de Reserva de Espaços e Calendário de Grade Horária da Fatec Franco da Rocha com timer em tempo real e check-in via QR Code.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API",
+    "PWA",
+    "Real-time Timer",
+    "Reservation Management"
+  ]
+}

@@ -1,0 +1,374 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 0. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 0.1 Primitives & Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isActiveUserDoc(userData) {
+      return (!('bloqueado' in userData) || userData.bloqueado == false) &&
+             (!('inativo' in userData) || userData.inativo == false);
+    }
+
+    // Regra 3: Bloqueio por No-Show restrito estritamente à data exata da falta (blockedDate)
+    function isNotBlockedOnDate(userData, dateStr) {
+      return !('blockedDate' in userData) ||
+             userData.blockedDate == null ||
+             userData.blockedDate != dateStr;
+    }
+
+    // Regra 1: Sala deve estar explicitamente liberada pelo ADM e ativa para reserva de usuários comuns
+    function isRoomReleasedForUser(roomData) {
+      return (!('liberadaParaReserva' in roomData) || roomData.liberadaParaReserva == true) &&
+             !(roomData.get('status', 'ATIVO') in ['INATIVO', 'MANUTENCAO']) &&
+             (!('statusManual' in roomData) || roomData.statusManual != 'MANUTENCAO') &&
+             (!('bloqueadaAte' in roomData) || roomData.bloqueadaAte == null ||
+              (roomData.bloqueadaAte is number && roomData.bloqueadaAte <= request.time.toMillis()));
+    }
+
+    function isBootstrapAdmin() {
+      return isSignedIn() &&
+             request.auth.token.get('email', '') is string &&
+             request.auth.token.get('email', '').size() <= 120 &&
+             request.auth.token.get('email', '').lower() in [
+               'negreirosmikaella@gmail.com',
+               'le387908@gmail.com',
+               'fatec.taquaritinga.2024@gmail.com'
+             ];
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isBootstrapAdmin() ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'USUARIO') == 'ADMIN' &&
+         isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data))
+      );
+    }
+
+    // 1. Connectivity Test
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // 2. USERS (/users/{userId})
+    match /users/{userId} {
+      function isValidUser(data) {
+        return (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
+               data.get('nome', '') is string && data.get('nome', '').size() >= 1 && data.get('nome', '').size() <= 120 &&
+               (!('name' in data) || data.name == null || (data.name is string && data.name.size() <= 120)) &&
+               data.get('email', '') is string && data.get('email', '').size() >= 3 && data.get('email', '').size() <= 120 &&
+               (!('phone' in data) || data.phone == null || (data.phone is string && data.phone.size() <= 20)) &&
+               (!('phoneFormatted' in data) || data.phoneFormatted == null || (data.phoneFormatted is string && data.phoneFormatted.size() <= 24)) &&
+               (!('whatsappNotificationsEnabled' in data) || data.whatsappNotificationsEnabled is bool) &&
+               data.get('role', 'USUARIO') is string && data.get('role', 'USUARIO') in ['ADMIN', 'USUARIO'] &&
+               (!('ra' in data) || data.ra == null || (data.ra is string && data.ra.size() <= 32)) &&
+               (!('tipoVinculo' in data) || data.tipoVinculo == null || (data.tipoVinculo is string && data.tipoVinculo in ['ALUNO', 'SERVIDOR', 'COORDENACAO'])) &&
+               (!('dataNascimento' in data) || data.dataNascimento == null || (data.dataNascimento is string && data.dataNascimento.size() <= 30)) &&
+               (!('aprovado' in data) || data.aprovado is bool) &&
+               (!('bloqueado' in data) || data.bloqueado is bool) &&
+               (!('inativo' in data) || data.inativo is bool) &&
+               (!('blockedDate' in data) || data.blockedDate == null || (data.blockedDate is string && data.blockedDate.size() <= 16)) &&
+               (!('punidoAte' in data) || data.punidoAte == null || data.punidoAte is number) &&
+               (!('motivoPunicao' in data) || data.motivoPunicao == null || (data.motivoPunicao is string && data.motivoPunicao.size() <= 500)) &&
+               (!('avatarUrl' in data) || data.avatarUrl == null || (data.avatarUrl is string && data.avatarUrl.size() <= 2000)) &&
+               (!('curso' in data) || data.curso == null || (data.curso is string && data.curso.size() <= 20)) &&
+               (!('course' in data) || data.course == null || (data.course is string && data.course.size() <= 20)) &&
+               (!('semestre' in data) || data.semestre == null || data.semestre is number) &&
+               (!('semester' in data) || data.semester == null || data.semester is number) &&
+               (!('authCodeSubmitted' in data) || data.authCodeSubmitted == null || (data.authCodeSubmitted is string && data.authCodeSubmitted.size() <= 64)) &&
+               (!('createdAt' in data) || data.createdAt is number) &&
+               (!('updatedAt' in data) || data.updatedAt is number);
+      }
+
+      // PII Isolation: Only profile owner or administrator can read user profile
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isSignedIn() && isValidId(userId) && isOwner(userId) &&
+                    isValidUser(incoming()) &&
+                    isActiveUserDoc(incoming()) &&
+                    incoming().get('createdAt', 0) is number &&
+                    (
+                      incoming().get('role', 'USUARIO') == 'USUARIO' ||
+                      (
+                        incoming().get('role', 'USUARIO') == 'ADMIN' && (
+                          isBootstrapAdmin() ||
+                          (exists(/databases/$(database)/documents/settings/admin_auth) &&
+                           get(/databases/$(database)/documents/settings/admin_auth).data.get('allowAdminSignup', true) == true &&
+                           'authCodeSubmitted' in incoming() &&
+                           incoming().authCodeSubmitted is string &&
+                           incoming().authCodeSubmitted.size() <= 64 &&
+                           incoming().authCodeSubmitted == get(/databases/$(database)/documents/settings/admin_auth).data.get('codeAuth', '')) ||
+                          (!exists(/databases/$(database)/documents/settings/admin_auth) &&
+                           'authCodeSubmitted' in incoming() &&
+                           incoming().authCodeSubmitted is string &&
+                           incoming().authCodeSubmitted.size() <= 64 &&
+                           incoming().authCodeSubmitted == '051325')
+                        )
+                      )
+                    );
+
+      allow update: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
+        isAdmin() ||
+        // Action 1: Owner updates personal profile fields or receives automatic single-day no-show penalty
+        (isOwner(userId) &&
+         isActiveUserDoc(existing()) &&
+         isActiveUserDoc(incoming()) &&
+         incoming().get('email', '') == existing().get('email', '') &&
+         incoming().get('role', 'USUARIO') == existing().get('role', 'USUARIO') &&
+         incoming().get('aprovado', true) == existing().get('aprovado', true) &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'nome', 'name', 'phone', 'phoneFormatted', 'whatsappNotificationsEnabled',
+           'ra', 'tipoVinculo', 'updatedAt', 'avatarUrl',
+           'dataNascimento', 'blockedDate', 'punidoAte', 'motivoPunicao',
+           'curso', 'course', 'semestre', 'semester'
+         ])) ||
+        // Action 2: Standard user self-deactivates (deletes) their own profile -> marked inactive for ADM
+        (isOwner(userId) &&
+         'inativo' in incoming() && incoming().inativo == true &&
+         'bloqueado' in incoming() && incoming().bloqueado == true &&
+         incoming().get('role', 'USUARIO') == existing().get('role', 'USUARIO') &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['inativo', 'bloqueado', 'updatedAt']))
+      );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // 3. SALAS (/salas/{salaId})
+    match /salas/{salaId} {
+      function isValidRoom(data) {
+        return data.get('nome', '') is string && data.get('nome', '').size() >= 1 && data.get('nome', '').size() <= 140 &&
+               (!('id' in data) || (data.id is string && data.id.size() <= 64)) &&
+               (!('codigo' in data) || (data.codigo is string && data.codigo.size() <= 64)) &&
+               (!('categoria' in data) || (data.categoria is string && data.categoria in ['SALA', 'LABORATORIO', 'AUDITORIO', 'ESPECIAL'])) &&
+               (!('andar' in data) || (data.andar is string && data.andar.size() <= 40)) &&
+               data.get('capacidade', 0) is number && data.get('capacidade', 0) >= 0 && data.get('capacidade', 0) <= 5000 &&
+               (!('descricao' in data) || (data.descricao is string && data.descricao.size() <= 800)) &&
+               (!('equipamentos' in data) || (data.equipamentos is list && data.equipamentos.size() <= 30)) &&
+               (!('imagem' in data) || (data.imagem is string && data.imagem.size() <= 4000)) &&
+               data.get('status', 'ATIVO') is string &&
+               data.get('status', 'ATIVO') in ['ATIVO', 'DISPONIVEL', 'RESERVADO', 'EM_USO', 'INATIVO', 'MANUTENCAO'] &&
+               (!('liberadaParaReserva' in data) || data.liberadaParaReserva is bool) &&
+               (!('blocosHorarios' in data) || (data.blocosHorarios is list && data.blocosHorarios.size() <= 30)) &&
+               (!('statusManual' in data) || data.statusManual == null || (data.statusManual is string && data.statusManual in ['DISPONIVEL', 'RESERVADO', 'EM_USO', 'MANUTENCAO'])) &&
+               (!('bloqueadaAte' in data) || data.bloqueadaAte == null || data.bloqueadaAte is number) &&
+               (!('motivoBloqueio' in data) || data.motivoBloqueio == null || (data.motivoBloqueio is string && data.motivoBloqueio.size() <= 400));
+      }
+
+      allow get: if isSignedIn() && isValidId(salaId);
+      allow list: if isSignedIn();
+      allow create: if isAdmin() && isValidId(salaId) && isValidRoom(incoming());
+      allow update: if isAdmin() && isValidId(salaId) && isValidRoom(incoming());
+      allow delete: if isAdmin() && isValidId(salaId);
+    }
+
+    // 4. RESERVAS (/reservas/{reservaId})
+    match /reservas/{reservaId} {
+      function isValidReservation(data) {
+        return data.get('status', '') is string &&
+               data.get('status', '') in ['PENDENTE', 'CONFIRMADA', 'CANCELADA', 'CONCLUIDA', 'PUNIDA'] &&
+               data.get('salaId', '') is string && data.get('salaId', '').size() >= 1 && data.get('salaId', '').size() <= 128 &&
+               (!('salaInstitutionalId' in data) || (data.salaInstitutionalId is string && data.salaInstitutionalId.size() <= 64)) &&
+               (!('salaNome' in data) || (data.salaNome is string && data.salaNome.size() <= 140)) &&
+               data.get('usuarioId', '') is string && data.get('usuarioId', '').size() >= 1 && data.get('usuarioId', '').size() <= 128 &&
+               data.get('data', '') is string && data.get('data', '').size() >= 8 && data.get('data', '').size() <= 16 &&
+               data.get('inicio', '') is string && data.get('inicio', '').size() >= 4 && data.get('inicio', '').size() <= 8 &&
+               data.get('fim', '') is string && data.get('fim', '').size() >= 4 && data.get('fim', '').size() <= 8 &&
+               (!('observacoes' in data) || data.observacoes == null || (data.observacoes is string && data.observacoes.size() <= 600)) &&
+               (!('blockedDate' in data) || data.blockedDate == null || (data.blockedDate is string && data.blockedDate.size() <= 16)) &&
+               (!('punicaoMotivo' in data) || data.punicaoMotivo == null || (data.punicaoMotivo is string && data.punicaoMotivo.size() <= 500)) &&
+               (!('punicaoFim' in data) || data.punicaoFim == null || data.punicaoFim is number) &&
+               (!('checkInExpiracao' in data) || data.checkInExpiracao == null || data.checkInExpiracao is number) &&
+               (!('checkInRealizado' in data) || data.checkInRealizado is bool) &&
+               (!('ocultoParaUsuario' in data) || data.ocultoParaUsuario is bool) &&
+               (!('whatsappConfirmacaoEnviada' in data) || data.whatsappConfirmacaoEnviada is bool) &&
+               (!('whatsappLembreteInicioEnviado' in data) || data.whatsappLembreteInicioEnviado is bool) &&
+               (!('whatsappAlertaDesocupacaoEnviado' in data) || data.whatsappAlertaDesocupacaoEnviado is bool) &&
+               (!('whatsappNoShowEnviado' in data) || data.whatsappNoShowEnviado is bool) &&
+               (!('createdAt' in data) || data.createdAt is number) &&
+               (!('updatedAt' in data) || data.updatedAt is number);
+      }
+
+      allow get: if isSignedIn() && isValidId(reservaId);
+      allow list: if isSignedIn();
+
+      allow create: if isSignedIn() && isValidId(reservaId) && isValidReservation(incoming()) &&
+                    exists(/databases/$(database)/documents/salas/$(incoming().salaId)) && (
+                      (isAdmin() && incoming().status in ['PENDENTE', 'CONFIRMADA']) ||
+                      (isOwner(incoming().usuarioId) &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
+                       isNotBlockedOnDate(get(/databases/$(database)/documents/users/$(request.auth.uid)).data, incoming().data) &&
+                       isRoomReleasedForUser(get(/databases/$(database)/documents/salas/$(incoming().salaId)).data) &&
+                       incoming().status == 'PENDENTE')
+                    );
+
+      allow update: if isSignedIn() && isValidId(reservaId) && isValidReservation(incoming()) && (
+        isAdmin() || (
+          isOwner(existing().usuarioId) &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
+          incoming().usuarioId == existing().usuarioId &&
+          incoming().salaId == existing().salaId && (
+            // Action 1: Prior cancellation before check-in (restores weekly quota)
+            (existing().status == 'PENDENTE' &&
+             incoming().status == 'CANCELADA' &&
+             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt', 'observacoes'])) ||
+            // Action 2: Automatic check-in expiration (No-Show after 5-min QR window -> single-day blockedDate)
+            (existing().status == 'PENDENTE' &&
+             incoming().status == 'PUNIDA' &&
+             incoming().diff(existing()).affectedKeys().hasOnly([
+               'status', 'updatedAt', 'blockedDate', 'punicaoMotivo', 'punicaoFim', 'observacoes', 'whatsappNoShowEnviado'
+             ])) ||
+            // Action 3: Hide closed reservation from personal list
+            (incoming().get('ocultoParaUsuario', false) == true &&
+             incoming().status == existing().status &&
+             incoming().diff(existing()).affectedKeys().hasOnly(['ocultoParaUsuario', 'updatedAt'])) ||
+            // Action 4: Perform QR check-in
+            (existing().status == 'PENDENTE' &&
+             incoming().get('checkInRealizado', false) == true &&
+             incoming().status == 'CONFIRMADA' &&
+             incoming().diff(existing()).affectedKeys().hasOnly(['checkInRealizado', 'status', 'updatedAt'])) ||
+            // Action 5: Update WhatsApp lifecycle alert delivery flags
+            (existing().status in ['PENDENTE', 'CONFIRMADA'] &&
+             incoming().status == existing().status &&
+             incoming().diff(existing()).affectedKeys().hasOnly([
+               'whatsappConfirmacaoEnviada',
+               'whatsappLembreteInicioEnviado',
+               'whatsappAlertaDesocupacaoEnviado',
+               'whatsappNoShowEnviado',
+               'updatedAt'
+             ])) ||
+            // Action 6: Conclude an already checked-in (CONFIRMADA) reservation (preserves weekly quota usage)
+            (existing().status == 'CONFIRMADA' &&
+             incoming().status == 'CONCLUIDA' &&
+             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt', 'observacoes']))
+          )
+        )
+      );
+
+      allow delete: if isAdmin() && isValidId(reservaId);
+    }
+
+    // 5. SCHEDULES (/schedules/{scheduleId})
+    match /schedules/{scheduleId} {
+      function isValidSchedule(data) {
+        return data.get('tipoDoc', '') is string && data.get('tipoDoc', '') in ['GLOBAL_CONFIG', 'EXCEPTION'] &&
+               data.get('updatedAt', 0) is number &&
+               (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
+               (!('reservasAbertas' in data) || data.reservasAbertas is bool) &&
+               (!('horaAberturaSistema' in data) || (data.horaAberturaSistema is number && data.horaAberturaSistema >= 0 && data.horaAberturaSistema <= 23)) &&
+               (!('janelaInicio' in data) || (data.janelaInicio is string && data.janelaInicio.size() <= 8)) &&
+               (!('janelaFim' in data) || (data.janelaFim is string && data.janelaFim.size() <= 8)) &&
+               (!('duracaoBlocoPadraoMinutos' in data) || data.duracaoBlocoPadraoMinutos is number) &&
+               (!('intervaloEntreBlocosMinutos' in data) || data.intervaloEntreBlocosMinutos is number) &&
+               (!('antecedenciaMaximaDias' in data) || data.antecedenciaMaximaDias is number) &&
+               (!('diasSemanaPermitidos' in data) || (data.diasSemanaPermitidos is list && data.diasSemanaPermitidos.size() <= 7)) &&
+               (!('blocosPadrao' in data) || (data.blocosPadrao is list && data.blocosPadrao.size() <= 30)) &&
+               (!('data' in data) || (data.data is string && data.data.size() <= 16)) &&
+               (!('titulo' in data) || (data.titulo is string && data.titulo.size() <= 140)) &&
+               (!('fechado' in data) || data.fechado is bool) &&
+               (!('salaId' in data) || (data.salaId is string && data.salaId.size() <= 128)) &&
+               (!('salaNome' in data) || (data.salaNome is string && data.salaNome.size() <= 140)) &&
+               (!('blocosCustomizados' in data) || (data.blocosCustomizados is list && data.blocosCustomizados.size() <= 30)) &&
+               (!('motivo' in data) || (data.motivo is string && data.motivo.size() <= 400)) &&
+               (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 120));
+      }
+
+      allow get: if isSignedIn() && isValidId(scheduleId);
+      allow list: if isSignedIn();
+      allow create, update: if isAdmin() && isValidId(scheduleId) && isValidSchedule(incoming());
+      allow delete: if isAdmin() && isValidId(scheduleId) && scheduleId != 'global_config';
+    }
+
+    // 6. PUNISHMENTS (/punishments/{punishmentId})
+    match /punishments/{punishmentId} {
+      function isValidPunishment(data) {
+        return data.get('usuarioId', '') is string && data.get('usuarioId', '').size() >= 1 && data.get('usuarioId', '').size() <= 128 &&
+               data.get('usuarioNome', '') is string && data.get('usuarioNome', '').size() <= 120 &&
+               (!('usuarioEmail' in data) || (data.usuarioEmail is string && data.usuarioEmail.size() <= 120)) &&
+               (!('usuarioRa' in data) || (data.usuarioRa is string && data.usuarioRa.size() <= 32)) &&
+               (!('reservaId' in data) || data.reservaId == null || (data.reservaId is string && data.reservaId.size() <= 128)) &&
+               (!('categoriaMotivo' in data) || (data.categoriaMotivo is string && data.categoriaMotivo in ['NO_SHOW', 'MAU_USO', 'ATRASO', 'DESCUMPRIMENTO_NORMAS', 'OUTRO'])) &&
+               data.get('motivo', '') is string && data.get('motivo', '').size() >= 1 && data.get('motivo', '').size() <= 500 &&
+               (!('blockedDate' in data) || data.blockedDate == null || (data.blockedDate is string && data.blockedDate.size() >= 8 && data.blockedDate.size() <= 16)) &&
+               (!('duracaoDias' in data) || data.duracaoDias == null || (data.duracaoDias is number && data.duracaoDias >= 1 && data.duracaoDias <= 365)) &&
+               data.get('dataInicio', 0) is number &&
+               (!('dataFim' in data) || data.dataFim == null || data.dataFim is number) &&
+               data.get('tipo', '') is string && data.get('tipo', '') in ['AUTOMATICA', 'MANUAL'] &&
+               (!('aplicadoPorId' in data) || (data.aplicadoPorId is string && data.aplicadoPorId.size() <= 128)) &&
+               (!('aplicadoPorNome' in data) || (data.aplicadoPorNome is string && data.aplicadoPorNome.size() <= 120)) &&
+               data.get('ativa', false) is bool &&
+               (!('revogadaEm' in data) || data.revogadaEm is number) &&
+               (!('revogadaPorNome' in data) || (data.revogadaPorNome is string && data.revogadaPorNome.size() <= 120));
+      }
+
+      allow get: if isSignedIn() && isValidId(punishmentId) && (isAdmin() || resource.data.usuarioId == request.auth.uid);
+      allow list: if isSignedIn() && (isAdmin() || resource.data.usuarioId == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(punishmentId) && isValidPunishment(incoming()) && (
+                      isAdmin() ||
+                      (isOwner(incoming().usuarioId) && incoming().tipo == 'AUTOMATICA')
+                    );
+      allow update: if isAdmin() && isValidId(punishmentId) && isValidPunishment(incoming());
+      allow delete: if isAdmin() && isValidId(punishmentId);
+    }
+
+    // 7. ADMIN SETTINGS (/settings/{settingId}) - Protects code-auth strictly for ADMIN
+    match /settings/{settingId} {
+      function isValidSetting(data) {
+        return data.get('codeAuth', '') is string && data.get('codeAuth', '').size() >= 4 && data.get('codeAuth', '').size() <= 64 &&
+               data.get('allowAdminSignup', true) is bool &&
+               data.get('updatedAt', 0) is number &&
+               data.get('updatedBy', '') is string && data.get('updatedBy', '').size() <= 128 &&
+               data.get('updatedByName', '') is string && data.get('updatedByName', '').size() <= 120;
+      }
+
+      allow get: if isAdmin() && isValidId(settingId);
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(settingId) && isValidSetting(incoming());
+      allow delete: if false;
+    }
+
+    // 8. AUDIT LOGS (/logs/{logId}) - Immutable Governance Trail
+    match /logs/{logId} {
+      function isValidLog(data) {
+        return data.get('acao', '') is string && data.get('acao', '').size() >= 1 && data.get('acao', '').size() <= 100 &&
+               data.get('usuarioId', '') is string && data.get('usuarioId', '').size() >= 1 && data.get('usuarioId', '').size() <= 128 &&
+               data.get('usuarioNome', '') is string && data.get('usuarioNome', '').size() >= 1 && data.get('usuarioNome', '').size() <= 120 &&
+               data.get('entidade', '') is string &&
+               data.get('entidade', '') in ['USERS', 'SALAS', 'RESERVAS', 'PUNIDAS', 'HORARIOS', 'SISTEMA', 'CHAMADOS', 'WHATSAPP'] &&
+               data.get('detalhes', '') is string && data.get('detalhes', '').size() <= 1000 &&
+               data.get('createdAt', 0) is number;
+      }
+
+      allow get: if isAdmin() && isValidId(logId);
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && isValidId(logId) && isValidLog(incoming());
+      allow update, delete: if false;
+    }
+  }
+}

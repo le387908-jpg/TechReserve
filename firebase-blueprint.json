@@ -1,0 +1,181 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "App user profile with institutional enrollment, WhatsApp contact/notification preferences, RA, role-based access, and single-day no-show moderation state",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "nome": { "type": "string", "maxLength": 120 },
+        "name": { "type": "string", "maxLength": 120 },
+        "email": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 20, "description": "Sanitized digits-only WhatsApp phone number" },
+        "phoneFormatted": { "type": "string", "maxLength": 24, "description": "Masked phone number (e.g. (11) 91234-5678)" },
+        "whatsappNotificationsEnabled": { "type": "boolean", "description": "User opt-in for WhatsApp booking alerts and reminders" },
+        "ra": { "type": "string", "maxLength": 32, "description": "Academic registration or institutional ID" },
+        "tipoVinculo": { "type": "string", "enum": ["ALUNO", "SERVIDOR", "COORDENACAO"] },
+        "dataNascimento": { "type": "string", "format": "date", "maxLength": 20 },
+        "role": { "type": "string", "enum": ["ADMIN", "USUARIO"] },
+        "aprovado": { "type": "boolean" },
+        "bloqueado": { "type": "boolean" },
+        "inativo": { "type": "boolean" },
+        "blockedDate": { "type": "string", "maxLength": 16, "description": "Single ISO date YYYY-MM-DD blocked due to No-Show or single-day restriction" },
+        "punidoAte": { "type": "number" },
+        "motivoPunicao": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "avatarUrl": { "type": "string", "maxLength": 1000 },
+        "curso": { "type": "string", "enum": ["GTI", "GEEE"] },
+        "course": { "type": "string", "enum": ["GTI", "GEEE"] },
+        "semestre": { "type": "number" },
+        "semester": { "type": "number" },
+        "authCodeSubmitted": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "nome", "email", "role", "aprovado", "bloqueado", "createdAt", "updatedAt"]
+    },
+    "Room": {
+      "title": "Room",
+      "description": "Pedagogical space (classroom, laboratory, auditorium) available for reservation when explicitly released by ADM",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "codigo": { "type": "string", "maxLength": 64 },
+        "nome": { "type": "string", "maxLength": 120 },
+        "categoria": { "type": "string", "enum": ["SALA", "LABORATORIO", "AUDITORIO", "ESPECIAL"] },
+        "andar": { "type": "string", "maxLength": 40 },
+        "capacidade": { "type": "number" },
+        "descricao": { "type": "string", "maxLength": 600 },
+        "equipamentos": { "type": "array" },
+        "imagem": { "type": "string", "maxLength": 4000 },
+        "status": { "type": "string", "enum": ["ATIVO", "DISPONIVEL", "RESERVADO", "EM_USO", "INATIVO", "MANUTENCAO"] },
+        "liberadaParaReserva": { "type": "boolean", "description": "Explicit ADM release prerequisite for standard users" },
+        "blocosHorarios": { "type": "array", "description": "Optional room-specific active time blocks released by ADM" },
+        "statusManual": { "type": "string", "enum": ["DISPONIVEL", "RESERVADO", "EM_USO", "MANUTENCAO"] },
+        "bloqueadaAte": { "type": "number" },
+        "motivoBloqueio": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "nome", "capacidade", "descricao", "equipamentos", "imagem", "status", "createdAt", "updatedAt"]
+    },
+    "Reservation": {
+      "title": "Reservation",
+      "description": "Timed booking of an academic space governed by ADM release, 1-per-week quota, and single-day no-show penalty",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "salaId": { "type": "string", "maxLength": 128 },
+        "salaInstitutionalId": { "type": "string", "maxLength": 64 },
+        "salaNome": { "type": "string", "maxLength": 120 },
+        "usuarioId": { "type": "string", "maxLength": 128 },
+        "data": { "type": "string", "maxLength": 16 },
+        "inicio": { "type": "string", "maxLength": 8 },
+        "fim": { "type": "string", "maxLength": 8 },
+        "status": { "type": "string", "enum": ["PENDENTE", "CONFIRMADA", "CANCELADA", "CONCLUIDA", "PUNIDA"] },
+        "checkInExpiracao": { "type": "number" },
+        "checkInRealizado": { "type": "boolean" },
+        "observacoes": { "type": "string", "maxLength": 500 },
+        "blockedDate": { "type": "string", "maxLength": 16 },
+        "punicaoMotivo": { "type": "string", "maxLength": 500 },
+        "punicaoFim": { "type": "number" },
+        "ocultoParaUsuario": { "type": "boolean" },
+        "whatsappConfirmacaoEnviada": { "type": "boolean" },
+        "whatsappLembreteInicioEnviado": { "type": "boolean" },
+        "whatsappAlertaDesocupacaoEnviado": { "type": "boolean" },
+        "whatsappNoShowEnviado": { "type": "boolean" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["salaId", "usuarioId", "data", "inicio", "fim", "status", "createdAt", "updatedAt"]
+    },
+    "ScheduleDocument": {
+      "title": "ScheduleDocument",
+      "description": "Centralized operational booking windows, standard 50-minute class blocks, and date-specific schedule exceptions",
+      "type": "object",
+      "properties": {
+        "tipoDoc": { "type": "string", "enum": ["GLOBAL_CONFIG", "EXCEPTION"] },
+        "reservasAbertas": { "type": "boolean" },
+        "horaAberturaSistema": { "type": "number" },
+        "janelaInicio": { "type": "string", "maxLength": 8 },
+        "janelaFim": { "type": "string", "maxLength": 8 },
+        "duracaoBlocoPadraoMinutos": { "type": "number" },
+        "intervaloEntreBlocosMinutos": { "type": "number" },
+        "antecedenciaMaximaDias": { "type": "number" },
+        "diasSemanaPermitidos": { "type": "array" },
+        "blocosPadrao": { "type": "array" },
+        "data": { "type": "string", "maxLength": 16 },
+        "titulo": { "type": "string", "maxLength": 140 },
+        "fechado": { "type": "boolean" },
+        "salaId": { "type": "string", "maxLength": 128 },
+        "salaNome": { "type": "string", "maxLength": 120 },
+        "blocosCustomizados": { "type": "array" },
+        "motivo": { "type": "string", "maxLength": 400 },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "updatedBy": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["tipoDoc", "updatedAt"]
+    },
+    "Punishment": {
+      "title": "Punishment",
+      "description": "Audit record of single-day No-Show suspension or single-date restriction applied to a user",
+      "type": "object",
+      "properties": {
+        "usuarioId": { "type": "string", "maxLength": 128 },
+        "usuarioNome": { "type": "string", "maxLength": 120 },
+        "usuarioEmail": { "type": "string", "maxLength": 120 },
+        "usuarioRa": { "type": "string", "maxLength": 32 },
+        "reservaId": { "type": "string", "maxLength": 128 },
+        "categoriaMotivo": { "type": "string", "enum": ["NO_SHOW", "MAU_USO", "ATRASO", "DESCUMPRIMENTO_NORMAS", "OUTRO"] },
+        "motivo": { "type": "string", "maxLength": 500 },
+        "blockedDate": { "type": "string", "maxLength": 16, "description": "Exact ISO date YYYY-MM-DD blocked due to No-Show" },
+        "duracaoDias": { "type": "number" },
+        "dataInicio": { "type": "number" },
+        "dataFim": { "type": "number" },
+        "tipo": { "type": "string", "enum": ["AUTOMATICA", "MANUAL"] },
+        "aplicadoPorId": { "type": "string", "maxLength": 128 },
+        "aplicadoPorNome": { "type": "string", "maxLength": 120 },
+        "ativa": { "type": "boolean" },
+        "revogadaEm": { "type": "number" },
+        "revogadaPorNome": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["usuarioId", "usuarioNome", "motivo", "blockedDate", "dataInicio", "tipo", "ativa"]
+    },
+    "AdminAuthSettings": {
+      "title": "AdminAuthSettings",
+      "description": "Protected administrative authorization code (code-auth) configuration",
+      "type": "object",
+      "properties": {
+        "codeAuth": { "type": "string", "minLength": 4, "maxLength": 64 },
+        "allowAdminSignup": { "type": "boolean" },
+        "updatedAt": { "type": "number" },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedByName": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["codeAuth", "allowAdminSignup", "updatedAt", "updatedBy", "updatedByName"]
+    },
+    "Log": {
+      "title": "Log",
+      "description": "Immutable governance audit trail record",
+      "type": "object",
+      "properties": {
+        "acao": { "type": "string", "maxLength": 80 },
+        "usuarioId": { "type": "string", "maxLength": 128 },
+        "usuarioNome": { "type": "string", "maxLength": 120 },
+        "entidade": { "type": "string", "enum": ["USERS", "SALAS", "RESERVAS", "PUNIDAS", "HORARIOS", "SISTEMA", "CHAMADOS", "WHATSAPP"] },
+        "detalhes": { "type": "string", "maxLength": 800 },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["acao", "usuarioId", "usuarioNome", "entidade", "detalhes", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": { "schema": "User", "description": "User profiles with academic enrollment, WhatsApp contact, and single-day no-show moderation status" },
+    "/salas/{salaId}": { "schema": "Room", "description": "Academic spaces inventory (classrooms, laboratories, auditoriums) with ADM booking release controls" },
+    "/reservas/{reservaId}": { "schema": "Reservation", "description": "Space bookings, QR check-in deadlines, weekly quota tracking, and WhatsApp notification flags" },
+    "/schedules/{scheduleId}": { "schema": "ScheduleDocument", "description": "Operational time windows, standard blocks, and date exceptions" },
+    "/punishments/{punishmentId}": { "schema": "Punishment", "description": "Single-day No-Show suspensions and manual date restrictions" },
+    "/settings/{settingId}": { "schema": "AdminAuthSettings", "description": "Protected administrative authorization settings (code-auth)" },
+    "/logs/{logId}": { "schema": "Log", "description": "Auditable governance event logs" }
+  }
+}
