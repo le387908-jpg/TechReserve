@@ -108,7 +108,7 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
       throw new Error('Apenas administradores podem alterar o código de autorização.');
     }
 
-    const cleanCode = codeAuth.trim();
+    const cleanCode = String(codeAuth || '').trim();
     if (cleanCode.length < 4 || cleanCode.length > 64) {
       throw new Error('O código de autorização (code-auth) deve ter entre 4 e 64 caracteres.');
     }
@@ -130,15 +130,18 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
         cleanCode.length > 2
           ? `${'*'.repeat(cleanCode.length - 2)}${cleanCode.slice(-2)}`
           : '****';
-      await useLogStore.getState().addLog({
-        acao: 'ATUALIZAR_CODE_AUTH',
-        usuarioId: user.id,
-        usuarioNome: user.nome,
-        entidade: 'SISTEMA',
-        detalhes: `Código de autorização administrativa (code-auth: ${masked}) atualizado. Novos cadastros ADM: ${
-          allowAdminSignup ? 'Habilitados' : 'Bloqueados'
-        }.`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: 'ATUALIZAR_CODE_AUTH',
+          usuarioId: user.id,
+          usuarioNome: user.nome,
+          entidade: 'SISTEMA',
+          detalhes: `Código de autorização administrativa (code-auth: ${masked}) atualizado. Novos cadastros ADM: ${
+            allowAdminSignup ? 'Habilitados' : 'Bloqueados'
+          }.`,
+        })
+        .catch(() => {});
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'settings/admin_auth');
     }
@@ -227,13 +230,16 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
       });
 
       if (!silentLog) {
-        await useLogStore.getState().addLog({
-          acao: 'ATUALIZAR_INTEGRACAO_WHATSAPP',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'WHATSAPP',
-          detalhes: `Integração WhatsApp (${resolvedProvider} · instância "${cleanInstance}") salva como ativa no Firestore.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'ATUALIZAR_INTEGRACAO_WHATSAPP',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'WHATSAPP',
+            detalhes: `Integração WhatsApp (${resolvedProvider} · instância "${cleanInstance}") salva como ativa no Firestore.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'settings/whatsapp_integration');

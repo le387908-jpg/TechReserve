@@ -4,9 +4,10 @@
  */
 
 import React, { lazy, Suspense } from 'react';
-import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { MainLayout } from '../components/layout/MainLayout';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 
 // Lazy load pages
 const LoginPage = lazy(() => import('../pages/auth/LoginPage').then(m => ({ default: m.LoginPage })));
@@ -22,16 +23,28 @@ function LoadingFallback() {
   return (
     <div className="h-screen w-screen flex items-center justify-center bg-white">
       <div className="flex flex-col items-center gap-4">
-        <div className="h-12 w-12 border-4 border-slate-200 border-t-fatec-red rounded-full animate-spin"></div>
+        <div className="h-12 w-12 border-4 border-slate-200 border-t-fatec-red rounded-full animate-spin" />
         <p className="text-slate-500 font-medium">Carregando TechReserve...</p>
       </div>
     </div>
   );
 }
 
-function ProtectedRoute({ children, adminOnly = false }: { children: React.ReactNode, adminOnly?: boolean }) {
+function InlineRouteFallback() {
+  return (
+    <div className="min-h-[50vh] w-full flex items-center justify-center">
+      <div className="flex flex-col items-center gap-3">
+        <div className="h-9 w-9 border-4 border-slate-200 border-t-fatec-red rounded-full animate-spin" />
+        <p className="text-sm text-slate-500 font-medium">Carregando seção...</p>
+      </div>
+    </div>
+  );
+}
+
+function ProtectedRoute({ children, adminOnly = false }: { children: React.ReactNode; adminOnly?: boolean }) {
   const { user, initialized } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
 
   if (!initialized) {
     return <LoadingFallback />;
@@ -41,11 +54,23 @@ function ProtectedRoute({ children, adminOnly = false }: { children: React.React
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
-  if (adminOnly && user.role !== 'ADMIN') {
+  if (adminOnly && user?.role !== 'ADMIN') {
     return <Navigate to="/salas" replace />;
   }
 
-  return <MainLayout>{children}</MainLayout>;
+  return (
+    <MainLayout>
+      <ErrorBoundary
+        resetKey={location.pathname}
+        variant="inline"
+        onGoHome={() => navigate(user?.role === 'ADMIN' ? '/admin' : '/salas')}
+      >
+        <Suspense fallback={<InlineRouteFallback />}>
+          {children}
+        </Suspense>
+      </ErrorBoundary>
+    </MainLayout>
+  );
 }
 
 function HomeRedirect() {
@@ -56,7 +81,7 @@ function HomeRedirect() {
   if (!user) {
     return <Navigate to="/login" replace />;
   }
-  return <Navigate to={user.role === 'ADMIN' ? '/admin' : '/salas'} replace />;
+  return <Navigate to={user?.role === 'ADMIN' ? '/admin' : '/salas'} replace />;
 }
 
 export function AppRoutes() {

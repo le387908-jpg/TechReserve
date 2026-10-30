@@ -8,6 +8,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Mail, Lock, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAuth } from '../../context/AuthContext';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { Logo } from '../../components/Logo';
 
 export function LoginPage() {
@@ -44,10 +45,10 @@ export function LoginPage() {
       toast.success(`E-mail de redefinição enviado com sucesso para ${cleanEmail}! Verifique sua caixa de entrada e também a pasta de SPAM.`);
     } catch (err: any) {
       console.error('Password reset error:', err);
-      let errorMsg = 'Erro ao enviar e-mail de redefinição.';
-      if (err.code === 'auth/user-not-found') {
+      let errorMsg = getFriendlyErrorMessage(err, 'Erro ao enviar e-mail de redefinição.');
+      if (err?.code === 'auth/user-not-found') {
         errorMsg = 'Usuário não encontrado com este e-mail.';
-      } else if (err.code === 'auth/invalid-email') {
+      } else if (err?.code === 'auth/invalid-email') {
         errorMsg = 'E-mail inválido.';
       }
       toast.error(errorMsg);
@@ -62,9 +63,9 @@ export function LoginPage() {
       await signIn(email, password);
       toast.success('Login realizado com sucesso!');
       navigate('/');
-    } catch (err: any) {
+    } catch (err) {
       console.error('Login submit error:', err);
-      toast.error(err.message || 'E-mail ou senha incorretos.');
+      toast.error(getFriendlyErrorMessage(err, 'E-mail ou senha incorretos.'));
     }
   };
 

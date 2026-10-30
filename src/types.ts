@@ -167,7 +167,7 @@ export interface Reservation {
   updatedAt: number;
 }
 
-export type AvailableSlotStatus = 'liberado' | 'ativo' | 'bloqueado' | 'inativo';
+export type AvailableSlotStatus = 'liberado' | 'ativo' | 'disponivel' | 'bloqueado' | 'inativo';
 
 /**
  * Registro explícito de liberação de horário pelo Administrador na coleção `available_slots`.
@@ -175,12 +175,13 @@ export type AvailableSlotStatus = 'liberado' | 'ativo' | 'bloqueado' | 'inativo'
  */
 export interface AvailableSlot {
   id: string;
-  salaId: string; // Firestore doc ID em `salas`
+  salaId: string; // Firestore doc ID em `salas` (ou `roomId` normalizado)
   salaInstitutionalId?: string; // Ex: LAB-001, SALA-003
   salaNome: string;
-  data: string; // YYYY-MM-DD
+  data: string; // YYYY-MM-DD (ou `date` normalizado)
   inicio: string; // HH:mm
   fim: string; // HH:mm
+  timeSlot?: string; // Ex: "19:00 - 19:50"
   label?: string;
   status: AvailableSlotStatus;
   ativo: boolean;
@@ -326,7 +327,7 @@ export interface CalendarEvent {
   salaInstitutionalId?: string;
   horarioInicio: string;
   horarioFim: string;
-  cor: 'verde' | 'vermelho';
+  cor: 'azul' | 'verde' | 'vermelho';
   status?: string;
   data?: string;
   observacoes?: string;
@@ -336,9 +337,12 @@ export interface CalendarEvent {
 /**
  * Infere a categoria pedagógica do ambiente caso o documento legado não possua o campo `categoria`.
  */
-export function inferSpaceCategory(room: Pick<Room, 'id' | 'codigo' | 'nome' | 'categoria'>): SpaceCategory {
+export function inferSpaceCategory(
+  room?: Partial<Pick<Room, 'id' | 'codigo' | 'nome' | 'categoria'>> | null
+): SpaceCategory {
+  if (!room) return 'SALA';
   if (room.categoria) return room.categoria;
-  const ref = `${room.id} ${room.codigo} ${room.nome}`.toUpperCase();
+  const ref = `${room.id || ''} ${room.codigo || ''} ${room.nome || ''}`.toUpperCase();
   if (ref.includes('AUD') || ref.includes('TEATRO')) return 'AUDITORIO';
   if (ref.includes('LAB') || ref.includes('QUI-') || ref.includes('CAD-') || ref.includes('BRA-')) return 'LABORATORIO';
   if (ref.includes('SALA-0') || ref.includes('SALA DE AULA')) return 'SALA';
@@ -350,8 +354,8 @@ export function inferSpaceCategory(room: Pick<Room, 'id' | 'codigo' | 'nome' | '
  * bloqueios temporários e reservas em andamento / agendadas hoje.
  */
 export function resolveRoomRealtimeStatus(
-  room: Room,
-  reservations: Reservation[],
+  room?: Room | null,
+  reservations: Reservation[] = [],
   now: Date = new Date()
 ): {
   status: RealtimeSpaceStatus;
@@ -359,6 +363,10 @@ export function resolveRoomRealtimeStatus(
   nextReservation?: Reservation;
   isTemporarilyBlocked: boolean;
 } {
+  if (!room) {
+    return { status: 'DISPONIVEL', isTemporarilyBlocked: false };
+  }
+
   const nowMs = now.getTime();
   const isTemporarilyBlocked = Boolean(room.bloqueadaAte && room.bloqueadaAte > nowMs);
 
@@ -374,17 +382,22 @@ export function resolveRoomRealtimeStatus(
   const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   const nowHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-  const activeToday = reservations
+  const safeReservations = Array.isArray(reservations) ? reservations : [];
+
+  const activeToday = safeReservations
     .filter(
       (r) =>
+        Boolean(r) &&
         (r.salaId === room.firestoreId || r.salaInstitutionalId === room.id) &&
         r.data === todayISO &&
         (r.status === 'PENDENTE' || r.status === 'CONFIRMADA')
     )
-    .sort((a, b) => a.inicio.localeCompare(b.inicio));
+    .sort((a, b) => (a?.inicio || '').localeCompare(b?.inicio || ''));
 
-  const currentReservation = activeToday.find((r) => nowHHMM >= r.inicio && nowHHMM < r.fim);
-  const nextReservation = activeToday.find((r) => r.inicio > nowHHMM);
+  const currentReservation = activeToday.find(
+    (r) => Boolean(r?.inicio && r?.fim) && nowHHMM >= r.inicio && nowHHMM < r.fim
+  );
+  const nextReservation = activeToday.find((r) => Boolean(r?.inicio) && r.inicio > nowHHMM);
 
   if (room.statusManual === 'EM_USO' || room.status === 'EM_USO') {
     return { status: 'EM_USO', currentReservation, nextReservation, isTemporarilyBlocked: false };

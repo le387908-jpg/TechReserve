@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { CalendarEvent, Room, User as UserType } from '../../../types';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 import { toast } from 'sonner';
 
@@ -66,44 +67,44 @@ export function EventDetailModal({
       roomDetails.statusManual !== 'MANUTENCAO');
 
   const handleApprove = async () => {
-    if (!event.reservationId || !onApproveReservation) return;
+    if (!event?.reservationId || !onApproveReservation) return;
     setIsProcessing(true);
     try {
       await onApproveReservation(event.reservationId);
       toast.success('Reserva aprovada com sucesso!');
       onClose();
-    } catch {
-      toast.error('Erro ao aprovar reserva.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao aprovar reserva.'));
     } finally {
       setIsProcessing(false);
     }
   };
 
   const handleCancel = async () => {
-    if (!event.reservationId || !onCancelReservation) return;
+    if (!event?.reservationId || !onCancelReservation) return;
     setIsProcessing(true);
     try {
       await onCancelReservation(event.reservationId);
       toast.success('Reserva cancelada. Cota semanal atualizada.');
       setConfirmAction(null);
       onClose();
-    } catch {
-      toast.error('Erro ao cancelar reserva.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao cancelar reserva.'));
     } finally {
       setIsProcessing(false);
     }
   };
 
   const handleDelete = async () => {
-    if (!event.reservationId || !onDeleteReservation) return;
+    if (!event?.reservationId || !onDeleteReservation) return;
     setIsProcessing(true);
     try {
       await onDeleteReservation(event.reservationId);
       toast.success('Registro excluído com sucesso.');
       setConfirmAction(null);
       onClose();
-    } catch {
-      toast.error('Erro ao excluir registro.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao excluir registro.'));
     } finally {
       setIsProcessing(false);
     }
@@ -122,11 +123,11 @@ export function EventDetailModal({
           {/* TOP ACCENT HEADER */}
           <div className={cn(
             "p-6 pb-5 relative text-white",
-            isGrade ? "bg-emerald-600" : "bg-fatec-red"
+            isGrade ? "bg-blue-600" : isOwner ? "bg-emerald-600" : "bg-fatec-red"
           )}>
             <button
               onClick={onClose}
-              className="absolute right-4 top-4 p-2 rounded-full bg-black/20 hover:bg-black/30 text-white transition-colors"
+              className="absolute right-4 top-4 p-2 rounded-full bg-black/20 hover:bg-black/30 text-white transition-colors cursor-pointer"
             >
               <X className="h-5 w-5" />
             </button>
@@ -134,9 +135,17 @@ export function EventDetailModal({
             <div className="flex items-center gap-2 mb-2">
               <span className={cn(
                 "px-2.5 py-0.5 rounded-lg text-[10px] font-black uppercase tracking-wider",
-                isGrade ? "bg-emerald-800/80 text-emerald-100" : "bg-red-900/80 text-red-100"
+                isGrade
+                  ? "bg-blue-900/75 text-blue-50"
+                  : isOwner
+                  ? "bg-emerald-900/75 text-emerald-50"
+                  : "bg-red-900/80 text-red-100"
               )}>
-                {isGrade ? '🟩 Aula da Grade Curricular' : '🟥 Sala Reservada por Usuário'}
+                {isGrade
+                  ? 'Ocupado · Aula Regular'
+                  : isOwner
+                  ? 'Sua Reserva'
+                  : 'Reservado'}
               </span>
               {event.status && (
                 <span className="px-2 py-0.5 rounded-lg text-[10px] font-bold bg-white/20 text-white uppercase">
@@ -152,10 +161,10 @@ export function EventDetailModal({
             <p className="text-xs text-white/80 mt-1 flex items-center gap-2">
               <Calendar className="h-3.5 w-3.5" />
               <span>{event.diaSemana}</span>
-              {event.data && <span>• Data: {event.data}</span>}
-              <span>•</span>
+              {event.data && <span className="tabular-nums">· Data: {event.data}</span>}
+              <span>·</span>
               <Clock className="h-3.5 w-3.5" />
-              <span className="font-mono font-bold">{event.horarioInicio} às {event.horarioFim}</span>
+              <span className="font-mono tabular-nums font-bold">{event.horarioInicio} às {event.horarioFim}</span>
             </p>
           </div>
 
@@ -173,8 +182,8 @@ export function EventDetailModal({
                   {event.sala}
                 </p>
                 {roomDetails && (
-                  <p className="text-[11px] text-slate-500 mt-1">
-                    {roomDetails.andar} • Capacidade: {roomDetails.capacidade} alunos
+                  <p className="text-[11px] text-slate-500 mt-1 tabular-nums">
+                    {roomDetails.andar} · Capacidade: {roomDetails.capacidade} alunos
                   </p>
                 )}
               </div>
@@ -234,7 +243,7 @@ export function EventDetailModal({
             )}
 
             {/* SE FOR AULA DA GRADE: MOSTRA RECURSOS DA SALA */}
-            {isGrade && roomDetails && roomDetails.equipamentos && roomDetails.equipamentos.length > 0 && (
+            {isGrade && Array.isArray(roomDetails?.equipamentos) && roomDetails.equipamentos.length > 0 && (
               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3.5">
                 <p className="text-[10px] font-black uppercase tracking-wider text-slate-400 mb-2">
                   Recursos & Equipamentos Disponíveis:

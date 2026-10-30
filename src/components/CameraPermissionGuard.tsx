@@ -7,57 +7,74 @@ import React, { useState, useEffect } from 'react';
 import { Camera, ShieldCheck, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
+function safeGetLocalFlag(key: string): string | null {
+  try {
+    return typeof window !== 'undefined' ? window.localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeSetLocalFlag(key: string, value: string): void {
+  try {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(key, value);
+    }
+  } catch {
+    // Ignora bloqueios de armazenamento em abas privadas ou iframes restritos
+  }
+}
+
 export function CameraPermissionGuard({ children }: { children: React.ReactNode }) {
   const [permissionState, setPermissionState] = useState<'prompt' | 'granted' | 'denied' | 'checking'>('checking');
   const [showOverlay, setShowOverlay] = useState(false);
 
   useEffect(() => {
-    checkPermission();
+    void checkPermission();
   }, []);
 
   const checkPermission = async () => {
-    try {
-      // First check localStorage to see if we've already tried on THIS device
-      const hasAsked = localStorage.getItem('camera_permission_asked');
+    const hasAsked = safeGetLocalFlag('camera_permission_asked');
 
+    try {
       if (!hasAsked) {
         setShowOverlay(true);
       } else {
-        // If already asked, we don't show the GLOBAL guard anymore
-        // We let the specific camera-using components handle it
         setShowOverlay(false);
       }
 
-      // Check if the browser supports the Permissions API
-      if (navigator.permissions && navigator.permissions.query) {
+      if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
         try {
-          const result = await navigator.permissions.query({ name: 'camera' as any });
-          setPermissionState(result.state as any);
-          
-          // Only force show if NOT asked yet
-          if (!hasAsked && (result.state === 'prompt' || result.state === 'denied')) {
+          const result = await navigator.permissions.query({ name: 'camera' as PermissionName });
+          setPermissionState(result.state as 'prompt' | 'granted' | 'denied');
+
+          if (result.state === 'granted') {
+            setShowOverlay(false);
+          } else if (!hasAsked && (result.state === 'prompt' || result.state === 'denied')) {
             setShowOverlay(true);
           }
 
           result.onchange = () => {
-            setPermissionState(result.state as any);
+            setPermissionState(result.state as 'prompt' | 'granted' | 'denied');
             if (result.state === 'granted') {
               setShowOverlay(false);
             }
           };
-        } catch (e) {
-          // Fallback if query({ name: 'camera' }) is not supported
+          return;
+        } catch {
+          setPermissionState(hasAsked ? 'granted' : 'prompt');
           if (!hasAsked) {
-            setPermissionState('prompt');
             setShowOverlay(true);
           }
+          return;
         }
       }
-    } catch (error: any) {
-      console.error('Error checking camera permission:', error?.message || String(error));
-      const hasAsked = localStorage.getItem('camera_permission_asked');
+
+      setPermissionState(hasAsked ? 'granted' : 'prompt');
+    } catch (error: unknown) {
+      console.error('Error checking camera permission:', error);
+      setPermissionState(hasAsked ? 'granted' : 'prompt');
       if (!hasAsked) {
-        setPermissionState('prompt');
         setShowOverlay(true);
       }
     }
@@ -65,21 +82,19 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
 
   const requestPermission = async () => {
     try {
+      if (!navigator?.mediaDevices?.getUserMedia) {
+        throw new Error('Navegador sem suporte direto a getUserMedia.');
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      // If we get here, permission was granted
-      stream.getTracks().forEach(track => track.stop()); // Stop the stream immediately
+      stream.getTracks().forEach((track) => track.stop());
       setPermissionState('granted');
       setShowOverlay(false);
-      localStorage.setItem('camera_permission_asked', 'true');
-    } catch (error) {
+      safeSetLocalFlag('camera_permission_asked', 'true');
+    } catch {
       setPermissionState('denied');
-      localStorage.setItem('camera_permission_asked', 'true');
+      safeSetLocalFlag('camera_permission_asked', 'true');
     }
   };
-
-  if (permissionState === 'checking' && !showOverlay) {
-    return null;
-  }
 
   return (
     <>
@@ -103,7 +118,7 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
               <h2 className="text-2xl font-black text-slate-900 mb-3 tracking-tight">
                 Permissão de Câmera
               </h2>
-              
+
               <p className="text-slate-500 mb-8 leading-relaxed">
                 Para utilizar o sistema de reservas e realizar o check-in via QR Code, precisamos de acesso à câmera do seu dispositivo.
               </p>
@@ -122,7 +137,7 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
                     <AlertCircle className="h-5 w-5 text-fatec-red shrink-0 mt-0.5" />
                     <div>
                       <p className="text-sm font-bold text-red-800">Acesso Negado</p>
-                      <p className="text-xs text-red-600">Você bloqueou o acesso à câmera. Por favor, habilite nas configurações do seu navegador para continuar.</p>
+                      <p className="text-xs text-red-600">Você bloqueou o acesso à câmera. Você pode continuar navegando normalmente e habilitar depois caso precise ler um QR Code.</p>
                     </div>
                   </div>
                 )}
@@ -135,8 +150,9 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
                     Permissão Concedida!
                   </div>
                   <button
+                    type="button"
                     onClick={() => setShowOverlay(false)}
-                    className="w-full bg-slate-900 text-white py-4 rounded-2xl font-black uppercase tracking-widest transition-all active:scale-95 shadow-xl shadow-slate-200"
+                    className="w-full bg-slate-900 text-white py-4 rounded-2xl font-black uppercase tracking-widest transition-all active:scale-95 shadow-xl shadow-slate-200 cursor-pointer"
                   >
                     Entrar no App
                   </button>
@@ -144,24 +160,27 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
               ) : (
                 <div className="space-y-4">
                   <button
+                    type="button"
                     onClick={requestPermission}
-                    className="w-full bg-fatec-red text-white py-4 rounded-2xl font-black uppercase tracking-widest transition-all active:scale-95 shadow-xl shadow-red-200 flex items-center justify-center gap-3"
+                    className="w-full bg-fatec-red text-white py-4 rounded-2xl font-black uppercase tracking-widest transition-all active:scale-95 shadow-xl shadow-red-200 flex items-center justify-center gap-3 cursor-pointer"
                   >
                     <Camera className="h-5 w-5" />
                     Permitir Acesso
                   </button>
                   <button
+                    type="button"
                     onClick={() => {
                       setPermissionState('denied');
-                      localStorage.setItem('camera_permission_asked', 'true');
+                      safeSetLocalFlag('camera_permission_asked', 'true');
+                      setShowOverlay(false);
                     }}
-                    className="w-full py-2 text-slate-400 font-bold uppercase tracking-widest text-[10px]"
+                    className="w-full py-2 text-slate-500 hover:text-slate-700 font-bold uppercase tracking-widest text-[10px] cursor-pointer"
                   >
-                    Negar
+                    Continuar sem câmera por agora
                   </button>
                 </div>
               )}
-              
+
               <p className="mt-6 text-[10px] text-slate-400 font-medium uppercase tracking-[0.2em]">
                 Ambiente Seguro &middot; TechReserve
               </p>

@@ -16,15 +16,15 @@ import { OperationType, handleFirestoreError } from '../services/firebase/utils'
  */
 export function toUserProfile(user: User): UserProfile {
   return {
-    id: user.id,
-    name: user.name || user.nome,
-    email: user.email,
-    phone: user.phone || '',
-    phoneFormatted: user.phoneFormatted || formatPhoneMask(user.phone),
-    course: user.course || user.curso,
-    semester: user.semester ?? user.semestre ?? null,
-    role: user.role,
-    whatsappNotificationsEnabled: user.whatsappNotificationsEnabled !== false,
+    id: String(user?.id || ''),
+    name: String(user?.name || user?.nome || 'Usuário'),
+    email: String(user?.email || ''),
+    phone: user?.phone || '',
+    phoneFormatted: user?.phoneFormatted || formatPhoneMask(user?.phone || ''),
+    course: user?.course || user?.curso,
+    semester: user?.semester ?? user?.semestre ?? null,
+    role: user?.role === 'ADMIN' ? 'ADMIN' : 'USUARIO',
+    whatsappNotificationsEnabled: user?.whatsappNotificationsEnabled !== false,
   };
 }
 
@@ -58,7 +58,7 @@ export function useFirebaseRealtime() {
       doc(db, 'users', authUser.id),
       (snap) => {
         if (snap.exists()) {
-          const data = { id: snap.id, ...snap.data() } as User;
+          const data = { id: snap.id, ...(snap.data() || {}) } as User;
           setProfile(toUserProfile(data));
         }
       },
@@ -73,12 +73,13 @@ export function useFirebaseRealtime() {
       spacesQuery,
       (snap) => {
         const list = snap.docs.map((d) => {
-          const raw = d.data();
+          const raw = d.data() || {};
           const base = {
             ...raw,
             firestoreId: d.id,
             id: raw.id || d.id,
             codigo: raw.codigo || '',
+            nome: String(raw.nome || 'Ambiente Institucional'),
           } as Room;
           base.categoria = inferSpaceCategory(base);
           return base;
@@ -95,7 +96,7 @@ export function useFirebaseRealtime() {
     const unsubReservations = onSnapshot(
       reservationsQuery,
       (snap) => {
-        const list = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Reservation));
+        const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) } as Reservation));
         setReservations(list);
         setLoading(false);
       },
@@ -106,9 +107,21 @@ export function useFirebaseRealtime() {
     );
 
     return () => {
-      unsubUser();
-      unsubSpaces();
-      unsubReservations();
+      try {
+        unsubUser();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+      try {
+        unsubSpaces();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+      try {
+        unsubReservations();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
     };
   }, [authUser?.id]);
 

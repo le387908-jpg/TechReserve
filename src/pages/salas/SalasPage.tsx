@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Plus,
   Search,
@@ -31,6 +31,7 @@ import { useScheduleStore } from '../../store/useScheduleStore';
 import {
   isSlotActiveOrReleased,
   matchesSlotRoom,
+  normalizeTimeHHMM,
   useAvailableSlotsStore,
 } from '../../store/useAvailableSlotsStore';
 import { usePunishmentStore } from '../../store/usePunishmentStore';
@@ -54,15 +55,19 @@ import {
   UNAVAILABLE_AWAITING_RELEASE_LABEL,
   checkNoShowSuspensionForDate,
   checkWeeklyQuotaLocal,
+  doRoomNamesMatch,
   formatNoShowTag,
   getCurriculumClassesForRoomOnDate,
   getReleasedBlocksForRoomOnDate,
+  getReleasedDatesForRoom,
   getRoomScheduleSlotsForDate,
   getUserNoShowBlockedDate,
+  isSlotOccupiedByReservation,
   isSpaceReleasedByAdmin,
 } from '../../services/reservationService';
 import { RoomSlotSelector } from '../../components/reservations/RoomSlotSelector';
 import { formatDataBR, createSafeLocalDateTime } from '../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 
 const FLOORS = ['Térreo', '1º andar', '2º andar'];
 const DEFAULT_ROOM_COVER =
@@ -78,7 +83,8 @@ export function SalasPage() {
     return () => clearInterval(timer);
   }, []);
 
-  const rooms = useRoomStore((state) => state.rooms);
+  const rawRooms = useRoomStore((state) => state.rooms);
+  const rooms = Array.isArray(rawRooms) ? rawRooms : [];
   const loading = useRoomStore((state) => state.loading);
   const fetchRooms = useRoomStore((state) => state.fetchRooms);
   const addRoom = useRoomStore((state) => state.addRoom);
@@ -89,18 +95,22 @@ export function SalasPage() {
 
   const user = useAuthStore((state) => state.user);
 
-  const reservations = useReservationStore((state) => state.reservations);
+  const rawReservations = useReservationStore((state) => state.reservations);
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
   const fetchReservations = useReservationStore((state) => state.fetchReservations);
   const addReservation = useReservationStore((state) => state.addReservation);
 
-  const punishments = usePunishmentStore((state) => state.punishments);
+  const rawPunishments = usePunishmentStore((state) => state.punishments);
+  const punishments = Array.isArray(rawPunishments) ? rawPunishments : [];
   const activePunishment = usePunishmentStore((state) => state.activePunishment);
   const fetchUserPunishments = usePunishmentStore((state) => state.fetchUserPunishments);
 
   // Subscribe to schedule config, exceptions & explicit `available_slots` so UI reacts immediately
   const scheduleConfig = useScheduleStore((state) => state.config);
-  const scheduleExceptions = useScheduleStore((state) => state.exceptions);
-  const availableSlots = useAvailableSlotsStore((state) => state.slots);
+  const rawScheduleExceptions = useScheduleStore((state) => state.exceptions);
+  const scheduleExceptions = Array.isArray(rawScheduleExceptions) ? rawScheduleExceptions : [];
+  const rawAvailableSlots = useAvailableSlotsStore((state) => state.slots);
+  const availableSlots = Array.isArray(rawAvailableSlots) ? rawAvailableSlots : [];
   const fetchAvailableSlots = useAvailableSlotsStore((state) => state.fetchAvailableSlots);
   const setSlotReleaseStatus = useAvailableSlotsStore((state) => state.setSlotReleaseStatus);
   const releaseMultipleSlotsForRoomAndDate = useAvailableSlotsStore(
@@ -111,6 +121,7 @@ export function SalasPage() {
   );
 
   const isAdmin = user?.role === 'ADMIN';
+  const standardizedRef = useRef(false);
   const effectivePunishments = React.useMemo(() => {
     if (isAdmin) return punishments;
     return activePunishment ? [activePunishment] : [];
@@ -172,23 +183,50 @@ export function SalasPage() {
       toast.error(check.message);
       return;
     }
-    const currentLimits = getReservationDateLimits(new Date());
-    const initialDate =
+    const currentNow = new Date();
+    const currentLimits = getReservationDateLimits(currentNow, room.firestoreId);
+    let initialDate =
       !isAdmin &&
       userBlockedDate === currentLimits.todayStr &&
       currentLimits.tomorrowStr <= currentLimits.maxDate
         ? currentLimits.tomorrowStr
         : currentLimits.minDate;
 
-    const slotView = getRoomScheduleSlotsForDate({
+    let slotView = getRoomScheduleSlotsForDate({
       room,
       dateISO: initialDate,
       config: scheduleConfig,
       exceptions: scheduleExceptions,
       availableSlots,
       reservations,
-      now: new Date(),
+      currentUserId: user?.id,
+      now: currentNow,
     });
+
+    // Se a data inicial não possuir horários disponíveis para o usuário, avança automaticamente
+    // para a primeira data futura com horário liberado pelo ADM nesta sala
+    if (!isAdmin && slotView.reservableCount === 0) {
+      const releasedDates = getReleasedDatesForRoom(room, currentLimits.todayStr, availableSlots);
+      for (const candidateDate of releasedDates) {
+        if (userBlockedDate === candidateDate) continue;
+        const candidateView = getRoomScheduleSlotsForDate({
+          room,
+          dateISO: candidateDate,
+          config: scheduleConfig,
+          exceptions: scheduleExceptions,
+          availableSlots,
+          reservations,
+          currentUserId: user?.id,
+          now: currentNow,
+        });
+        if (candidateView.reservableCount > 0) {
+          initialDate = candidateDate;
+          slotView = candidateView;
+          break;
+        }
+      }
+    }
+
     const firstReservable = slotView.slots.find((s) => s.selectableForUser);
 
     setSelectedBookingDate(initialDate);
@@ -207,6 +245,11 @@ export function SalasPage() {
     }
     setBookingRoom(room);
   };
+
+  const bookingRoomDateLimits = React.useMemo(
+    () => getReservationDateLimits(now, bookingRoom?.firestoreId),
+    [now, bookingRoom?.firestoreId, availableSlots, scheduleConfig]
+  );
 
   const blockRelease = React.useMemo(
     () =>
@@ -230,10 +273,30 @@ export function SalasPage() {
         exceptions: scheduleExceptions,
         availableSlots,
         reservations,
+        currentUserId: user?.id,
         now,
       }),
-    [bookingRoom, selectedBookingDate, scheduleConfig, scheduleExceptions, availableSlots, reservations, now]
+    [
+      bookingRoom,
+      selectedBookingDate,
+      scheduleConfig,
+      scheduleExceptions,
+      availableSlots,
+      reservations,
+      user?.id,
+      now,
+    ]
   );
+
+  const resolvedBookingSlotId = React.useMemo(() => {
+    const match = bookingSlotView.slots.find(
+      (s) =>
+        s.selectableForUser &&
+        s.inicio === normalizeTimeHHMM(bookingStartTime) &&
+        s.fim === normalizeTimeHHMM(bookingEndTime)
+    );
+    return match?.availableSlotId || selectedAvailableSlotId;
+  }, [bookingSlotView.slots, bookingStartTime, bookingEndTime, selectedAvailableSlotId]);
 
   const selectedDateQuota = React.useMemo(() => {
     if (!user || isAdmin) return null;
@@ -281,95 +344,121 @@ export function SalasPage() {
     const unsubUserPunishments =
       user && !isAdmin ? fetchUserPunishments(user.id) : () => {};
     return () => {
-      unsubRooms();
-      unsubReservations();
-      unsubAvailable();
-      unsubUserPunishments();
+      try {
+        unsubRooms();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+      try {
+        unsubReservations();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+      try {
+        unsubAvailable();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+      try {
+        unsubUserPunishments();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
     };
   }, [fetchRooms, fetchReservations, fetchAvailableSlots, fetchUserPunishments, user?.id, isAdmin]);
 
   // Automatic standardization restricted strictly to ADMIN clients to respect Firestore write rules
   useEffect(() => {
-    if (!isAdmin || rooms.length === 0) return;
+    if (!isAdmin || rooms.length === 0 || standardizedRef.current) return;
 
     const autoStandardize = async () => {
-      let updatedSomething = false;
-      const { updateReservation } = useReservationStore.getState();
+      try {
+        standardizedRef.current = true;
+        let updatedSomething = false;
+        const { updateReservation } = useReservationStore.getState();
 
-      for (const room of rooms) {
-        const roomLower = room.nome
-          .toLowerCase()
-          .normalize('NFD')
-          .replace(/[\u0300-\u036f]/g, '');
-        const normId = room.id.toUpperCase().trim();
-        let targetMatch = null;
+        for (const room of rooms) {
+          if (!room?.firestoreId) continue;
+          const roomLower = (room.nome || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '');
+          const normId = (room.id || '').toUpperCase().trim();
+          let targetMatch = null;
 
-        if (
-          roomLower.includes('informatica 02 a') ||
-          roomLower.includes('informatica 2 a') ||
-          normId === 'LAB-002A'
-        ) {
-          targetMatch = INITIAL_ROOMS.find((x) => x.id === 'LAB-002A');
-        } else if (roomLower.includes('braile a') || normId === 'BRA-001A') {
-          targetMatch = INITIAL_ROOMS.find((x) => x.id === 'BRA-001A');
-        } else if (roomLower.includes('quimica') || normId === 'QUI-001') {
-          targetMatch = INITIAL_ROOMS.find((x) => x.id === 'QUI-001');
-        } else if (
-          roomLower.includes('autocad a') ||
-          roomLower.includes('cad a') ||
-          normId === 'CAD-001A'
-        ) {
-          targetMatch = INITIAL_ROOMS.find((x) => x.id === 'CAD-001A');
-        }
+          if (
+            roomLower.includes('informatica 02 a') ||
+            roomLower.includes('informatica 2 a') ||
+            normId === 'LAB-002A'
+          ) {
+            targetMatch = INITIAL_ROOMS.find((x) => x.id === 'LAB-002A');
+          } else if (roomLower.includes('braile a') || normId === 'BRA-001A') {
+            targetMatch = INITIAL_ROOMS.find((x) => x.id === 'BRA-001A');
+          } else if (roomLower.includes('quimica') || normId === 'QUI-001') {
+            targetMatch = INITIAL_ROOMS.find((x) => x.id === 'QUI-001');
+          } else if (
+            roomLower.includes('autocad a') ||
+            roomLower.includes('cad a') ||
+            normId === 'CAD-001A'
+          ) {
+            targetMatch = INITIAL_ROOMS.find((x) => x.id === 'CAD-001A');
+          }
 
-        if (targetMatch) {
-          const isStandardized =
-            room.id === targetMatch.id &&
-            room.nome === targetMatch.nome &&
-            room.codigo === targetMatch.codigo &&
-            room.capacidade === targetMatch.capacidade &&
-            room.descricao === targetMatch.descricao &&
-            room.imagem === targetMatch.imagem;
+          if (targetMatch) {
+            const isStandardized =
+              room.id === targetMatch.id &&
+              room.nome === targetMatch.nome &&
+              room.codigo === targetMatch.codigo &&
+              room.capacidade === targetMatch.capacidade &&
+              room.descricao === targetMatch.descricao &&
+              room.imagem === targetMatch.imagem;
 
-          if (!isStandardized) {
-            await updateRoom(room.firestoreId, {
-              id: targetMatch.id,
-              nome: targetMatch.nome,
-              codigo: targetMatch.codigo,
-              capacidade: targetMatch.capacidade,
-              descricao: targetMatch.descricao,
-              equipamentos: targetMatch.equipamentos,
-              imagem: targetMatch.imagem,
-            });
+            if (!isStandardized) {
+              await updateRoom(room.firestoreId, {
+                id: targetMatch.id,
+                nome: targetMatch.nome,
+                codigo: targetMatch.codigo,
+                capacidade: targetMatch.capacidade,
+                descricao: targetMatch.descricao,
+                equipamentos: targetMatch.equipamentos,
+                imagem: targetMatch.imagem,
+              });
 
-            const roomReservations = reservations.filter((r) => r.salaId === room.firestoreId);
-            for (const res of roomReservations) {
-              if (
-                res.salaInstitutionalId !== targetMatch.id ||
-                res.salaNome !== targetMatch.nome
-              ) {
-                await updateReservation(res.id, {
-                  salaInstitutionalId: targetMatch.id,
-                  salaNome: targetMatch.nome,
-                });
+              const roomReservations = reservations.filter((r) => r?.salaId === room.firestoreId);
+              for (const res of roomReservations) {
+                if (
+                  res.salaInstitutionalId !== targetMatch.id ||
+                  res.salaNome !== targetMatch.nome
+                ) {
+                  await updateReservation(res.id, {
+                    salaInstitutionalId: targetMatch.id,
+                    salaNome: targetMatch.nome,
+                  });
+                }
               }
+
+              await useLogStore
+                .getState()
+                .addLog({
+                  acao: 'PADRONIZACAO_SALA',
+                  usuarioId: 'SISTEMA_AUTO',
+                  usuarioNome: 'Sistema (Padronização Automática)',
+                  entidade: 'SALAS',
+                  detalhes: `Padronização automática realizada para sala ${room.nome} -> ${targetMatch.nome} (ID: ${targetMatch.id})`,
+                })
+                .catch(() => {});
+
+              updatedSomething = true;
             }
-
-            await useLogStore.getState().addLog({
-              acao: 'PADRONIZACAO_SALA',
-              usuarioId: 'SISTEMA_AUTO',
-              usuarioNome: 'Sistema (Padronização Automática)',
-              entidade: 'SALAS',
-              detalhes: `Padronização automática realizada para sala ${room.nome} -> ${targetMatch.nome} (ID: ${targetMatch.id})`,
-            });
-
-            updatedSomething = true;
           }
         }
-      }
 
-      if (updatedSomething) {
-        toast.success('Padronização institucional de ambientes aplicada com sucesso.');
+        if (updatedSomething) {
+          toast.success('Padronização institucional de ambientes aplicada com sucesso.');
+        }
+      } catch (err) {
+        standardizedRef.current = false;
+        console.warn('Auto standardization skipped:', err);
       }
     };
 
@@ -377,13 +466,14 @@ export function SalasPage() {
   }, [isAdmin, rooms, reservations, updateRoom]);
 
   const roomsByFloor = FLOORS.reduce((acc, floor) => {
+    const q = search.toLowerCase();
     const floorRooms = visibleRooms.filter(
       (r) =>
-        r.andar === floor &&
+        r?.andar === floor &&
         (search === '' ||
-          r.nome.toLowerCase().includes(search.toLowerCase()) ||
-          r.id.toLowerCase().includes(search.toLowerCase()) ||
-          r.codigo.toLowerCase().includes(search.toLowerCase()))
+          (r?.nome || '').toLowerCase().includes(q) ||
+          (r?.id || '').toLowerCase().includes(q) ||
+          (r?.codigo || '').toLowerCase().includes(q))
     );
     if (floorRooms.length > 0) {
       acc[floor] = floorRooms;
@@ -397,15 +487,15 @@ export function SalasPage() {
     const formData = new FormData(e.currentTarget);
 
     const roomData: any = {
-      id: (formData.get('id') as string).trim(),
-      codigo: (formData.get('codigo') as string).trim(),
-      nome: (formData.get('nome') as string).trim(),
+      id: ((formData.get('id') as string) || '').trim(),
+      codigo: ((formData.get('codigo') as string) || '').trim(),
+      nome: ((formData.get('nome') as string) || '').trim(),
       categoria: (formData.get('categoria') as SpaceCategory) || 'SALA',
-      andar: formData.get('andar') as string,
-      capacidade: Number(formData.get('capacidade')),
-      descricao: (formData.get('descricao') as string).trim(),
-      status: formData.get('status') as RoomStatus,
-      equipamentos: (formData.get('equipamentos') as string)
+      andar: (formData.get('andar') as string) || 'Térreo',
+      capacidade: Number(formData.get('capacidade')) || 1,
+      descricao: ((formData.get('descricao') as string) || '').trim(),
+      status: ((formData.get('status') as RoomStatus) || 'ATIVO') as RoomStatus,
+      equipamentos: ((formData.get('equipamentos') as string) || '')
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean)
@@ -432,9 +522,9 @@ export function SalasPage() {
       }
       setIsModalOpen(false);
       setEditingRoom(null);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Room save error:', err);
-      toast.error('Erro ao salvar dados do ambiente.');
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao salvar dados do ambiente.'));
     }
   };
 
@@ -444,8 +534,8 @@ export function SalasPage() {
       await deleteRoom(room.firestoreId, room.nome);
       setConfirmDeleteId(null);
       toast.success('Ambiente removido do inventário.');
-    } catch {
-      toast.error('Erro ao excluir ambiente.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao excluir ambiente.'));
     }
   };
 
@@ -478,11 +568,11 @@ export function SalasPage() {
 
     const localNow = new Date();
     const date = selectedBookingDate;
-    const startTime = bookingStartTime;
-    const endTime = bookingEndTime;
+    const startTime = normalizeTimeHHMM(bookingStartTime);
+    const endTime = normalizeTimeHHMM(bookingEndTime);
 
     if (!date || !startTime || !endTime) {
-      toast.error('Selecione uma data e um bloco de horário liberado.');
+      toast.error('Selecione uma data e um horário com status Disponível.');
       return;
     }
 
@@ -506,11 +596,13 @@ export function SalasPage() {
 
     const conflict = reservations.find(
       (r) =>
-        (r.salaId === bookingRoom.firestoreId || r.salaInstitutionalId === bookingRoom.id) &&
+        (r.salaId === bookingRoom.firestoreId ||
+          Boolean(bookingRoom.id && r.salaInstitutionalId === bookingRoom.id) ||
+          Boolean(r.salaNome && doRoomNamesMatch(r.salaNome, bookingRoom.nome))) &&
         r.data === date &&
         (r.status === 'PENDENTE' || r.status === 'CONFIRMADA') &&
-        startTime < r.fim &&
-        endTime > r.inicio
+        startTime < normalizeTimeHHMM(r.fim) &&
+        endTime > normalizeTimeHHMM(r.inicio)
     );
 
     if (conflict) {
@@ -523,8 +615,8 @@ export function SalasPage() {
         r.usuarioId === user.id &&
         r.data === date &&
         (r.status === 'PENDENTE' || r.status === 'CONFIRMADA') &&
-        startTime < r.fim &&
-        endTime > r.inicio
+        startTime < normalizeTimeHHMM(r.fim) &&
+        endTime > normalizeTimeHHMM(r.inicio)
     );
 
     if (userTimeConflict && !isAdmin) {
@@ -552,7 +644,7 @@ export function SalasPage() {
         data: date,
         inicio: startTime,
         fim: endTime,
-        availableSlotId: isAdmin ? undefined : selectedAvailableSlotId,
+        availableSlotId: isAdmin ? undefined : resolvedBookingSlotId,
         status: isAdmin ? 'CONFIRMADA' : 'PENDENTE',
         checkInExpiracao: isAdmin ? null : startDateTime.getTime() + 5 * 60 * 1000,
         checkInRealizado: isAdmin,
@@ -564,12 +656,13 @@ export function SalasPage() {
       );
       setBookingRoom(null);
       setSelectedBookingDate(getReservationDateLimits().minDate);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Reservation error:', err);
       toast.error(
-        err?.message && !String(err.message).startsWith('{')
-          ? err.message
-          : 'Não foi possível registrar a reserva. Verifique sua cota semanal e situação cadastral.'
+        getFriendlyErrorMessage(
+          err,
+          'Não foi possível registrar a reserva. Verifique sua cota semanal e situação cadastral.'
+        )
       );
     }
   };
@@ -748,8 +841,7 @@ export function SalasPage() {
                     const upcomingReleasedCount = availableSlots.filter(
                       (slot) =>
                         matchesSlotRoom(slot, room) &&
-                        slot.data >= dateLimits.todayStr &&
-                        (isAdmin || slot.data <= dateLimits.maxDate) &&
+                        (slot?.data || '') >= dateLimits.todayStr &&
                         isSlotActiveOrReleased(slot)
                     ).length;
 
@@ -915,8 +1007,13 @@ export function SalasPage() {
                                         ? `${room.nome} liberada para visualização de usuários.`
                                         : `${room.nome} ocultada para usuários.`
                                     );
-                                  } catch {
-                                    toast.error('Erro ao alterar liberação da sala.');
+                                  } catch (err) {
+                                    toast.error(
+                                      getFriendlyErrorMessage(
+                                        err,
+                                        'Erro ao alterar liberação da sala.'
+                                      )
+                                    );
                                   }
                                 }}
                                 className={cn(
@@ -950,8 +1047,13 @@ export function SalasPage() {
                                         ? `${room.nome} reativado para uso.`
                                         : `${room.nome} suspenso para manutenção.`
                                     );
-                                  } catch {
-                                    toast.error('Erro ao alterar status de manutenção.');
+                                  } catch (err) {
+                                    toast.error(
+                                      getFriendlyErrorMessage(
+                                        err,
+                                        'Erro ao alterar status de manutenção.'
+                                      )
+                                    );
                                   }
                                 }}
                                 className={cn(
@@ -1167,8 +1269,8 @@ export function SalasPage() {
                       name="reservaDate"
                       type="date"
                       required
-                      min={dateLimits.minDate}
-                      max={isAdmin ? undefined : dateLimits.maxDate}
+                      min={bookingRoomDateLimits.minDate}
+                      max={isAdmin ? undefined : bookingRoomDateLimits.maxDate}
                       value={selectedBookingDate}
                       onChange={(e) => setSelectedBookingDate(e.target.value)}
                       className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-fatec-red font-mono tabular-nums text-xs font-semibold"
@@ -1181,6 +1283,7 @@ export function SalasPage() {
                     date={selectedBookingDate}
                     selectedStartTime={bookingStartTime}
                     selectedEndTime={bookingEndTime}
+                    onSelectDate={setSelectedBookingDate}
                     onSelectSlot={(slot) => {
                       setBookingStartTime(slot.inicio);
                       setBookingEndTime(slot.fim);
@@ -1263,7 +1366,7 @@ export function SalasPage() {
                       (!isAdmin &&
                         (!blockRelease.released ||
                           bookingSlotView.reservableCount === 0 ||
-                          !selectedAvailableSlotId ||
+                          !resolvedBookingSlotId ||
                           selectedDateNoShow.blocked ||
                           Boolean(selectedDateQuota && !selectedDateQuota.allowed)))
                     }
@@ -1275,7 +1378,7 @@ export function SalasPage() {
                         (!isAdmin &&
                           (!blockRelease.released ||
                             bookingSlotView.reservableCount === 0 ||
-                            !selectedAvailableSlotId ||
+                            !resolvedBookingSlotId ||
                             selectedDateNoShow.blocked ||
                             Boolean(selectedDateQuota && !selectedDateQuota.allowed)))
                         ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
@@ -1403,7 +1506,8 @@ export function SalasPage() {
                             const freeCandidates = adminView.slots
                               .filter(
                                 (s) =>
-                                  s.state !== 'OCUPADO_AULA' && s.state !== 'OCUPADO_RESERVA'
+                                  s.state !== 'OCUPADO_AULA' &&
+                                  !isSlotOccupiedByReservation(s.state)
                               )
                               .map((s) => ({
                                 inicio: s.inicio,
@@ -1426,8 +1530,10 @@ export function SalasPage() {
                                   slotAdminDate
                                 )}.`
                               );
-                            } catch {
-                              toast.error('Erro ao liberar horários em lote.');
+                            } catch (err) {
+                              toast.error(
+                                getFriendlyErrorMessage(err, 'Erro ao liberar horários em lote.')
+                              );
                             } finally {
                               setIsUpdatingSlotAdmin(false);
                             }
@@ -1451,8 +1557,10 @@ export function SalasPage() {
                                   slotAdminDate
                                 )}.`
                               );
-                            } catch {
-                              toast.error('Erro ao bloquear horários.');
+                            } catch (err) {
+                              toast.error(
+                                getFriendlyErrorMessage(err, 'Erro ao bloquear horários.')
+                              );
                             } finally {
                               setIsUpdatingSlotAdmin(false);
                             }
@@ -1471,7 +1579,7 @@ export function SalasPage() {
                           slot.rawAvailableSlot &&
                           isSlotActiveOrReleased(slot.rawAvailableSlot);
                         const isClass = slot.state === 'OCUPADO_AULA';
-                        const isBooked = slot.state === 'OCUPADO_RESERVA';
+                        const isBooked = isSlotOccupiedByReservation(slot.state);
 
                         return (
                           <div
@@ -1479,11 +1587,11 @@ export function SalasPage() {
                             className={cn(
                               'px-3 py-2.5 rounded-xl border flex items-center justify-between gap-3 text-xs',
                               isClass
-                                ? 'bg-emerald-50/50 border-emerald-200 text-emerald-950'
+                                ? 'bg-blue-50/70 border-blue-200 text-blue-950'
                                 : isBooked
                                 ? 'bg-rose-50/60 border-rose-200 text-rose-950'
                                 : isReleased
-                                ? 'bg-emerald-50 border-emerald-300 text-slate-900'
+                                ? 'bg-amber-50/70 border-amber-300 text-slate-900'
                                 : 'bg-white border-slate-200 text-slate-700'
                             )}
                           >
@@ -1527,8 +1635,10 @@ export function SalasPage() {
                                         ? `Horário ${slot.inicio}–${slot.fim} liberado!`
                                         : `Horário ${slot.inicio}–${slot.fim} bloqueado.`
                                     );
-                                  } catch {
-                                    toast.error('Falha ao atualizar horário.');
+                                  } catch (err) {
+                                    toast.error(
+                                      getFriendlyErrorMessage(err, 'Falha ao atualizar horário.')
+                                    );
                                   } finally {
                                     setIsUpdatingSlotAdmin(false);
                                   }
@@ -1611,8 +1721,13 @@ export function SalasPage() {
                                 slotAdminDate
                               )}.`
                             );
-                          } catch {
-                            toast.error('Erro ao liberar horário personalizado.');
+                          } catch (err) {
+                            toast.error(
+                              getFriendlyErrorMessage(
+                                err,
+                                'Erro ao liberar horário personalizado.'
+                              )
+                            );
                           } finally {
                             setIsUpdatingSlotAdmin(false);
                           }
@@ -1831,7 +1946,11 @@ export function SalasPage() {
                   </label>
                   <input
                     name="equipamentos"
-                    defaultValue={editingRoom?.equipamentos.join(', ')}
+                    defaultValue={
+                      Array.isArray(editingRoom?.equipamentos)
+                        ? editingRoom.equipamentos.join(', ')
+                        : ''
+                    }
                     className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-fatec-red outline-none text-sm"
                   />
                 </div>

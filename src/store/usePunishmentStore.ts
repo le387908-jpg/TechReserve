@@ -16,7 +16,13 @@ import {
   getDocs,
 } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
-import { OperationType, handleFirestoreError, withRetry } from '../services/firebase/utils';
+import {
+  OperationType,
+  getFriendlyErrorMessage,
+  handleFirestoreError,
+  stripUndefinedFields,
+  withRetry,
+} from '../services/firebase/utils';
 import { PunishmentCategory, PunishmentRecord, User } from '../types';
 import { useAuthStore } from './useAuthStore';
 import { useLogStore } from './useLogStore';
@@ -65,7 +71,7 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
       q,
       (snapshot) => {
         const punishments = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
+          const data = docSnap.data() || {};
           const resolvedBlockedDate =
             data.blockedDate ||
             (data.dataInicio ? normalizeDateToISO(data.dataInicio) : getTodayLocalISO());
@@ -75,11 +81,18 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
             blockedDate: resolvedBlockedDate,
           } as PunishmentRecord;
         });
-        set({ punishments, loading: false });
+        set({ punishments, loading: false, error: null });
       },
       (error) => {
-        console.warn('Punishments list warning:', error);
-        set({ error: error.message, loading: false });
+        try {
+          handleFirestoreError(error, OperationType.LIST, 'punishments');
+        } catch {
+          // Erro estruturado registrado para diagnóstico
+        }
+        set({
+          error: getFriendlyErrorMessage(error, 'Erro ao carregar histórico de punições.'),
+          loading: false,
+        });
       }
     );
 
@@ -87,6 +100,10 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
   },
 
   fetchUserPunishments: (userId: string) => {
+    if (!userId) {
+      set({ activePunishment: null, loading: false });
+      return () => {};
+    }
     set({ loading: true });
     const q = query(collection(db, 'punishments'), where('usuarioId', '==', userId));
 
@@ -96,7 +113,7 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
         const todayISO = getTodayLocalISO();
         const punishments = snapshot.docs
           .map((docSnap) => {
-            const data = docSnap.data();
+            const data = docSnap.data() || {};
             return {
               id: docSnap.id,
               ...data,
@@ -105,14 +122,22 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
                 (data.dataInicio ? normalizeDateToISO(data.dataInicio) : todayISO),
             } as PunishmentRecord;
           })
-          .filter((p) => p.ativa)
-          .sort((a, b) => (b.dataInicio || 0) - (a.dataInicio || 0));
+          .filter((p) => Boolean(p?.ativa))
+          .sort((a, b) => (b?.dataInicio || 0) - (a?.dataInicio || 0));
 
-        const active = punishments.find((p) => p.blockedDate >= todayISO);
-        set({ activePunishment: active || null, loading: false });
+        const active = punishments.find((p) => (p?.blockedDate || '') >= todayISO);
+        set({ activePunishment: active || null, loading: false, error: null });
       },
       (error) => {
-        set({ error: error.message, loading: false });
+        try {
+          handleFirestoreError(error, OperationType.LIST, 'punishments');
+        } catch {
+          // Erro estruturado registrado para diagnóstico
+        }
+        set({
+          error: getFriendlyErrorMessage(error, 'Erro ao verificar restrições do usuário.'),
+          loading: false,
+        });
       }
     );
 
@@ -122,11 +147,14 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
   applyPunishment: async (punishmentData) => {
     try {
       await withRetry(() =>
-        addDoc(collection(db, 'punishments'), {
-          ...punishmentData,
-          blockedDate: normalizeDateToISO(punishmentData.blockedDate) || getTodayLocalISO(),
-          ativa: true,
-        })
+        addDoc(
+          collection(db, 'punishments'),
+          stripUndefinedFields({
+            ...punishmentData,
+            blockedDate: normalizeDateToISO(punishmentData.blockedDate) || getTodayLocalISO(),
+            ativa: true,
+          })
+        )
       );
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'punishments');
@@ -146,7 +174,7 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
       throw new Error('Operação restrita a administradores.');
     }
 
-    const cleanReason = motivo.trim().slice(0, 500);
+    const cleanReason = String(motivo || '').trim().slice(0, 500);
     const normalizedBlockedDate = normalizeDateToISO(blockedDate) || getTodayLocalISO();
     const now = Date.now();
 
@@ -164,37 +192,45 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
 
       // 2. Registra no histórico disciplinar auditável (`punishments`)
       await withRetry(() =>
-        addDoc(collection(db, 'punishments'), {
-          usuarioId: targetUser.id,
-          usuarioNome: targetUser.nome,
-          usuarioEmail: targetUser.email || '',
-          usuarioRa: targetUser.ra || '',
-          categoriaMotivo,
-          motivo: cleanReason,
-          blockedDate: normalizedBlockedDate,
-          dataInicio: now,
-          tipo: 'MANUAL',
-          aplicadoPorId: admin.id,
-          aplicadoPorNome: admin.nome,
-          ativa: true,
-        })
+        addDoc(
+          collection(db, 'punishments'),
+          stripUndefinedFields({
+            usuarioId: targetUser.id,
+            usuarioNome: String(targetUser.nome || 'Usuário'),
+            usuarioEmail: String(targetUser.email || ''),
+            usuarioRa: String(targetUser.ra || ''),
+            categoriaMotivo,
+            motivo: cleanReason,
+            blockedDate: normalizedBlockedDate,
+            dataInicio: now,
+            tipo: 'MANUAL',
+            aplicadoPorId: admin.id,
+            aplicadoPorNome: String(admin.nome || 'Administrador'),
+            ativa: true,
+          })
+        )
       );
 
       // 3. Registra no log de governança (`logs`)
-      await useLogStore.getState().addLog({
-        acao: bloquearConta ? 'BLOQUEIO_CONTA_USUARIO' : 'PUNICAO_DIA_UNICO_MANUAL',
-        usuarioId: targetUser.id,
-        usuarioNome: admin.nome,
-        entidade: 'USERS',
-        detalhes: `Restrição pontual aplicada a ${targetUser.nome} (${
-          targetUser.email
-        }) exclusivamente para ${formatDataBR(normalizedBlockedDate)}${
-          bloquearConta ? ' com bloqueio de conta' : ''
-        }. Motivo: ${cleanReason}`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: bloquearConta ? 'BLOQUEIO_CONTA_USUARIO' : 'PUNICAO_DIA_UNICO_MANUAL',
+          usuarioId: targetUser.id,
+          usuarioNome: admin.nome,
+          entidade: 'USERS',
+          detalhes: `Restrição pontual aplicada a ${targetUser.nome} (${
+            targetUser.email
+          }) exclusivamente para ${formatDataBR(normalizedBlockedDate)}${
+            bloquearConta ? ' com bloqueio de conta' : ''
+          }. Motivo: ${cleanReason}`,
+        })
+        .catch(() => {});
 
       // 4. Notifica o usuário via WhatsApp sobre o bloqueio exclusivo na data informada
-      void notifyManualPunishmentApplied(targetUser, normalizedBlockedDate, cleanReason);
+      void notifyManualPunishmentApplied(targetUser, normalizedBlockedDate, cleanReason).catch(
+        () => {}
+      );
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${targetUser.id}`);
     }
@@ -241,15 +277,18 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
       }
 
       // 3. Registra auditoria
-      await useLogStore.getState().addLog({
-        acao: 'REVOGACAO_RESTRICAO_USUARIO',
-        usuarioId: targetUser.id,
-        usuarioNome: admin.nome,
-        entidade: 'USERS',
-        detalhes: `Restrição de ${targetUser.nome} revogada pelo administrador.${
-          motivoRevogacao ? ` Observação: ${motivoRevogacao}` : ''
-        }`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: 'REVOGACAO_RESTRICAO_USUARIO',
+          usuarioId: targetUser.id,
+          usuarioNome: admin.nome,
+          entidade: 'USERS',
+          detalhes: `Restrição de ${targetUser.nome} revogada pelo administrador.${
+            motivoRevogacao ? ` Observação: ${motivoRevogacao}` : ''
+          }`,
+        })
+        .catch(() => {});
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${targetUser.id}`);
     }

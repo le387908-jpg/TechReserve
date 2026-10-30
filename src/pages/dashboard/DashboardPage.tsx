@@ -43,19 +43,30 @@ const data = [
 ];
 
 export function DashboardPage() {
-  const { rooms, fetchRooms } = useRoomStore();
-  const { reservations, fetchReservations } = useReservationStore();
+  const { rooms: rawRooms, fetchRooms } = useRoomStore();
+  const { reservations: rawReservations, fetchReservations } = useReservationStore();
   const { user } = useAuthStore();
+
+  const rooms = Array.isArray(rawRooms) ? rawRooms : [];
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
 
   useEffect(() => {
     const unsubRooms = fetchRooms();
     const unsubReservas = fetchReservations();
 
     return () => {
-      unsubRooms();
-      unsubReservas();
+      try {
+        unsubRooms();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+      try {
+        unsubReservas();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
     };
-  }, [fetchRooms, fetchReservations, user]);
+  }, [fetchRooms, fetchReservations, user?.id]);
 
   const stats = [
     { 
@@ -67,21 +78,21 @@ export function DashboardPage() {
     },
     { 
       label: 'Reservas Ativas', 
-      value: reservations.filter(r => r.status === 'CONFIRMADA').length, 
+      value: reservations.filter((r) => r?.status === 'CONFIRMADA').length, 
       icon: CalendarDays, 
       color: 'bg-fatec-red',
       trend: { val: '+15%', up: true }
     },
     { 
       label: 'Check-ins Pendentes', 
-      value: reservations.filter(r => r.status === 'PENDENTE').length, 
+      value: reservations.filter((r) => r?.status === 'PENDENTE').length, 
       icon: Clock, 
       color: 'bg-amber-500',
       trend: { val: 'Aguardando', up: true }
     },
     { 
       label: 'Capacidade Total', 
-      value: rooms.reduce((acc, r) => acc + r.capacidade, 0), 
+      value: rooms.reduce((acc, r) => acc + (Number(r?.capacidade) || 0), 0), 
       icon: Users, 
       color: 'bg-emerald-500',
       trend: { val: 'Estável', up: true }

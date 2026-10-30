@@ -34,6 +34,7 @@ import {
   sanitizePhone,
   validatePhone,
 } from '../../utils/formatters';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { cn } from '../../lib/utils';
 
 const COURSES: { id: CalendarCourse; label: string; name: string }[] = [
@@ -112,9 +113,9 @@ export function SignupPage() {
           : {}),
       });
       toast.success('Cadastro realizado com sucesso! Bem-vindo ao TechReserve.');
-      navigate(createdUser.role === 'ADMIN' ? '/admin' : '/salas', { replace: true });
-    } catch (err: any) {
-      toast.error(err.message || 'Erro ao realizar cadastro.');
+      navigate(createdUser?.role === 'ADMIN' ? '/admin' : '/salas', { replace: true });
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao realizar cadastro.'));
     }
   };
 

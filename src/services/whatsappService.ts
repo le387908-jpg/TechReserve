@@ -319,8 +319,8 @@ export async function sendWhatsAppMessage(
   customEndpoint?: string
 ): Promise<WhatsAppDispatchResult> {
   const timestamp = Date.now();
-  const apiPhone = toWhatsAppApiPhone(payload.phone);
-  const instanceName = getConfiguredInstanceName(payload.instanceName);
+  const apiPhone = toWhatsAppApiPhone(payload?.phone || '');
+  const instanceName = getConfiguredInstanceName(payload?.instanceName);
 
   if (!apiPhone || apiPhone.length < 12 || /\D/.test(apiPhone)) {
     console.error('[WhatsApp][Erro de Formatação] Número de destino inválido para envio:', {
@@ -583,9 +583,10 @@ async function registerWhatsAppLog(
 export async function sendReservationConfirmation(
   input: DirectReservationAlertInput
 ): Promise<WhatsAppDispatchResult> {
-  const formattedDate = input.date.includes('-') ? formatDataBR(input.date) : input.date;
-  const timeSlot = `${input.startTime} às ${input.endTime}`;
-  const checkInDeadline = calculateCheckInDeadline(input.startTime);
+  const rawDate = String(input.date || '');
+  const formattedDate = rawDate.includes('-') ? formatDataBR(rawDate) : rawDate;
+  const timeSlot = `${input.startTime || ''} às ${input.endTime || ''}`;
+  const checkInDeadline = calculateCheckInDeadline(input.startTime || '');
 
   const message = WHATSAPP_TEMPLATES.RESERVATION_CONFIRMED({
     userName: input.userName,
@@ -668,9 +669,10 @@ export async function sendReservationReminder(
   input: DirectReservationAlertInput & { minutesBefore?: number }
 ): Promise<WhatsAppDispatchResult> {
   const minutesBefore = input.minutesBefore ?? 10;
-  const formattedDate = input.date.includes('-') ? formatDataBR(input.date) : input.date;
-  const timeSlot = `${input.startTime} às ${input.endTime}`;
-  const checkInDeadline = calculateCheckInDeadline(input.startTime);
+  const rawDate = String(input.date || '');
+  const formattedDate = rawDate.includes('-') ? formatDataBR(rawDate) : rawDate;
+  const timeSlot = `${input.startTime || ''} às ${input.endTime || ''}`;
+  const checkInDeadline = calculateCheckInDeadline(input.startTime || '');
 
   const message = WHATSAPP_TEMPLATES.RESERVATION_REMINDER({
     userName: input.userName,
@@ -808,9 +810,10 @@ export async function notifyVacateWarning10Min(
 export async function sendNoShowAlert(
   input: DirectReservationAlertInput
 ): Promise<WhatsAppDispatchResult> {
-  const formattedDate = input.date.includes('-') ? formatDataBR(input.date) : input.date;
-  const timeSlot = `${input.startTime} às ${input.endTime}`;
-  const checkInDeadline = calculateCheckInDeadline(input.startTime);
+  const rawDate = String(input.date || '');
+  const formattedDate = rawDate.includes('-') ? formatDataBR(rawDate) : rawDate;
+  const timeSlot = `${input.startTime || ''} às ${input.endTime || ''}`;
+  const checkInDeadline = calculateCheckInDeadline(input.startTime || '');
 
   const message = WHATSAPP_TEMPLATES.RESERVATION_NO_SHOW({
     userName: input.userName,

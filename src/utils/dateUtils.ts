@@ -113,8 +113,21 @@ export function getTomorrowLocalISO(referenceDate = new Date()): string {
 /**
  * Cria um objeto Date seguro para comparações locais a partir de date 'YYYY-MM-DD' e time 'HH:mm'.
  */
-export function createSafeLocalDateTime(dateStr: string, timeStr = '00:00'): Date {
-  const [year, month, day] = dateStr.split('-').map(Number);
-  const [hours, minutes] = timeStr.split(':').map(Number);
-  return new Date(year, (month || 1) - 1, day || 1, hours || 0, minutes || 0, 0, 0);
+export function createSafeLocalDateTime(
+  dateStr?: string | null,
+  timeStr?: string | null
+): Date {
+  const safeDate = normalizeDateToISO(dateStr) || getTodayLocalISO();
+  const safeTime = typeof timeStr === 'string' && timeStr.includes(':') ? timeStr.trim() : '00:00';
+  const [year, month, day] = safeDate.split('-').map(Number);
+  const [hours, minutes] = safeTime.split(':').map(Number);
+  return new Date(
+    Number.isFinite(year) && year > 0 ? year : new Date().getFullYear(),
+    (Number.isFinite(month) && month > 0 ? month : 1) - 1,
+    Number.isFinite(day) && day > 0 ? day : 1,
+    Number.isFinite(hours) ? hours : 0,
+    Number.isFinite(minutes) ? minutes : 0,
+    0,
+    0
+  );
 }

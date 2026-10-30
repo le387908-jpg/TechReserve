@@ -15,7 +15,12 @@ import {
 } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
 import { DayOfWeek, ScheduleConfig, ScheduleException, TimeBlock } from '../types';
-import { OperationType, handleFirestoreError, withRetry } from '../services/firebase/utils';
+import {
+  OperationType,
+  handleFirestoreError,
+  stripUndefinedFields,
+  withRetry,
+} from '../services/firebase/utils';
 import { useLogStore } from './useLogStore';
 import { useAuthStore } from './useAuthStore';
 
@@ -28,8 +33,8 @@ export function buildTimeBlocks(
   durationMinutes = 50,
   breakMinutes = 0
 ): TimeBlock[] {
-  const [sh, sm] = startHHMM.split(':').map(Number);
-  const [eh, em] = endHHMM.split(':').map(Number);
+  const [sh, sm] = String(startHHMM || '17:00').split(':').map(Number);
+  const [eh, em] = String(endHHMM || '22:00').split(':').map(Number);
   const startTotal = (sh || 0) * 60 + (sm || 0);
   const endTotal = (eh || 0) * 60 + (em || 0);
 
@@ -118,24 +123,32 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
         const loadedExceptions: ScheduleException[] = [];
 
         snapshot.docs.forEach((docSnap) => {
-          const data = docSnap.data();
+          const data = docSnap.data() || {};
           if (docSnap.id === 'global_config' || data.tipoDoc === 'GLOBAL_CONFIG') {
             loadedConfig = {
               ...DEFAULT_SCHEDULE_CONFIG,
               ...data,
               id: 'global_config',
               tipoDoc: 'GLOBAL_CONFIG',
+              diasSemanaPermitidos: Array.isArray(data.diasSemanaPermitidos)
+                ? data.diasSemanaPermitidos
+                : DEFAULT_SCHEDULE_CONFIG.diasSemanaPermitidos,
+              blocosPadrao: Array.isArray(data.blocosPadrao)
+                ? data.blocosPadrao
+                : DEFAULT_SCHEDULE_CONFIG.blocosPadrao,
             } as ScheduleConfig;
           } else if (data.tipoDoc === 'EXCEPTION' || data.data) {
             loadedExceptions.push({
               ...data,
               id: docSnap.id,
               tipoDoc: 'EXCEPTION',
+              data: String(data.data || ''),
+              titulo: String(data.titulo || 'Exceção de Horário'),
             } as ScheduleException);
           }
         });
 
-        loadedExceptions.sort((a, b) => a.data.localeCompare(b.data));
+        loadedExceptions.sort((a, b) => (a?.data || '').localeCompare(b?.data || ''));
 
         set({
           config: loadedConfig,
@@ -160,29 +173,33 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
     const { user } = useAuthStore.getState();
     const now = Date.now();
 
-    const nextConfig: ScheduleConfig = {
+    const nextConfig: ScheduleConfig = stripUndefinedFields({
+      ...DEFAULT_SCHEDULE_CONFIG,
       ...current,
       ...partial,
       id: 'global_config',
       tipoDoc: 'GLOBAL_CONFIG',
       updatedAt: now,
       updatedBy: user?.nome || 'Administrador',
-    };
+    });
 
     try {
       await withRetry(() => setDoc(doc(db, 'schedules', 'global_config'), nextConfig));
       set({ config: nextConfig });
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'ATUALIZAR_JANELA_HORARIOS',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'HORARIOS',
-          detalhes: `Janela operacional atualizada (${nextConfig.janelaInicio} às ${nextConfig.janelaFim} • Status: ${
-            nextConfig.reservasAbertas ? 'Liberado' : 'Suspenso'
-          } • ${nextConfig.blocosPadrao.filter((b) => b.ativo).length} blocos ativos).`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'ATUALIZAR_JANELA_HORARIOS',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'HORARIOS',
+            detalhes: `Janela operacional atualizada (${nextConfig.janelaInicio} às ${nextConfig.janelaFim} • Status: ${
+              nextConfig.reservasAbertas ? 'Liberado' : 'Suspenso'
+            } • ${(nextConfig.blocosPadrao ?? []).filter((b) => b?.ativo).length} blocos ativos).`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'schedules/global_config');
@@ -196,39 +213,47 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
 
     const cleanPayload: Record<string, unknown> = {
       tipoDoc: 'EXCEPTION',
-      data: exceptionData.data,
-      titulo: exceptionData.titulo.trim().slice(0, 140),
+      data: String(exceptionData.data || ''),
+      titulo: String(exceptionData.titulo || '').trim().slice(0, 140),
       fechado: Boolean(exceptionData.fechado),
       salaId: exceptionData.salaId || 'TODAS',
       salaNome: exceptionData.salaNome || 'Todos os Ambientes',
-      motivo: (exceptionData.motivo || '').trim().slice(0, 400),
+      motivo: String(exceptionData.motivo || '').trim().slice(0, 400),
       createdAt: now,
       updatedAt: now,
     };
 
     if (!exceptionData.fechado) {
-      cleanPayload.janelaInicio = exceptionData.janelaInicio || get().config.janelaInicio;
-      cleanPayload.janelaFim = exceptionData.janelaFim || get().config.janelaFim;
-      if (exceptionData.blocosCustomizados && exceptionData.blocosCustomizados.length > 0) {
+      cleanPayload.janelaInicio = exceptionData.janelaInicio || get().config?.janelaInicio || '17:00';
+      cleanPayload.janelaFim = exceptionData.janelaFim || get().config?.janelaFim || '22:00';
+      if (
+        Array.isArray(exceptionData.blocosCustomizados) &&
+        exceptionData.blocosCustomizados.length > 0
+      ) {
         cleanPayload.blocosCustomizados = exceptionData.blocosCustomizados;
       }
     }
 
     try {
-      await withRetry(() => addDoc(collection(db, 'schedules'), cleanPayload));
+      await withRetry(() =>
+        addDoc(collection(db, 'schedules'), stripUndefinedFields(cleanPayload))
+      );
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'CRIAR_EXCECAO_HORARIO',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'HORARIOS',
-          detalhes: `Exceção "${exceptionData.titulo}" criada para ${exceptionData.data} (${
-            exceptionData.fechado
-              ? 'Dia Fechado / Bloqueado'
-              : `${exceptionData.janelaInicio} às ${exceptionData.janelaFim}`
-          }).`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'CRIAR_EXCECAO_HORARIO',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'HORARIOS',
+            detalhes: `Exceção "${exceptionData.titulo}" criada para ${exceptionData.data} (${
+              exceptionData.fechado
+                ? 'Dia Fechado / Bloqueado'
+                : `${exceptionData.janelaInicio} às ${exceptionData.janelaFim}`
+            }).`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'schedules');
@@ -239,23 +264,25 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
     assertAdminRole();
     const { user } = useAuthStore.getState();
     const now = Date.now();
-    const cleanData: Record<string, unknown> = { updatedAt: now };
-
-    Object.entries(data).forEach(([k, v]) => {
-      if (v !== undefined) cleanData[k] = v;
+    const cleanData = stripUndefinedFields({
+      ...(data as unknown as Record<string, unknown>),
+      updatedAt: now,
     });
 
     try {
       await withRetry(() => updateDoc(doc(db, 'schedules', id), cleanData));
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'EDITAR_EXCECAO_HORARIO',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'HORARIOS',
-          detalhes: `Exceção de horário ID ${id} atualizada.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'EDITAR_EXCECAO_HORARIO',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'HORARIOS',
+            detalhes: `Exceção de horário ID ${id} atualizada.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `schedules/${id}`);
@@ -269,13 +296,16 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
       await withRetry(() => deleteDoc(doc(db, 'schedules', id)));
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'EXCLUIR_EXCECAO_HORARIO',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'HORARIOS',
-          detalhes: `Exceção de horário "${titulo || id}" removida.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'EXCLUIR_EXCECAO_HORARIO',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'HORARIOS',
+            detalhes: `Exceção de horário "${titulo || id}" removida.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `schedules/${id}`);

@@ -20,14 +20,22 @@ import {
 import { CalendarEvent, DayOfWeek, CalendarCourse, Room } from '../../../types';
 import { cn } from '../../../lib/utils';
 import { calculateDayTimeSlots, timeToMinutes } from '../../../utils/calendarTimeSlots';
-import { useAvailableSlotsStore } from '../../../store/useAvailableSlotsStore';
+import {
+  isSlotActiveOrReleased,
+  matchesSlotRoom,
+  useAvailableSlotsStore,
+} from '../../../store/useAvailableSlotsStore';
+import { useAuthStore } from '../../../store/useAuthStore';
 import { useReservationStore } from '../../../store/useReservationStore';
 import { useScheduleStore } from '../../../store/useScheduleStore';
 import {
+  doRoomNamesMatch,
   getRoomScheduleSlotsForDate,
   RoomScheduleSlotView,
   UNAVAILABLE_AWAITING_RELEASE_LABEL,
 } from '../../../services/reservationService';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
+import { toast } from 'sonner';
 
 interface MonthCalendarGridProps {
   currentDate: Date;
@@ -81,10 +89,17 @@ export function MonthCalendarGrid({
   isAdmin,
   onApproveReservation,
 }: MonthCalendarGridProps) {
-  const availableSlots = useAvailableSlotsStore((state) => state.slots);
-  const reservations = useReservationStore((state) => state.reservations);
+  const currentUser = useAuthStore((state) => state.user);
+  const rawAvailableSlots = useAvailableSlotsStore((state) => state.slots);
+  const rawReservations = useReservationStore((state) => state.reservations);
   const scheduleConfig = useScheduleStore((state) => state.config);
-  const scheduleExceptions = useScheduleStore((state) => state.exceptions);
+  const rawScheduleExceptions = useScheduleStore((state) => state.exceptions);
+
+  const safeEvents = Array.isArray(events) ? events : [];
+  const safeRooms = Array.isArray(rooms) ? rooms : [];
+  const availableSlots = Array.isArray(rawAvailableSlots) ? rawAvailableSlots : [];
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
+  const scheduleExceptions = Array.isArray(rawScheduleExceptions) ? rawScheduleExceptions : [];
 
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
@@ -162,7 +177,8 @@ export function MonthCalendarGrid({
 
   // Map events to dateStrings
   const eventsForDate = (dateString: string, dayOfWeek: DayOfWeek | null) => {
-    return events.filter((evt) => {
+    return safeEvents.filter((evt) => {
+      if (!evt) return false;
       if (evt.tipo === 'RESERVA_USUARIO') {
         return evt.data === dateString;
       }
@@ -177,6 +193,7 @@ export function MonthCalendarGrid({
   const selectedDayOfWeek = React.useMemo(() => {
     if (!selectedDateStr) return null;
     const [y, m, d] = selectedDateStr.split('-').map(Number);
+    if (!y || !m || !d) return null;
     const dateObj = new Date(y, m - 1, d, 12, 0, 0);
     return getDayOfWeekName(dateObj.getDay());
   }, [selectedDateStr]);
@@ -184,9 +201,9 @@ export function MonthCalendarGrid({
   const selectedDateEvents = React.useMemo(() => {
     if (!selectedDateStr) return [];
     return eventsForDate(selectedDateStr, selectedDayOfWeek).sort((a, b) =>
-      a.horarioInicio.localeCompare(b.horarioInicio)
+      (a?.horarioInicio || '').localeCompare(b?.horarioInicio || '')
     );
-  }, [selectedDateStr, selectedDayOfWeek, events]);
+  }, [selectedDateStr, selectedDayOfWeek, safeEvents]);
 
   const timeSlotsInfo = React.useMemo(() => {
     if (!selectedDateStr) {
@@ -194,23 +211,39 @@ export function MonthCalendarGrid({
     }
     return calculateDayTimeSlots(
       selectedDateStr,
-      events,
+      safeEvents,
       selectedRoomId !== 'TODAS' ? selectedRoomId : undefined
     );
-  }, [selectedDateStr, events, selectedRoomId]);
+  }, [selectedDateStr, safeEvents, selectedRoomId]);
+
+  const scopedRooms = React.useMemo(
+    () =>
+      selectedRoomId !== 'TODAS'
+        ? safeRooms.filter(
+            (r) =>
+              r &&
+              (doRoomNamesMatch(r.nome || '', selectedRoomId) ||
+                r.id === selectedRoomId ||
+                r.firestoreId === selectedRoomId)
+          )
+        : safeRooms,
+    [safeRooms, selectedRoomId]
+  );
+
+  const releasedCountByDate = React.useMemo(() => {
+    const map = new Map<string, number>();
+    for (const slot of availableSlots) {
+      if (!slot?.data || slot.data < todayStr || !isSlotActiveOrReleased(slot)) continue;
+      const roomMatch = scopedRooms.some((r) => matchesSlotRoom(slot, r));
+      if (!roomMatch) continue;
+      map.set(slot.data, (map.get(slot.data) || 0) + 1);
+    }
+    return map;
+  }, [availableSlots, scopedRooms, todayStr]);
 
   // Calcula estritamente os horários liberados pelo ADM em `available_slots` para a data selecionada
   const releasedSlotsForSelectedDate = React.useMemo(() => {
     if (!selectedDateStr || selectedDateStr < todayStr) return [];
-
-    const scopedRooms =
-      selectedRoomId !== 'TODAS'
-        ? rooms.filter((r) => {
-            const cleanFilter = selectedRoomId.toLowerCase().trim();
-            const cleanName = r.nome.toLowerCase().trim();
-            return cleanName.includes(cleanFilter) || cleanFilter.includes(cleanName);
-          })
-        : rooms;
 
     const results: { room: Room; slot: RoomScheduleSlotView }[] = [];
 
@@ -222,6 +255,7 @@ export function MonthCalendarGrid({
         exceptions: scheduleExceptions,
         availableSlots,
         reservations,
+        currentUserId: currentUser?.id,
       });
 
       for (const slot of scheduleView.slots) {
@@ -233,19 +267,19 @@ export function MonthCalendarGrid({
 
     return results.sort((a, b) => {
       if (a.slot.inicio !== b.slot.inicio) {
-        return a.slot.inicio.localeCompare(b.slot.inicio);
+        return (a.slot.inicio || '').localeCompare(b.slot.inicio || '');
       }
-      return a.room.nome.localeCompare(b.room.nome);
+      return (a.room?.nome || '').localeCompare(b.room?.nome || '');
     });
   }, [
     selectedDateStr,
     todayStr,
-    rooms,
-    selectedRoomId,
+    scopedRooms,
     scheduleConfig,
     scheduleExceptions,
     availableSlots,
     reservations,
+    currentUser?.id,
   ]);
 
   return (
@@ -375,40 +409,84 @@ export function MonthCalendarGrid({
 
                 {/* EVENTS PREVIEWS (CHIPS) */}
                 <div className="space-y-1 flex-1 overflow-hidden">
-                  {/* Real-time active reservations first (RED) */}
-                  {userReservations.slice(0, 2).map((res) => (
+                  {/* ADM-released available slots indicator ("Disponível") */}
+                  {(releasedCountByDate.get(cell.dateString) || 0) > 0 && (
                     <div
-                      key={res.id}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectEvent(res);
-                      }}
-                      className="bg-rose-100 hover:bg-rose-200 border border-rose-300 text-rose-950 px-1.5 py-0.5 rounded text-[10px] font-bold truncate flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
-                      title={`${res.materia} (${res.horarioInicio} às ${res.horarioFim}) - ${res.sala}`}
+                      className="bg-amber-50 border border-amber-400 text-amber-950 px-1.5 py-0.5 rounded text-[9.5px] font-black truncate flex items-center justify-between gap-1 shadow-2xs"
+                      title={`${releasedCountByDate.get(cell.dateString)} horário(s) liberado(s) pela coordenação`}
                     >
-                      <span className="h-1.5 w-1.5 rounded-full bg-fatec-red shrink-0" />
-                      <span className="font-mono text-[8.5px] font-black text-rose-800 shrink-0 tabular-nums">
-                        {res.horarioInicio}-{res.horarioFim}
+                      <span className="truncate">Disponível</span>
+                      <span className="font-mono tabular-nums text-[9px] shrink-0">
+                        {releasedCountByDate.get(cell.dateString)}
                       </span>
-                      <span className="truncate">{res.materia}</span>
                     </div>
-                  ))}
+                  )}
 
-                  {/* Curriculum classes (GREEN) */}
+                  {/* Real-time active reservations: Green = Sua Reserva, Red = Reservado */}
+                  {userReservations.slice(0, 2).map((res) => {
+                    const isOwn = Boolean(currentUser?.id && res.usuarioId === currentUser.id);
+                    const canOpen = isAdmin || isOwn;
+                    return (
+                      <div
+                        key={res.id}
+                        onClick={(e) => {
+                          if (canOpen) {
+                            e.stopPropagation();
+                            onSelectEvent(res);
+                          }
+                        }}
+                        className={cn(
+                          'border px-1.5 py-0.5 rounded text-[10px] font-bold truncate flex items-center gap-1 transition-colors shadow-2xs',
+                          isOwn
+                            ? 'bg-emerald-50 hover:bg-emerald-100 border-emerald-300 text-emerald-950 cursor-pointer'
+                            : cn(
+                                'bg-rose-50 border-rose-200 text-rose-950',
+                                isAdmin ? 'hover:bg-rose-100 cursor-pointer' : 'cursor-default'
+                              )
+                        )}
+                        title={`${isOwn ? 'Sua Reserva' : 'Reservado'}: ${res.materia} (${res.horarioInicio} às ${res.horarioFim}) - ${res.sala}`}
+                      >
+                        <span
+                          className={cn(
+                            'h-1.5 w-1.5 rounded-full shrink-0',
+                            isOwn ? 'bg-emerald-600' : 'bg-rose-600'
+                          )}
+                        />
+                        <span
+                          className={cn(
+                            'font-mono text-[8.5px] font-black shrink-0 tabular-nums',
+                            isOwn ? 'text-emerald-800' : 'text-rose-800'
+                          )}
+                        >
+                          {res.horarioInicio}-{res.horarioFim}
+                        </span>
+                        <span className="truncate">
+                          {isOwn ? 'Sua Reserva' : res.materia}
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                  {/* Curriculum classes: Blue = Ocupado */}
                   {gradeClasses
                     .slice(0, 2 - Math.min(userReservations.length, 2))
                     .map((aula) => (
                       <div
                         key={aula.id}
                         onClick={(e) => {
-                          e.stopPropagation();
-                          onSelectEvent(aula);
+                          if (isAdmin) {
+                            e.stopPropagation();
+                            onSelectEvent(aula);
+                          }
                         }}
-                        className="bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/90 text-emerald-950 px-1.5 py-0.5 rounded text-[10px] font-bold truncate flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
-                        title={`${aula.materia} (${aula.horarioInicio} às ${aula.horarioFim}) - Prof. ${aula.professor}`}
+                        className={cn(
+                          'bg-blue-50 border border-blue-200 text-blue-950 px-1.5 py-0.5 rounded text-[10px] font-bold truncate flex items-center gap-1 transition-colors shadow-2xs',
+                          isAdmin ? 'hover:bg-blue-100 cursor-pointer' : 'cursor-default'
+                        )}
+                        title={`Ocupado (Aula): ${aula.materia} (${aula.horarioInicio} às ${aula.horarioFim}) - Prof. ${aula.professor}`}
                       >
-                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 shrink-0" />
-                        <span className="font-mono text-[8.5px] font-black text-emerald-700 shrink-0 tabular-nums">
+                        <span className="h-1.5 w-1.5 rounded-full bg-blue-600 shrink-0" />
+                        <span className="font-mono text-[8.5px] font-black text-blue-800 shrink-0 tabular-nums">
                           {aula.horarioInicio}-{aula.horarioFim}
                         </span>
                         <span className="truncate">{aula.materia}</span>
@@ -416,7 +494,7 @@ export function MonthCalendarGrid({
                     ))}
 
                   {dayEvents.length > 2 && (
-                    <p className="text-[9px] font-black text-slate-500 hover:text-slate-900 pt-0.5 px-0.5">
+                    <p className="text-[9px] font-black text-slate-500 hover:text-slate-900 pt-0.5 px-0.5 tabular-nums">
                       +{dayEvents.length - 2} mais
                     </p>
                   )}
@@ -482,15 +560,15 @@ export function MonthCalendarGrid({
                     releasedSlotsForSelectedDate[0].room.nome
                   )
                 }
-                className="px-4 py-2 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0 cursor-pointer"
+                className="px-4 py-2 rounded-2xl bg-amber-400 hover:bg-amber-500 text-slate-950 text-xs font-black transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Unlock className="h-4 w-4" />
-                Reservar Horário Liberado ({releasedSlotsForSelectedDate.length})
+                Horários Disponíveis ({releasedSlotsForSelectedDate.length})
               </button>
             ) : (
               <div className="px-3.5 py-2 rounded-2xl bg-slate-100 border border-slate-200 text-slate-500 text-xs font-semibold flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0">
                 <Lock className="h-3.5 w-3.5 text-slate-400" />
-                <span>Aguardando liberação da coordenação</span>
+                <span>Indisponível · Aguardando liberação</span>
               </div>
             )}
           </div>
@@ -506,14 +584,18 @@ export function MonthCalendarGrid({
                     {selectedDayOfWeek === 'Sábado' ? '13:00' : '22:30'})
                   </span>
                 </div>
-                <div className="flex items-center gap-3 text-[10px] font-bold text-slate-600">
+                <div className="flex flex-wrap items-center gap-3 text-[10px] font-bold text-slate-600">
+                  <span className="flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-blue-600" />
+                    Ocupado (Aula)
+                  </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2.5 w-2.5 rounded-sm bg-emerald-600" />
-                    Aula da Grade
+                    Sua Reserva
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2.5 w-2.5 rounded-sm bg-rose-600" />
-                    Reserva Ativa
+                    Reservado
                   </span>
                 </div>
               </div>
@@ -529,18 +611,26 @@ export function MonthCalendarGrid({
                   const leftPct = ((sMin - minStart) / spanMinutes) * 100;
                   const widthPct = Math.max(3, ((eMin - sMin) / spanMinutes) * 100);
                   const isGrade = slot.type === 'AULA_GRADE';
+                  const isOwn =
+                    !isGrade && Boolean(currentUser?.id && slot.event?.usuarioId === currentUser.id);
+                  const canClick = isAdmin || isOwn;
 
                   return (
                     <div
                       key={slot.id}
                       style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                       className={cn(
-                        'absolute top-0 bottom-0 transition-opacity hover:opacity-90 flex items-center justify-center text-[9px] font-mono tabular-nums font-bold px-1 truncate cursor-pointer border-r border-white/30',
-                        isGrade ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
+                        'absolute top-0 bottom-0 transition-opacity flex items-center justify-center text-[9px] font-mono tabular-nums font-bold px-1 truncate border-r border-white/30',
+                        isGrade
+                          ? 'bg-blue-600 text-white'
+                          : isOwn
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-rose-600 text-white',
+                        canClick ? 'cursor-pointer hover:opacity-90' : 'cursor-not-allowed'
                       )}
-                      title={`${slot.start} às ${slot.end}: ${slot.title} (${slot.room || ''})`}
+                      title={`${isGrade ? 'Ocupado' : isOwn ? 'Sua Reserva' : 'Reservado'} — ${slot.start} às ${slot.end}: ${slot.title} (${slot.room || ''})`}
                       onClick={() => {
-                        if (slot.event) {
+                        if (canClick && slot.event) {
                           onSelectEvent(slot.event);
                         }
                       }}
@@ -575,7 +665,7 @@ export function MonthCalendarGrid({
                   className={cn(
                     'h-6 w-6 rounded-lg flex items-center justify-center font-bold',
                     releasedSlotsForSelectedDate.length > 0
-                      ? 'bg-emerald-100 text-emerald-700'
+                      ? 'bg-amber-100 text-amber-800 border border-amber-300'
                       : 'bg-slate-100 text-slate-500'
                   )}
                 >
@@ -587,28 +677,33 @@ export function MonthCalendarGrid({
                 </span>
                 <div>
                   <h5 className="text-xs font-black uppercase tracking-wider text-slate-900">
-                    Horários Liberados pela Coordenação para Agendamento
+                    Horários Liberados pelo ADM (Disponíveis)
                   </h5>
                   <p className="text-[11px] text-slate-500">
-                    Apenas slots explicitamente liberados pelo Administrador para esta sala e data ficam disponíveis
+                    Clique em um horário com status Disponível para efetuar a reserva imediatamente
                   </p>
                 </div>
               </div>
               <span className="text-[11px] font-mono tabular-nums font-semibold text-slate-600">
                 {releasedSlotsForSelectedDate.length}{' '}
-                {releasedSlotsForSelectedDate.length === 1 ? 'horário liberado' : 'horários liberados'}
+                {releasedSlotsForSelectedDate.length === 1 ? 'disponível' : 'disponíveis'}
               </span>
             </div>
 
             {releasedSlotsForSelectedDate.length === 0 ? (
-              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex items-start gap-3">
+              <div className="p-4 rounded-2xl bg-slate-100/80 border border-slate-200 flex items-start gap-3">
                 <Lock className="h-4 w-4 text-slate-400 shrink-0 mt-0.5" />
                 <div className="space-y-0.5">
-                  <p className="text-xs font-bold text-slate-700">
-                    {UNAVAILABLE_AWAITING_RELEASE_LABEL}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-slate-200 text-slate-600 text-[10px] font-black uppercase tracking-wider">
+                      Indisponível
+                    </span>
+                    <p className="text-xs font-bold text-slate-700">
+                      {UNAVAILABLE_AWAITING_RELEASE_LABEL}
+                    </p>
+                  </div>
                   <p className="text-[11px] text-slate-500">
-                    Por padrão, nenhum horário é exibido como livre. O agendamento somente é habilitado quando a coordenação libera explicitamente o horário e a sala para esta data.
+                    Horários não liberados permanecem bloqueados por padrão até liberação explícita pela coordenação.
                   </p>
                 </div>
               </div>
@@ -617,15 +712,17 @@ export function MonthCalendarGrid({
                 {releasedSlotsForSelectedDate.map(({ room, slot }) => (
                   <div
                     key={`${room.firestoreId}_${slot.key}`}
-                    className="p-3.5 rounded-2xl border border-emerald-200 bg-emerald-50/40 hover:bg-emerald-50/80 transition-colors flex flex-col justify-between gap-3"
+                    className="p-3.5 rounded-2xl border-2 border-amber-400 bg-amber-50/35 hover:bg-amber-50/75 hover:border-amber-500 transition-colors flex flex-col justify-between gap-3"
                   >
                     <div className="space-y-1">
-                      <div className="flex items-center justify-between gap-2 text-xs text-emerald-800">
-                        <span className="font-semibold truncate">{room.nome}</span>
-                        <span className="font-semibold shrink-0">{slot.statusBadge}</span>
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="font-bold text-slate-900 truncate">{room.nome}</span>
+                        <span className="px-2 py-0.5 rounded-md bg-amber-400 text-slate-950 text-[10px] font-black uppercase tracking-wider shrink-0">
+                          Disponível
+                        </span>
                       </div>
                       <div className="text-base font-black text-slate-900 font-mono tabular-nums tracking-tight flex items-center gap-1.5">
-                        <Clock className="h-4 w-4 text-emerald-600" />
+                        <Clock className="h-4 w-4 text-amber-600" />
                         {slot.inicio} às {slot.fim}
                       </div>
                       <p className="text-[11px] text-slate-600 truncate">
@@ -638,7 +735,7 @@ export function MonthCalendarGrid({
                       onClick={() =>
                         onNewReservationOnDate(selectedDateStr, slot.inicio, room.nome)
                       }
-                      className="w-full py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                      className="w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-fatec-red text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
                     >
                       <Plus className="h-3.5 w-3.5" />
                       Reservar este Horário
@@ -653,7 +750,7 @@ export function MonthCalendarGrid({
           <div className="space-y-3 pt-4 border-t border-slate-100">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="h-6 w-6 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold">
+                <span className="h-6 w-6 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center font-bold">
                   <GraduationCap className="h-3.5 w-3.5" />
                 </span>
                 <div>
@@ -661,7 +758,7 @@ export function MonthCalendarGrid({
                     Grade de Aulas Regulares & Reservas Registradas
                   </h5>
                   <p className="text-[11px] text-slate-500">
-                    Indicação informativa de ocupação acadêmica e reservas confirmadas/pendentes
+                    Azul: Ocupado (Aula Regular) · Vermelho: Reservado · Verde: Sua Reserva
                   </p>
                 </div>
               </div>
@@ -684,27 +781,49 @@ export function MonthCalendarGrid({
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
                 {selectedDateEvents.map((evt) => {
                   const isGrade = evt.tipo === 'AULA_GRADE';
+                  const isOwn =
+                    !isGrade && Boolean(currentUser?.id && evt.usuarioId === currentUser.id);
+                  const canClick = isAdmin || isOwn;
+
                   return (
                     <div
                       key={evt.id}
-                      onClick={() => onSelectEvent(evt)}
+                      role={canClick ? 'button' : undefined}
+                      tabIndex={canClick ? 0 : undefined}
+                      aria-disabled={!canClick}
+                      onClick={() => {
+                        if (canClick) onSelectEvent(evt);
+                      }}
+                      onKeyDown={(e) => {
+                        if (canClick && (e.key === 'Enter' || e.key === ' ')) {
+                          e.preventDefault();
+                          onSelectEvent(evt);
+                        }
+                      }}
                       className={cn(
-                        'p-4 rounded-2xl border text-left cursor-pointer transition-all duration-150 relative group hover:shadow-md',
+                        'p-4 rounded-2xl border text-left transition-all duration-150 relative group',
                         isGrade
-                          ? 'bg-emerald-50/70 border-emerald-200/90 hover:border-emerald-400 text-emerald-950'
-                          : 'bg-rose-50/80 border-rose-200/90 hover:border-rose-400 text-rose-950'
+                          ? 'bg-blue-50/80 border-blue-200 text-blue-950'
+                          : isOwn
+                          ? 'bg-emerald-50/85 border-emerald-300 text-emerald-950'
+                          : 'bg-rose-50/80 border-rose-200 text-rose-950',
+                        canClick
+                          ? 'cursor-pointer hover:shadow-md'
+                          : 'cursor-not-allowed select-none opacity-95'
                       )}
                     >
                       <div className="flex items-center justify-between gap-1 mb-2">
                         <span
                           className={cn(
-                            'text-[9px] font-black px-2 py-0.5 rounded-md uppercase tracking-wider',
+                            'text-[9px] font-black px-2 py-0.5 rounded-md uppercase tracking-wider whitespace-nowrap',
                             isGrade
-                              ? 'bg-emerald-200/80 text-emerald-900'
-                              : 'bg-rose-200 text-rose-900'
+                              ? 'bg-blue-600 text-white'
+                              : isOwn
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-rose-600 text-white'
                           )}
                         >
-                          {isGrade ? 'Grade Oficial' : 'Reserva Ativa'}
+                          {isGrade ? 'Ocupado' : isOwn ? 'Sua Reserva' : 'Reservado'}
                         </span>
                         <span className="text-xs font-mono tabular-nums font-black text-slate-800 flex items-center gap-1">
                           <Clock className="h-3 w-3 text-slate-400" />
@@ -719,7 +838,9 @@ export function MonthCalendarGrid({
                       <div className="mt-2 space-y-1 text-xs text-slate-600">
                         <p className="flex items-center gap-1.5 font-medium truncate">
                           {isGrade ? (
-                            <GraduationCap className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
+                            <GraduationCap className="h-3.5 w-3.5 text-blue-600 shrink-0" />
+                          ) : isOwn ? (
+                            <User className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
                           ) : (
                             <User className="h-3.5 w-3.5 text-fatec-red shrink-0" />
                           )}
@@ -731,6 +852,12 @@ export function MonthCalendarGrid({
                         </p>
                       </div>
 
+                      {isOwn && !isAdmin && (
+                        <p className="mt-2.5 pt-2 border-t border-emerald-200/80 text-[11px] font-semibold text-emerald-800">
+                          Clique para ver detalhes da sua reserva
+                        </p>
+                      )}
+
                       {isAdmin && !isGrade && evt.status === 'Pendente' && onApproveReservation && (
                         <div className="mt-3 pt-2.5 border-t border-rose-200/80 flex items-center justify-between">
                           <span className="text-[9px] font-black text-amber-700 uppercase">
@@ -738,13 +865,19 @@ export function MonthCalendarGrid({
                           </span>
                           <button
                             type="button"
-                            onClick={(e) => {
+                            onClick={async (e) => {
                               e.stopPropagation();
-                              if (evt.reservationId) {
-                                onApproveReservation(evt.reservationId);
+                              if (!evt.reservationId) return;
+                              try {
+                                await onApproveReservation(evt.reservationId);
+                                toast.success('Reserva aprovada com sucesso!');
+                              } catch (err) {
+                                toast.error(
+                                  getFriendlyErrorMessage(err, 'Erro ao aprovar reserva.')
+                                );
                               }
                             }}
-                            className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold transition-all flex items-center gap-1"
+                            className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold transition-all flex items-center gap-1 cursor-pointer"
                           >
                             <CheckCircle2 className="h-3 w-3" />
                             Aprovar

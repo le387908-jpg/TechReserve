@@ -12,7 +12,12 @@ import {
 import { db } from '../services/firebase/config';
 import { useAuthStore } from './useAuthStore';
 import { Reservation } from '../types';
-import { OperationType, handleFirestoreError, withRetry } from '../services/firebase/utils';
+import {
+  OperationType,
+  getFriendlyErrorMessage,
+  withRetry,
+} from '../services/firebase/utils';
+import { getTodayLocalISO } from '../utils/dateUtils';
 
 interface CheckInState {
   isProcessing: boolean;
@@ -47,12 +52,13 @@ export const useCheckInStore = create<CheckInState>((set, get) => ({
 
     try {
       // 1. Validate and Extract Room ID
-      let salaId = qrData;
-      if (qrData.startsWith('TECHRESERVE:')) {
-        salaId = qrData.split(':')[1];
+      const safeQr = String(qrData || '').trim();
+      let salaId = safeQr;
+      if (safeQr.startsWith('TECHRESERVE:')) {
+        salaId = (safeQr.split(':')[1] || '').trim();
       }
       
-      if (!salaId || salaId.trim() === '') {
+      if (!salaId) {
         const validationErr = new Error('Identificador da sala não encontrado no código.');
         (validationErr as any).isValidationError = true;
         throw validationErr;
@@ -97,7 +103,7 @@ export const useCheckInStore = create<CheckInState>((set, get) => ({
       }
 
       // 3. Search for ANY reservation for this user and this room today
-      const today = new Date().toLocaleDateString('en-CA');
+      const today = getTodayLocalISO();
       const reservationsRef = collection(db, 'reservas');
       const q = query(
         reservationsRef,
@@ -130,29 +136,29 @@ export const useCheckInStore = create<CheckInState>((set, get) => ({
       }
 
       // 4. Find matching reservation (looking for the PENDING one first)
-      const reservations = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Reservation));
+      const reservations = querySnapshot.docs.map(docSnap => ({ id: docSnap.id, ...(docSnap.data() || {}) } as Reservation));
       
       // Sorted by start time to get the closest one if multiple exist
-      const sortedReservations = reservations.sort((a, b) => a.inicio.localeCompare(b.inicio));
+      const sortedReservations = reservations.sort((a, b) => (a?.inicio || '').localeCompare(b?.inicio || ''));
       
-      const validReservation = sortedReservations.find(r => r.status === 'PENDENTE' && !r.checkInRealizado);
+      const validReservation = sortedReservations.find(r => r?.status === 'PENDENTE' && !r?.checkInRealizado);
       
       if (!validReservation) {
-        const anyConfirmed = reservations.some(r => r.checkInRealizado || r.status === 'CONFIRMADA');
+        const anyConfirmed = reservations.some(r => r?.checkInRealizado || r?.status === 'CONFIRMADA');
         if (anyConfirmed) {
           const validationErr = new Error('erro no check-in, código QR incompatível com sua reserva atual');
           (validationErr as any).isValidationError = true;
           throw validationErr;
         }
         
-        const anyCancelled = reservations.some(r => r.status === 'CANCELADA');
+        const anyCancelled = reservations.some(r => r?.status === 'CANCELADA');
         if (anyCancelled) {
           const validationErr = new Error(`Sua reserva para a sala ${salaId} foi cancelada.`);
           (validationErr as any).isValidationError = true;
           throw validationErr;
         }
 
-        const validationErr = new Error(`Reserva encontrada para ${salaId}, mas não está disponível para check-in (Status: ${reservations[0].status}).`);
+        const validationErr = new Error(`Reserva encontrada para ${salaId}, mas não está disponível para check-in (Status: ${reservations[0]?.status || 'INDISPONÍVEL'}).`);
         (validationErr as any).isValidationError = true;
         throw validationErr;
       }
@@ -189,7 +195,7 @@ export const useCheckInStore = create<CheckInState>((set, get) => ({
 
       set({ 
         isProcessing: false, 
-        message: { type: 'error', text: err.message || 'Erro ao processar check-in.' } 
+        message: { type: 'error', text: getFriendlyErrorMessage(err, 'Erro ao processar check-in.') } 
       });
       return false;
     }

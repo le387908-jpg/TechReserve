@@ -5,6 +5,7 @@
 
 import { AvailableSlot, CalendarEvent, DayOfWeek } from '../types';
 import { isSlotActiveOrReleased } from '../store/useAvailableSlotsStore';
+import { doRoomNamesMatch } from '../services/reservationService';
 
 export interface DayTimeSlot {
   id: string;
@@ -20,21 +21,23 @@ export interface DayTimeSlot {
 }
 
 export function timeToMinutes(timeStr: string): number {
-  if (!timeStr) return 0;
+  if (!timeStr || typeof timeStr !== 'string') return 0;
   const [h, m] = timeStr.split(':').map(Number);
   return (h || 0) * 60 + (m || 0);
 }
 
 export function minutesToTime(mins: number): string {
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
+  const safeMins = Number.isFinite(mins) ? Math.max(0, Math.floor(mins)) : 0;
+  const h = Math.floor(safeMins / 60);
+  const m = safeMins % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
 export function getDayOfWeekFromDate(dateStr: string): DayOfWeek | null {
-  if (!dateStr) return null;
+  if (!dateStr || typeof dateStr !== 'string') return null;
   const [y, m, d] = dateStr.split('-').map(Number);
-  const date = new Date(y, m - 1, d, 12, 0, 0);
+  const date = new Date(y || 2000, (m || 1) - 1, d || 1, 12, 0, 0);
+  if (isNaN(date.getTime())) return null;
   const dayIndex = date.getDay();
   const map: Record<number, DayOfWeek | null> = {
     0: null,
@@ -78,12 +81,13 @@ export function calculateDayTimeSlots(
   const dayStartMinutes = 7 * 60 + 40;
   const dayEndMinutes = isSaturday ? 13 * 60 + 30 : 22 * 60 + 30;
 
-  const relevantEvents = events.filter((evt) => {
+  const safeEvents = Array.isArray(events) ? events : [];
+  const safeAvailableSlots = Array.isArray(availableSlots) ? availableSlots : [];
+
+  const relevantEvents = safeEvents.filter((evt) => {
+    if (!evt) return false;
     if (roomFilter && roomFilter !== 'TODAS') {
-      const roomMatch =
-        evt.sala.toLowerCase().includes(roomFilter.toLowerCase()) ||
-        roomFilter.toLowerCase().includes(evt.sala.toLowerCase());
-      if (!roomMatch) return false;
+      if (!doRoomNamesMatch(evt.sala || '', roomFilter)) return false;
     }
 
     if (evt.tipo === 'RESERVA_USUARIO') {
@@ -99,8 +103,8 @@ export function calculateDayTimeSlots(
 
   const occupiedRaw = relevantEvents
     .map((evt) => {
-      const startM = Math.max(dayStartMinutes, timeToMinutes(evt.horarioInicio));
-      const endM = Math.min(dayEndMinutes, timeToMinutes(evt.horarioFim));
+      const startM = Math.max(dayStartMinutes, timeToMinutes(evt.horarioInicio || ''));
+      const endM = Math.min(dayEndMinutes, timeToMinutes(evt.horarioFim || ''));
       return {
         startM,
         endM,
@@ -112,48 +116,42 @@ export function calculateDayTimeSlots(
   occupiedRaw.sort((a, b) => a.startM - b.startM);
 
   const occupiedSlots: DayTimeSlot[] = occupiedRaw.map((item, idx) => ({
-    id: `occ_${idx}_${item.evt.id}`,
+    id: `occ_${idx}_${item.evt.id || idx}`,
     start: minutesToTime(item.startM),
     end: minutesToTime(item.endM),
     durationMinutes: item.endM - item.startM,
     type: item.evt.tipo,
-    title: item.evt.materia,
+    title: item.evt.materia || 'Atividade Acadêmica',
     subtitle:
       item.evt.tipo === 'AULA_GRADE'
-        ? `Prof. ${item.evt.professor}`
-        : `Solicitante: ${item.evt.solicitante}`,
-    room: item.evt.sala,
+        ? `Prof. ${item.evt.professor || 'Docente'}`
+        : `Solicitante: ${item.evt.solicitante || 'Usuário'}`,
+    room: item.evt.sala || '',
     event: item.evt,
   }));
 
   // Apenas slots explicitamente liberados pelo ADM em `available_slots` para esta data (sem conflito)
-  const freeSlots: DayTimeSlot[] = availableSlots
+  const freeSlots: DayTimeSlot[] = safeAvailableSlots
     .filter((slot) => {
-      if (slot.data !== dateStr) return false;
+      if (!slot || slot.data !== dateStr) return false;
       if (!isSlotActiveOrReleased(slot)) return false;
       if (roomFilter && roomFilter !== 'TODAS') {
-        const roomMatch =
-          slot.salaNome.toLowerCase().includes(roomFilter.toLowerCase()) ||
-          roomFilter.toLowerCase().includes(slot.salaNome.toLowerCase());
-        if (!roomMatch) return false;
+        if (!doRoomNamesMatch(slot.salaNome || '', roomFilter)) return false;
       }
 
-      const sStart = timeToMinutes(slot.inicio);
-      const sEnd = timeToMinutes(slot.fim);
+      const sStart = timeToMinutes(slot.inicio || '');
+      const sEnd = timeToMinutes(slot.fim || '');
       if (sEnd <= sStart) return false;
 
       const hasRoomConflict = occupiedRaw.some((occ) => {
-        const sameRoom =
-          occ.evt.sala.toLowerCase().includes(slot.salaNome.toLowerCase()) ||
-          slot.salaNome.toLowerCase().includes(occ.evt.sala.toLowerCase());
-        if (!sameRoom) return false;
+        if (!doRoomNamesMatch(occ.evt.sala || '', slot.salaNome || '')) return false;
         return sStart < occ.endM && sEnd > occ.startM;
       });
       return !hasRoomConflict;
     })
     .map((slot) => {
-      const sStart = timeToMinutes(slot.inicio);
-      const sEnd = timeToMinutes(slot.fim);
+      const sStart = timeToMinutes(slot.inicio || '');
+      const sEnd = timeToMinutes(slot.fim || '');
       return {
         id: `released_${slot.id}`,
         availableSlotId: slot.id,
@@ -162,8 +160,8 @@ export function calculateDayTimeSlots(
         durationMinutes: sEnd - sStart,
         type: 'LIVRE' as const,
         title: slot.label || 'Horário Liberado pela Coordenação',
-        subtitle: `Liberado para agendamento (${slot.salaNome})`,
-        room: slot.salaNome,
+        subtitle: `Disponível para agendamento (${slot.salaNome || 'Ambiente'})`,
+        room: slot.salaNome || '',
       };
     })
     .sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
@@ -201,12 +199,9 @@ export function checkReservationConflict(
     };
   }
 
-  for (const evt of events) {
-    const isSameRoom =
-      evt.sala.toLowerCase().includes(targetRoomName.toLowerCase()) ||
-      targetRoomName.toLowerCase().includes(evt.sala.toLowerCase());
-
-    if (!isSameRoom) continue;
+  const safeEvents = Array.isArray(events) ? events : [];
+  for (const evt of safeEvents) {
+    if (!evt || !doRoomNamesMatch(evt.sala || '', targetRoomName || '')) continue;
 
     let isSameDay = false;
     if (evt.tipo === 'RESERVA_USUARIO') {
@@ -217,8 +212,8 @@ export function checkReservationConflict(
 
     if (!isSameDay) continue;
 
-    const evtStartM = timeToMinutes(evt.horarioInicio);
-    const evtEndM = timeToMinutes(evt.horarioFim);
+    const evtStartM = timeToMinutes(evt.horarioInicio || '');
+    const evtEndM = timeToMinutes(evt.horarioFim || '');
 
     const overlaps = startM < evtEndM && endM > evtStartM;
 
@@ -240,5 +235,5 @@ export function checkReservationConflict(
  * Retorna exclusivamente os slots que já vieram de `available_slots` com status liberado/ativo.
  */
 export function getReservableFreeSlots(freeSlots: DayTimeSlot[]): DayTimeSlot[] {
-  return freeSlots;
+  return Array.isArray(freeSlots) ? freeSlots : [];
 }

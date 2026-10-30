@@ -22,6 +22,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { toast } from 'sonner';
 import { useAuth } from '../../context/AuthContext';
 import { useReservationStore } from '../../store/useReservationStore';
 import { useRoomStore } from '../../store/useRoomStore';
@@ -34,6 +35,8 @@ import { Logo } from '../Logo';
 import { GlobalAlert } from '../GlobalAlert';
 import { CameraPermissionGuard } from '../CameraPermissionGuard';
 import { EditProfileModal } from '../profile/EditProfileModal';
+import { ErrorBoundary } from '../ErrorBoundary';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { cn } from '../../lib/utils';
 
 interface SidebarItem {
@@ -82,7 +85,9 @@ function formatPunishmentDuration(millis: number): string {
 
 export function MainLayout({ children }: { children: React.ReactNode }) {
   const { user, signOut } = useAuth();
-  const [isOnline, setIsOnline] = React.useState(navigator.onLine);
+  const [isOnline, setIsOnline] = React.useState(
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
   const [now, setNow] = useState(Date.now());
   const [isEditProfileOpen, setIsEditProfileOpen] = useState(false);
   const location = useLocation();
@@ -110,20 +115,24 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     if (user?.id) {
-      const unsubRes = fetchReservations();
-      const unsubRooms = fetchRooms();
-      const unsubSchedules = fetchSchedules();
-      const unsubAvailableSlots = fetchAvailableSlots();
-      const unsubWhatsApp = fetchWhatsAppIntegration();
-      const unsubPunishments =
-        user.role === 'ADMIN' ? fetchPunishments() : fetchUserPunishments(user.id);
+      const unsubs = [
+        fetchReservations(),
+        fetchRooms(),
+        fetchSchedules(),
+        fetchAvailableSlots(),
+        fetchWhatsAppIntegration(),
+        user?.role === 'ADMIN' ? fetchPunishments() : fetchUserPunishments(user.id),
+      ];
       return () => {
-        unsubRes();
-        unsubRooms();
-        unsubSchedules();
-        unsubAvailableSlots();
-        unsubWhatsApp();
-        unsubPunishments();
+        for (const unsub of unsubs) {
+          if (typeof unsub === 'function') {
+            try {
+              unsub();
+            } catch (err) {
+              console.warn('[MainLayout] Falha ao encerrar listener Firestore:', err);
+            }
+          }
+        }
       };
     }
   }, [
@@ -157,8 +166,14 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const isAdmin = user?.role === 'ADMIN';
 
   const handleLogout = async () => {
-    await signOut();
-    navigate('/login');
+    try {
+      await signOut();
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao encerrar a sessão.'));
+    } finally {
+      setIsMobileMenuOpen(false);
+      navigate('/login', { replace: true });
+    }
   };
 
   return (
@@ -309,7 +324,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
           {/* Content Area */}
           <main className="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar overflow-touch">
-            {user && user.punidoAte && user.punidoAte > now && (
+            {user?.punidoAte && user.punidoAte > now && (
               <motion.div
                 initial={{ opacity: 0, y: -12 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -331,23 +346,21 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                       {formatPunishmentDuration(user.punidoAte - now)}
                     </span>
                     <span aria-hidden="true">·</span>
-                    <span>Motivo: {user.motivoPunicao || 'Não informado'}</span>
+                    <span>Motivo: {user?.motivoPunicao || 'Não informado'}</span>
                   </div>
                 </div>
               </motion.div>
             )}
 
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={location.pathname}
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.15 }}
-              >
+            <ErrorBoundary
+              resetKey={location.pathname}
+              variant="inline"
+              onGoHome={() => navigate(isAdmin ? '/admin' : '/salas')}
+            >
+              <div key={location.pathname} className="animate-in fade-in duration-150">
                 {children}
-              </motion.div>
-            </AnimatePresence>
+              </div>
+            </ErrorBoundary>
           </main>
         </div>
 

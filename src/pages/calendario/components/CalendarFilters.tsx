@@ -353,13 +353,13 @@ export function CalendarFilters({
             type="button"
             onClick={() => onToggleOnlyReservations(!showOnlyReservations)}
             className={cn(
-              "w-full py-2 px-3 rounded-xl border text-xs font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2",
+              "w-full py-2 px-3 rounded-xl border text-xs font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap",
               showOnlyReservations
                 ? "bg-rose-50 border-rose-300 text-fatec-red shadow-sm"
                 : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
             )}
           >
-            <span className={cn("h-2.5 w-2.5 rounded-full", showOnlyReservations ? "bg-fatec-red animate-pulse" : "bg-slate-300")} />
+            <Filter className={cn("h-3.5 w-3.5 shrink-0", showOnlyReservations ? "text-fatec-red" : "text-slate-400")} />
             {showOnlyReservations ? 'Ver Apenas Reservas' : 'Todas as Ocorrências'}
           </button>
         </div>

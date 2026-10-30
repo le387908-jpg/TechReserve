@@ -36,6 +36,7 @@ import {
 } from '../../../services/reservationService';
 import { DayOfWeek, ScheduleException, TimeBlock } from '../../../types';
 import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 
 const ALL_WEEK_DAYS: DayOfWeek[] = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
@@ -49,21 +50,25 @@ const ALL_WEEK_DAYS: DayOfWeek[] = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Se
 export function AdminSchedulesTab() {
   const {
     config,
-    exceptions,
+    exceptions: rawExceptions,
     saveGlobalConfig,
     addException,
     updateException,
     deleteException,
   } = useScheduleStore();
-  const rooms = useRoomStore((state) => state.rooms);
-  const reservations = useReservationStore((state) => state.reservations);
+  const exceptions = Array.isArray(rawExceptions) ? rawExceptions : [];
+  const rawRooms = useRoomStore((state) => state.rooms);
+  const rooms = Array.isArray(rawRooms) ? rawRooms : [];
+  const rawReservations = useReservationStore((state) => state.reservations);
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
   const {
-    slots: availableSlots,
+    slots: rawAvailableSlots,
     setSlotReleaseStatus,
     releaseMultipleSlotsForRoomAndDate,
     blockAllSlotsForRoomAndDate,
     deleteSlot,
   } = useAvailableSlotsStore();
+  const availableSlots = Array.isArray(rawAvailableSlots) ? rawAvailableSlots : [];
 
   const todayISO = getTodayLocalISO();
   const tomorrowISO = useMemo(() => {
@@ -89,15 +94,19 @@ export function AdminSchedulesTab() {
   }, [rooms, releaseScopeRoomId]);
 
   // Estado local editável da configuração global
-  const [reservasAbertas, setReservasAbertas] = useState(config.reservasAbertas);
-  const [horaAbertura, setHoraAbertura] = useState(config.horaAberturaSistema);
-  const [janelaInicio, setJanelaInicio] = useState(config.janelaInicio);
-  const [janelaFim, setJanelaFim] = useState(config.janelaFim);
-  const [duracaoBloco, setDuracaoBloco] = useState(config.duracaoBlocoPadraoMinutos || 50);
-  const [intervaloBlocos, setIntervaloBlocos] = useState(config.intervaloEntreBlocosMinutos ?? 10);
-  const [antecedenciaDias, setAntecedenciaDias] = useState(config.antecedenciaMaximaDias || 1);
-  const [diasPermitidos, setDiasPermitidos] = useState<DayOfWeek[]>(config.diasSemanaPermitidos);
-  const [blocosPadrao, setBlocosPadrao] = useState<TimeBlock[]>(config.blocosPadrao);
+  const [reservasAbertas, setReservasAbertas] = useState(config?.reservasAbertas ?? true);
+  const [horaAbertura, setHoraAbertura] = useState(config?.horaAberturaSistema ?? 8);
+  const [janelaInicio, setJanelaInicio] = useState(config?.janelaInicio || '07:00');
+  const [janelaFim, setJanelaFim] = useState(config?.janelaFim || '22:00');
+  const [duracaoBloco, setDuracaoBloco] = useState(config?.duracaoBlocoPadraoMinutos || 50);
+  const [intervaloBlocos, setIntervaloBlocos] = useState(config?.intervaloEntreBlocosMinutos ?? 10);
+  const [antecedenciaDias, setAntecedenciaDias] = useState(config?.antecedenciaMaximaDias || 1);
+  const [diasPermitidos, setDiasPermitidos] = useState<DayOfWeek[]>(
+    Array.isArray(config?.diasSemanaPermitidos) ? config.diasSemanaPermitidos : ALL_WEEK_DAYS
+  );
+  const [blocosPadrao, setBlocosPadrao] = useState<TimeBlock[]>(
+    Array.isArray(config?.blocosPadrao) ? config.blocosPadrao : []
+  );
   const [isSavingGlobal, setIsSavingGlobal] = useState(false);
 
   // Estado para modal de novo bloco manual
@@ -119,15 +128,17 @@ export function AdminSchedulesTab() {
   const [deletingExId, setDeletingExId] = useState<string | null>(null);
 
   useEffect(() => {
-    setReservasAbertas(config.reservasAbertas);
-    setHoraAbertura(config.horaAberturaSistema);
-    setJanelaInicio(config.janelaInicio);
-    setJanelaFim(config.janelaFim);
-    setDuracaoBloco(config.duracaoBlocoPadraoMinutos || 50);
-    setIntervaloBlocos(config.intervaloEntreBlocosMinutos ?? 10);
-    setAntecedenciaDias(config.antecedenciaMaximaDias || 1);
-    setDiasPermitidos(config.diasSemanaPermitidos || ALL_WEEK_DAYS);
-    setBlocosPadrao(config.blocosPadrao || []);
+    setReservasAbertas(config?.reservasAbertas ?? true);
+    setHoraAbertura(config?.horaAberturaSistema ?? 8);
+    setJanelaInicio(config?.janelaInicio || '07:00');
+    setJanelaFim(config?.janelaFim || '22:00');
+    setDuracaoBloco(config?.duracaoBlocoPadraoMinutos || 50);
+    setIntervaloBlocos(config?.intervaloEntreBlocosMinutos ?? 10);
+    setAntecedenciaDias(config?.antecedenciaMaximaDias || 1);
+    setDiasPermitidos(
+      Array.isArray(config?.diasSemanaPermitidos) ? config.diasSemanaPermitidos : ALL_WEEK_DAYS
+    );
+    setBlocosPadrao(Array.isArray(config?.blocosPadrao) ? config.blocosPadrao : []);
   }, [config]);
 
   const selectedRoomForRelease = useMemo(
@@ -205,11 +216,12 @@ export function AdminSchedulesTab() {
   // Lista de registros atualmente liberados em `available_slots` (a partir de hoje)
   const activeUpcomingSlots = useMemo(() => {
     return availableSlots
-      .filter((s) => s.data >= todayISO && isSlotActiveOrReleased(s))
+      .filter((s) => (s?.data || '') >= todayISO && isSlotActiveOrReleased(s))
       .sort((a, b) => {
-        if (a.data !== b.data) return a.data.localeCompare(b.data);
-        if (a.salaNome !== b.salaNome) return a.salaNome.localeCompare(b.salaNome);
-        return a.inicio.localeCompare(b.inicio);
+        if ((a.data || '') !== (b.data || '')) return (a.data || '').localeCompare(b.data || '');
+        if ((a.salaNome || '') !== (b.salaNome || ''))
+          return (a.salaNome || '').localeCompare(b.salaNome || '');
+        return (a.inicio || '').localeCompare(b.inicio || '');
       });
   }, [availableSlots, todayISO]);
 
@@ -235,8 +247,8 @@ export function AdminSchedulesTab() {
           ? `Horário ${item.inicio}–${item.fim} liberado para ${selectedRoomForRelease.nome} em ${formatDataBR(releaseDate)}.`
           : `Horário ${item.inicio}–${item.fim} bloqueado novamente.`
       );
-    } catch {
-      toast.error('Falha ao atualizar status de liberação do horário.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Falha ao atualizar status de liberação do horário.'));
     } finally {
       setIsMutatingSlots(false);
     }
@@ -267,8 +279,8 @@ export function AdminSchedulesTab() {
       toast.success(
         `${count} horário(s) liberado(s) em ${formatDataBR(releaseDate)} para ${selectedRoomForRelease.nome}.`
       );
-    } catch {
-      toast.error('Erro ao liberar horários em lote.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao liberar horários em lote.'));
     } finally {
       setIsMutatingSlots(false);
     }
@@ -289,8 +301,8 @@ export function AdminSchedulesTab() {
           `${count} horário(s) bloqueado(s) em ${formatDataBR(releaseDate)} para ${selectedRoomForRelease.nome}.`
         );
       }
-    } catch {
-      toast.error('Erro ao bloquear horários da sala.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao bloquear horários da sala.'));
     } finally {
       setIsMutatingSlots(false);
     }
@@ -335,8 +347,8 @@ export function AdminSchedulesTab() {
         toast.success(
           `Horário ${customSlotStart}–${customSlotEnd} liberado em ${totalReleased} sala(s) sem conflito de aula em ${formatDataBR(releaseDate)}.`
         );
-      } catch {
-        toast.error('Erro ao liberar horário personalizado em lote.');
+      } catch (err) {
+        toast.error(getFriendlyErrorMessage(err, 'Erro ao liberar horário personalizado em lote.'));
       } finally {
         setIsMutatingSlots(false);
       }
@@ -373,16 +385,16 @@ export function AdminSchedulesTab() {
       toast.success(
         `Horário personalizado ${customSlotStart}–${customSlotEnd} liberado para ${selectedRoomForRelease.nome}.`
       );
-    } catch {
-      toast.error('Falha ao liberar horário personalizado.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Falha ao liberar horário personalizado.'));
     } finally {
       setIsMutatingSlots(false);
     }
   };
 
   const handleBatchReleaseAcrossAllActiveRooms = async () => {
-    const chosenBlocks = (config.blocosPadrao || []).filter((b) =>
-      selectedBatchBlockIds.includes(b.id)
+    const chosenBlocks = (Array.isArray(config?.blocosPadrao) ? config.blocosPadrao : []).filter(
+      (b) => selectedBatchBlockIds.includes(b.id)
     );
     if (chosenBlocks.length === 0) {
       toast.error('Selecione ao menos um bloco de horário para liberar nas salas ativas.');
@@ -422,8 +434,8 @@ export function AdminSchedulesTab() {
       toast.success(
         `${totalCreated} registro(s) liberado(s) em ${formatDataBR(releaseDate)} respeitando a grade curricular.`
       );
-    } catch {
-      toast.error('Erro ao liberar horários para múltiplas salas.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao liberar horários para múltiplas salas.'));
     } finally {
       setIsMutatingSlots(false);
     }
@@ -496,8 +508,8 @@ export function AdminSchedulesTab() {
         blocosPadrao,
       });
       toast.success('Janelas operacionais e grade base de blocos atualizadas em tempo real.');
-    } catch {
-      toast.error('Falha ao salvar configuração de horários.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Falha ao salvar configuração de horários.'));
     } finally {
       setIsSavingGlobal(false);
     }
@@ -513,9 +525,9 @@ export function AdminSchedulesTab() {
           ? 'Portal de agendamentos habilitado para receber reservas nos horários liberados.'
           : 'Novos agendamentos suspensos temporariamente.'
       );
-    } catch {
+    } catch (err) {
       setReservasAbertas(!nextState);
-      toast.error('Não foi possível alterar o status de abertura.');
+      toast.error(getFriendlyErrorMessage(err, 'Não foi possível alterar o status de abertura.'));
     }
   };
 
@@ -536,8 +548,8 @@ export function AdminSchedulesTab() {
     setExData(ex.data);
     setExTitulo(ex.titulo);
     setExFechado(ex.fechado);
-    setExJanelaInicio(ex.janelaInicio || config.janelaInicio);
-    setExJanelaFim(ex.janelaFim || config.janelaFim);
+    setExJanelaInicio(ex.janelaInicio || config?.janelaInicio || '07:00');
+    setExJanelaFim(ex.janelaFim || config?.janelaFim || '22:00');
     setExSalaId(ex.salaId || 'TODAS');
     setExMotivo(ex.motivo || '');
     setIsExceptionModalOpen(true);
@@ -584,8 +596,8 @@ export function AdminSchedulesTab() {
         toast.success('Exceção de horário registrada no calendário operacional.');
       }
       setIsExceptionModalOpen(false);
-    } catch {
-      toast.error('Erro ao salvar exceção de horário.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao salvar exceção de horário.'));
     }
   };
 
@@ -772,11 +784,11 @@ export function AdminSchedulesTab() {
                       className={cn(
                         'p-3.5 rounded-xl border flex items-center justify-between gap-3 transition-colors',
                         hasClass
-                          ? 'bg-emerald-50/40 border-emerald-200'
+                          ? 'bg-blue-50/70 border-blue-200'
                           : hasRes
-                          ? 'bg-rose-50/40 border-rose-200'
+                          ? 'bg-rose-50/60 border-rose-200'
                           : item.isReleased
-                          ? 'bg-emerald-50/70 border-emerald-300'
+                          ? 'bg-amber-50/50 border-amber-400'
                           : 'bg-slate-50/70 border-slate-200'
                       )}
                     >
@@ -786,23 +798,23 @@ export function AdminSchedulesTab() {
                         </div>
                         <p className="text-xs text-slate-600 truncate">
                           {hasClass
-                            ? `Aula: ${item.classMatch?.materia}`
+                            ? `Ocupado (Aula): ${item.classMatch?.materia}`
                             : hasRes
-                            ? 'Já reservado por usuário'
+                            ? 'Reservado por usuário'
                             : item.isReleased
-                            ? 'Liberado para agendamento'
-                            : 'Bloqueado (Padrão)'}
+                            ? 'Disponível para agendamento'
+                            : 'Indisponível (Bloqueado)'}
                         </p>
                       </div>
 
                       {hasClass ? (
-                        <span className="text-xs font-semibold text-emerald-800 flex items-center gap-1 shrink-0">
+                        <span className="text-xs font-semibold text-blue-800 flex items-center gap-1 shrink-0">
                           <GraduationCap className="h-3.5 w-3.5" />
-                          Grade
+                          Ocupado
                         </span>
                       ) : hasRes ? (
                         <span className="text-xs font-semibold text-rose-700 shrink-0">
-                          Ocupado
+                          Reservado
                         </span>
                       ) : (
                         <button
@@ -1008,8 +1020,8 @@ export function AdminSchedulesTab() {
                       try {
                         await deleteSlot(slot.id);
                         toast.success('Liberação removida.');
-                      } catch {
-                        toast.error('Erro ao remover liberação.');
+                      } catch (err) {
+                        toast.error(getFriendlyErrorMessage(err, 'Erro ao remover liberação.'));
                       } finally {
                         setIsMutatingSlots(false);
                       }
@@ -1339,9 +1351,13 @@ export function AdminSchedulesTab() {
                           <button
                             type="button"
                             onClick={async () => {
-                              await deleteException(ex.id, ex.titulo);
-                              setDeletingExId(null);
-                              toast.success('Exceção removida.');
+                              try {
+                                await deleteException(ex.id, ex.titulo);
+                                setDeletingExId(null);
+                                toast.success('Exceção removida.');
+                              } catch (err) {
+                                toast.error(getFriendlyErrorMessage(err, 'Erro ao remover exceção.'));
+                              }
                             }}
                             className="px-2.5 py-1 bg-red-600 text-white rounded-lg text-xs font-semibold cursor-pointer"
                           >

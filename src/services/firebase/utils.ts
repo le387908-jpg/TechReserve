@@ -50,10 +50,12 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     emailVerified: currentUser?.emailVerified || false,
     isAnonymous: currentUser?.isAnonymous || false,
     tenantId: currentUser?.tenantId || null,
-    providerInfo: currentUser?.providerData?.map(p => ({
-      providerId: p.providerId || 'unknown',
-      email: p.email || 'unknown',
-    })) || []
+    providerInfo: Array.isArray(currentUser?.providerData)
+      ? currentUser.providerData.map(p => ({
+          providerId: p?.providerId || 'unknown',
+          email: p?.email || 'unknown',
+        }))
+      : []
   };
 
   const errInfo: FirestoreErrorInfo = {
@@ -78,6 +80,83 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 
   console.error('Firestore Error: ', serialized);
   throw new Error(serialized);
+}
+
+/**
+ * Converte qualquer erro (incluindo JSON estruturado do FirestoreErrorInfo, códigos Firebase Auth/Firestore
+ * ou exceções de rede) em uma mensagem amigável e segura em português para exibição na interface.
+ */
+export function getFriendlyErrorMessage(
+  error: unknown,
+  fallbackMessage = 'Ocorreu um erro inesperado. Tente novamente.'
+): string {
+  if (!error) return fallbackMessage;
+
+  const rawMessage =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+      ? error
+      : typeof (error as { message?: unknown })?.message === 'string'
+      ? String((error as { message?: unknown }).message)
+      : '';
+
+  if (!rawMessage.trim()) return fallbackMessage;
+
+  let extractedError = rawMessage.trim();
+
+  // Caso seja um JSON serializado por handleFirestoreError
+  if (extractedError.startsWith('{') && extractedError.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(extractedError) as Partial<FirestoreErrorInfo>;
+      if (parsed && typeof parsed.error === 'string') {
+        extractedError = parsed.error;
+      }
+    } catch {
+      // Mantém a mensagem original caso não seja JSON válido
+    }
+  }
+
+  const lower = extractedError.toLowerCase();
+
+  if (
+    lower.includes('missing or insufficient permissions') ||
+    lower.includes('permission-denied') ||
+    lower.includes('permission_denied')
+  ) {
+    return 'Você não possui permissão para realizar esta operação ou sua sessão precisa ser revalidada.';
+  }
+
+  if (
+    lower.includes('quota exceeded') ||
+    lower.includes('resource-exhausted')
+  ) {
+    return 'Limite diário de operações do banco de dados atingido. Tente novamente mais tarde.';
+  }
+
+  if (
+    lower.includes('network') ||
+    lower.includes('offline') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('unavailable')
+  ) {
+    return 'Falha de conexão com o servidor. Verifique sua internet e tente novamente.';
+  }
+
+  if (lower.includes('not-found') || lower.includes('no document to update')) {
+    return 'O registro solicitado não foi encontrado ou já foi removido.';
+  }
+
+  if (lower.includes('already-exists')) {
+    return 'Este registro já existe no sistema.';
+  }
+
+  // Evita exibir payloads técnicos brutos ou stack traces na UI
+  if (extractedError.startsWith('{') || extractedError.length > 260) {
+    return fallbackMessage;
+  }
+
+  return extractedError;
 }
 
 /**
@@ -118,3 +197,39 @@ export async function withRetry<T>(
 
   throw lastError;
 }
+
+/**
+ * Remove recursivamente chaves com valor `undefined` de objetos planos e arrays antes de enviar
+ * ao Firebase Firestore (`addDoc`, `setDoc`, `updateDoc`, `batch.set`), prevenindo exceções
+ * `FirebaseError: Unsupported field value: undefined` em tempo de execução.
+ */
+export function stripUndefinedFields<T>(value: T): T {
+  if (value === undefined || value === null) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== undefined)
+      .map((item) => stripUndefinedFields(item)) as unknown as T;
+  }
+
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    // Preserva instâncias especiais (Date, FieldValue, Timestamp, DocumentReference, etc.)
+    if (proto !== null && proto !== Object.prototype) {
+      return value;
+    }
+
+    const cleaned: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) {
+        cleaned[k] = stripUndefinedFields(v);
+      }
+    }
+    return cleaned as T;
+  }
+
+  return value;
+}
+

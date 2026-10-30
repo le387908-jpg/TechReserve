@@ -20,9 +20,11 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Room, CalendarCourse, User as UserType, CalendarEvent } from '../../../types';
 import { useReservationStore } from '../../../store/useReservationStore';
 import { useScheduleStore } from '../../../store/useScheduleStore';
-import { useAvailableSlotsStore } from '../../../store/useAvailableSlotsStore';
+import {
+  normalizeTimeHHMM,
+  useAvailableSlotsStore,
+} from '../../../store/useAvailableSlotsStore';
 import { usePunishmentStore } from '../../../store/usePunishmentStore';
-import { checkReservationConflict } from '../../../utils/calendarTimeSlots';
 import {
   validateReservationRules,
   isBookingWindowOpen,
@@ -31,13 +33,16 @@ import {
 import {
   checkNoShowSuspensionForDate,
   checkWeeklyQuotaLocal,
+  doRoomNamesMatch,
   formatNoShowTag,
   getReleasedBlocksForRoomOnDate,
+  getReleasedDatesForRoom,
   getRoomScheduleSlotsForDate,
   isSpaceReleasedByAdmin,
 } from '../../../services/reservationService';
 import { RoomSlotSelector } from '../../../components/reservations/RoomSlotSelector';
 import { formatDataBR, createSafeLocalDateTime } from '../../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 import { toast } from 'sonner';
 
@@ -67,20 +72,26 @@ export function NewReservationModal({
   existingEvents = [],
 }: NewReservationModalProps) {
   const addReservation = useReservationStore((state) => state.addReservation);
-  const reservations = useReservationStore((state) => state.reservations);
+  const rawReservations = useReservationStore((state) => state.reservations);
   const scheduleConfig = useScheduleStore((state) => state.config);
-  const scheduleExceptions = useScheduleStore((state) => state.exceptions);
-  const availableSlots = useAvailableSlotsStore((state) => state.slots);
-  const punishments = usePunishmentStore((state) => state.punishments);
+  const rawScheduleExceptions = useScheduleStore((state) => state.exceptions);
+  const rawAvailableSlots = useAvailableSlotsStore((state) => state.slots);
+  const rawPunishments = usePunishmentStore((state) => state.punishments);
   const activePunishment = usePunishmentStore((state) => state.activePunishment);
+
+  const safeRooms = Array.isArray(rooms) ? rooms : [];
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
+  const scheduleExceptions = Array.isArray(rawScheduleExceptions) ? rawScheduleExceptions : [];
+  const availableSlots = Array.isArray(rawAvailableSlots) ? rawAvailableSlots : [];
+  const punishments = Array.isArray(rawPunishments) ? rawPunishments : [];
 
   const isAdmin = currentUser?.role === 'ADMIN';
 
   // Usuários comuns SÓ visualizam salas liberadas explicitamente pelo ADM
   const availableRooms = React.useMemo(() => {
-    if (isAdmin) return rooms;
-    return rooms.filter((r) => isSpaceReleasedByAdmin(r).released);
-  }, [rooms, isAdmin]);
+    if (isAdmin) return safeRooms;
+    return safeRooms.filter((r) => isSpaceReleasedByAdmin(r).released);
+  }, [safeRooms, isAdmin]);
 
   const effectivePunishments = React.useMemo(() => {
     if (isAdmin) return punishments;
@@ -105,8 +116,18 @@ export function NewReservationModal({
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const selectedRoomObj = React.useMemo(
-    () => availableRooms.find((r) => r.nome === selectedRoomName) || availableRooms[0],
+    () =>
+      availableRooms.find(
+        (r) =>
+          r.nome === selectedRoomName ||
+          (selectedRoomName ? doRoomNamesMatch(r.nome, selectedRoomName) : false)
+      ) || availableRooms[0],
     [availableRooms, selectedRoomName]
+  );
+
+  const roomDateLimits = React.useMemo(
+    () => getReservationDateLimits(new Date(), selectedRoomObj?.firestoreId),
+    [selectedRoomObj?.firestoreId, availableSlots, scheduleConfig]
   );
 
   const blockRelease = React.useMemo(
@@ -131,9 +152,28 @@ export function NewReservationModal({
         exceptions: scheduleExceptions,
         availableSlots,
         reservations,
+        currentUserId: currentUser?.id,
       }),
-    [selectedRoomObj, date, scheduleConfig, scheduleExceptions, availableSlots, reservations]
+    [
+      selectedRoomObj,
+      date,
+      scheduleConfig,
+      scheduleExceptions,
+      availableSlots,
+      reservations,
+      currentUser?.id,
+    ]
   );
+
+  const resolvedAvailableSlotId = React.useMemo(() => {
+    const match = slotScheduleView.slots.find(
+      (s) =>
+        s.selectableForUser &&
+        s.inicio === normalizeTimeHHMM(startTime) &&
+        s.fim === normalizeTimeHHMM(endTime)
+    );
+    return match?.availableSlotId || selectedAvailableSlotId;
+  }, [slotScheduleView.slots, startTime, endTime, selectedAvailableSlotId]);
 
   const quotaCheck = React.useMemo(() => {
     if (!currentUser || isAdmin) return null;
@@ -147,27 +187,66 @@ export function NewReservationModal({
 
   React.useEffect(() => {
     if (isOpen) {
-      const limits = getReservationDateLimits();
       const chosenRoom =
-        availableRooms.find((r) => r.nome === initialRoomName) || availableRooms[0];
+        availableRooms.find(
+          (r) =>
+            initialRoomName &&
+            (r.nome === initialRoomName || doRoomNamesMatch(r.nome, initialRoomName))
+        ) || availableRooms[0];
+      const limits = getReservationDateLimits(new Date(), chosenRoom?.firestoreId);
       setSelectedRoomName(chosenRoom?.nome ?? '');
-      const validInitial =
+
+      let validInitial =
         initialDate && initialDate >= limits.minDate && (isAdmin || initialDate <= limits.maxDate)
           ? initialDate
           : limits.minDate;
-      setDate(validInitial);
 
-      const initialView = getRoomScheduleSlotsForDate({
+      let initialView = getRoomScheduleSlotsForDate({
         room: chosenRoom,
         dateISO: validInitial,
         config: scheduleConfig,
         exceptions: scheduleExceptions,
         availableSlots,
         reservations,
+        currentUserId: currentUser?.id,
       });
+
+      if (!isAdmin && initialView.reservableCount === 0 && chosenRoom) {
+        const releasedDates = getReleasedDatesForRoom(
+          chosenRoom,
+          limits.todayStr,
+          availableSlots
+        );
+        for (const candidateDate of releasedDates) {
+          const checkNoShow = checkNoShowSuspensionForDate(
+            currentUser,
+            effectivePunishments,
+            candidateDate
+          );
+          if (checkNoShow.blocked) continue;
+          const candidateView = getRoomScheduleSlotsForDate({
+            room: chosenRoom,
+            dateISO: candidateDate,
+            config: scheduleConfig,
+            exceptions: scheduleExceptions,
+            availableSlots,
+            reservations,
+            currentUserId: currentUser?.id,
+          });
+          if (candidateView.reservableCount > 0) {
+            validInitial = candidateDate;
+            initialView = candidateView;
+            break;
+          }
+        }
+      }
+
+      setDate(validInitial);
+
       const reservable = initialView.slots.filter((s) => s.selectableForUser);
-      const matched = initialStartTime
-        ? reservable.find((s) => s.inicio === initialStartTime)
+      const normPrefillStart = initialStartTime ? normalizeTimeHHMM(initialStartTime) : '';
+      const matched = normPrefillStart
+        ? reservable.find((s) => s.inicio === normPrefillStart) || reservable[0]
         : reservable[0];
 
       if (matched) {
@@ -175,7 +254,7 @@ export function NewReservationModal({
         setEndTime(matched.fim);
         setSelectedAvailableSlotId(matched.availableSlotId);
       } else if (isAdmin) {
-        setStartTime(initialStartTime || scheduleConfig.janelaInicio || '17:00');
+        setStartTime(normPrefillStart || scheduleConfig.janelaInicio || '17:00');
         setEndTime('17:50');
         setSelectedAvailableSlotId(undefined);
       } else {
@@ -195,7 +274,9 @@ export function NewReservationModal({
     const reservable = slotScheduleView.slots.filter((s) => s.selectableForUser);
     if (reservable.length > 0) {
       const stillValid = reservable.find(
-        (s) => s.inicio === startTime && s.fim === endTime
+        (s) =>
+          s.inicio === normalizeTimeHHMM(startTime) &&
+          s.fim === normalizeTimeHHMM(endTime)
       );
       if (stillValid) {
         if (selectedAvailableSlotId !== stillValid.availableSlotId) {
@@ -214,11 +295,58 @@ export function NewReservationModal({
   }, [date, selectedRoomObj?.firestoreId, slotScheduleView.slots, isAdmin, isOpen]);
 
   const conflictCheck = React.useMemo(() => {
-    if (!existingEvents.length || !date || !startTime || !endTime || !selectedRoomName) {
-      return { hasConflict: false };
+    if (!selectedRoomObj || !date || !startTime || !endTime) {
+      return { hasConflict: false as const };
     }
-    return checkReservationConflict(existingEvents, date, selectedRoomName, startTime, endTime);
-  }, [existingEvents, date, selectedRoomName, startTime, endTime]);
+    const normStart = normalizeTimeHHMM(startTime);
+    const normEnd = normalizeTimeHHMM(endTime);
+    if (normStart >= normEnd) {
+      return {
+        hasConflict: true as const,
+        conflictReason: 'O horário de início deve ser anterior ao horário de término.',
+      };
+    }
+
+    const overlappingClass = slotScheduleView.curriculumClasses.find(
+      (aula) => normStart < aula.horarioFim && normEnd > aula.horarioInicio
+    );
+    if (overlappingClass) {
+      return {
+        hasConflict: true as const,
+        conflictReason: `Horário ocupado por aula regular da grade: "${overlappingClass.materia}" (${overlappingClass.horarioInicio} às ${overlappingClass.horarioFim}).`,
+      };
+    }
+
+    const overlappingRes = reservations.find(
+      (r) =>
+        r.data === date &&
+        (r.status === 'PENDENTE' || r.status === 'CONFIRMADA') &&
+        (r.salaId === selectedRoomObj.firestoreId ||
+          Boolean(selectedRoomObj.id && r.salaInstitutionalId === selectedRoomObj.id) ||
+          Boolean(r.salaNome && doRoomNamesMatch(r.salaNome, selectedRoomObj.nome))) &&
+        normStart < normalizeTimeHHMM(r.fim) &&
+        normEnd > normalizeTimeHHMM(r.inicio)
+    );
+    if (overlappingRes) {
+      return {
+        hasConflict: true as const,
+        conflictReason:
+          overlappingRes.usuarioId === currentUser?.id
+            ? `Você já possui uma reserva ativa neste horário (${overlappingRes.inicio} às ${overlappingRes.fim}).`
+            : `Este horário (${overlappingRes.inicio} às ${overlappingRes.fim}) já está reservado por outro usuário.`,
+      };
+    }
+
+    return { hasConflict: false as const };
+  }, [
+    selectedRoomObj,
+    date,
+    startTime,
+    endTime,
+    slotScheduleView.curriculumClasses,
+    reservations,
+    currentUser?.id,
+  ]);
 
   if (!isOpen) return null;
 
@@ -238,7 +366,7 @@ export function NewReservationModal({
     (!isAdmin &&
       (!blockRelease.released ||
         slotScheduleView.reservableCount === 0 ||
-        !selectedAvailableSlotId));
+        !resolvedAvailableSlotId));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -261,7 +389,7 @@ export function NewReservationModal({
         toast.error(quotaCheck.error);
         return;
       }
-      if (!blockRelease.released || !selectedAvailableSlotId) {
+      if (!blockRelease.released || !resolvedAvailableSlotId) {
         toast.error(
           blockRelease.reason ||
             'Indisponível - Aguardando liberação da coordenação para esta sala nesta data.'
@@ -270,16 +398,19 @@ export function NewReservationModal({
       }
     }
 
-    const room = availableRooms.find((r) => r.nome === selectedRoomName) || availableRooms[0];
+    const room = selectedRoomObj || availableRooms[0];
     if (!room) {
       toast.error('Nenhuma sala liberada pelo administrador foi selecionada.');
       return;
     }
 
+    const normStart = normalizeTimeHHMM(startTime);
+    const normEnd = normalizeTimeHHMM(endTime);
+
     const validation = validateReservationRules({
       date,
-      startTime,
-      endTime,
+      startTime: normStart,
+      endTime: normEnd,
       salaFirestoreId: room.firestoreId,
       isAdmin,
     });
@@ -295,7 +426,7 @@ export function NewReservationModal({
       return;
     }
 
-    const startDateTime = createSafeLocalDateTime(date, startTime);
+    const startDateTime = createSafeLocalDateTime(date, normStart);
 
     setIsSubmitting(true);
     try {
@@ -305,9 +436,9 @@ export function NewReservationModal({
         salaNome: room.nome,
         usuarioId: currentUser.id,
         data: date,
-        inicio: startTime,
-        fim: endTime,
-        availableSlotId: isAdmin ? undefined : selectedAvailableSlotId,
+        inicio: normStart,
+        fim: normEnd,
+        availableSlotId: isAdmin ? undefined : resolvedAvailableSlotId,
         status: isAdmin ? 'CONFIRMADA' : 'PENDENTE',
         checkInExpiracao: isAdmin ? null : startDateTime.getTime() + 5 * 60 * 1000,
         checkInRealizado: isAdmin,
@@ -321,9 +452,10 @@ export function NewReservationModal({
     } catch (err: any) {
       console.error(err);
       toast.error(
-        err?.message && !String(err.message).startsWith('{')
-          ? err.message
-          : 'Erro ao registrar reserva. Verifique sua cota semanal e permissões.'
+        getFriendlyErrorMessage(
+          err,
+          'Erro ao registrar reserva. Verifique sua cota semanal e permissões.'
+        )
       );
     } finally {
       setIsSubmitting(false);
@@ -417,7 +549,7 @@ export function NewReservationModal({
                   </span>
                   <span aria-hidden="true">·</span>
                   <span>
-                    Antecedência até: <strong>{formatDataBR(dateLimits.maxDate)}</strong>
+                    Antecedência até: <strong>{formatDataBR(roomDateLimits.maxDate)}</strong>
                   </span>
                 </div>
               </div>
@@ -484,8 +616,8 @@ export function NewReservationModal({
               <input
                 type="date"
                 value={date}
-                min={dateLimits.minDate}
-                max={isAdmin ? undefined : dateLimits.maxDate}
+                min={roomDateLimits.minDate}
+                max={isAdmin ? undefined : roomDateLimits.maxDate}
                 onChange={(e) => setDate(e.target.value)}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-fatec-red"
                 required
@@ -498,6 +630,7 @@ export function NewReservationModal({
               date={date}
               selectedStartTime={startTime}
               selectedEndTime={endTime}
+              onSelectDate={setDate}
               onSelectSlot={(slot) => {
                 setStartTime(slot.inicio);
                 setEndTime(slot.fim);

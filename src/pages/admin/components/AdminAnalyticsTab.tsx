@@ -38,6 +38,7 @@ import {
 } from '../../../types';
 import { REALTIME_SPACE_STATUS_LABELS, SPACE_CATEGORY_LABELS } from '../../../constants';
 import { formatDataBR, getTodayLocalISO } from '../../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 
 /**
@@ -50,9 +51,12 @@ import { cn } from '../../../lib/utils';
  * - Histórico auditável de ações (`logs`) com busca, filtro e exportação CSV
  */
 export function AdminAnalyticsTab() {
-  const { rooms, toggleMaintenanceOneClick } = useRoomStore();
-  const reservations = useReservationStore((state) => state.reservations);
-  const { logs, loading: loadingLogs, fetchLogs } = useLogStore();
+  const { rooms: rawRooms, toggleMaintenanceOneClick } = useRoomStore();
+  const rooms = Array.isArray(rawRooms) ? rawRooms : [];
+  const rawReservations = useReservationStore((state) => state.reservations);
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
+  const { logs: rawLogs, loading: loadingLogs, fetchLogs } = useLogStore();
+  const logs = Array.isArray(rawLogs) ? rawLogs : [];
 
   const [now, setNow] = useState(() => new Date());
   const [matrixCategory, setMatrixCategory] = useState<'TODAS' | SpaceCategory>('TODAS');
@@ -63,7 +67,11 @@ export function AdminAnalyticsTab() {
     const unsub = fetchLogs();
     const timer = setInterval(() => setNow(new Date()), 15000);
     return () => {
-      unsub();
+      try {
+        unsub();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
       clearInterval(timer);
     };
   }, [fetchLogs]);
@@ -175,10 +183,11 @@ export function AdminAnalyticsTab() {
 
   const filteredLogs = useMemo(() => {
     return logs.filter((l) => {
+      if (!l) return false;
       if (logEntityFilter !== 'TODOS' && l.entidade !== logEntityFilter) return false;
       if (logSearch.trim()) {
         const q = logSearch.toLowerCase();
-        const hay = `${l.acao} ${l.usuarioNome} ${l.detalhes} ${l.entidade}`.toLowerCase();
+        const hay = `${l.acao || ''} ${l.usuarioNome || ''} ${l.detalhes || ''} ${l.entidade || ''}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -190,25 +199,29 @@ export function AdminAnalyticsTab() {
       toast.error('Não há registros no filtro atual para exportar.');
       return;
     }
-    const header = ['Data_Hora', 'Entidade', 'Acao', 'Responsavel', 'Detalhes'];
-    const rows = filteredLogs.map((l) => [
-      new Date(l.createdAt).toLocaleString('pt-BR'),
-      l.entidade,
-      l.acao,
-      `"${(l.usuarioNome || '').replace(/"/g, '""')}"`,
-      `"${(l.detalhes || '').replace(/"/g, '""')}"`,
-    ]);
-    const csv = [header.join(';'), ...rows.map((r) => r.join(';'))].join('\n');
-    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `auditoria_techreserve_${todayISO}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    toast.success('Relatório de auditoria exportado em CSV.');
+    try {
+      const header = ['Data_Hora', 'Entidade', 'Acao', 'Responsavel', 'Detalhes'];
+      const rows = filteredLogs.map((l) => [
+        l?.createdAt ? new Date(l.createdAt).toLocaleString('pt-BR') : '',
+        l?.entidade || '',
+        l?.acao || '',
+        `"${(l?.usuarioNome || '').replace(/"/g, '""')}"`,
+        `"${(l?.detalhes || '').replace(/"/g, '""')}"`,
+      ]);
+      const csv = [header.join(';'), ...rows.map((r) => r.join(';'))].join('\n');
+      const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `auditoria_techreserve_${todayISO}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast.success('Relatório de auditoria exportado em CSV.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Falha ao exportar relatório CSV.'));
+    }
   };
 
   return (
@@ -389,12 +402,21 @@ export function AdminAnalyticsTab() {
                     <button
                       type="button"
                       onClick={async () => {
-                        await toggleMaintenanceOneClick(room);
-                        toast.success(
-                          status === 'MANUTENCAO'
-                            ? `${room.id} liberado para uso.`
-                            : `${room.id} colocado em manutenção.`
-                        );
+                        try {
+                          await toggleMaintenanceOneClick(room);
+                          toast.success(
+                            status === 'MANUTENCAO'
+                              ? `${room.id} liberado para uso.`
+                              : `${room.id} colocado em manutenção.`
+                          );
+                        } catch (err) {
+                          toast.error(
+                            getFriendlyErrorMessage(
+                              err,
+                              'Não foi possível alterar o status de manutenção do ambiente.'
+                            )
+                          );
+                        }
                       }}
                       title={
                         status === 'MANUTENCAO'

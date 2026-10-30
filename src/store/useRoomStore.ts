@@ -16,7 +16,13 @@ import {
 } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
 import { RealtimeSpaceStatus, Room, inferSpaceCategory } from '../types';
-import { OperationType, handleFirestoreError, withRetry } from '../services/firebase/utils';
+import {
+  OperationType,
+  getFriendlyErrorMessage,
+  handleFirestoreError,
+  stripUndefinedFields,
+  withRetry,
+} from '../services/firebase/utils';
 import { useLogStore } from './useLogStore';
 import { useAuthStore } from './useAuthStore';
 import { INITIAL_ROOMS } from '../data/initialRooms';
@@ -25,6 +31,7 @@ import { REALTIME_SPACE_STATUS_LABELS } from '../constants';
 interface RoomState {
   rooms: Room[];
   loading: boolean;
+  initialized: boolean;
   error: string | null;
 
   fetchRooms: () => () => void;
@@ -48,10 +55,11 @@ function assertAdminRole(): void {
 export const useRoomStore = create<RoomState>((set, get) => ({
   rooms: [],
   loading: false,
+  initialized: false,
   error: null,
 
   fetchRooms: () => {
-    set({ loading: true });
+    set({ loading: true, error: null });
     const q = query(collection(db, 'salas'), orderBy('nome', 'asc'));
 
     const unsubscribe = onSnapshot(
@@ -59,12 +67,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       async (snapshot) => {
         const now = Date.now();
         const rooms = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
+          const data = docSnap.data() || {};
           const base = {
             ...data,
             firestoreId: docSnap.id,
             id: data.id || docSnap.id,
             codigo: data.codigo || '',
+            nome: String(data.nome || 'Ambiente Institucional'),
+            andar: String(data.andar || 'Fatec Franco da Rocha'),
+            capacidade: Number(data.capacidade ?? 0),
+            equipamentos: Array.isArray(data.equipamentos) ? data.equipamentos : [],
             liberadaParaReserva: data.liberadaParaReserva !== false,
           } as Room;
           base.categoria = inferSpaceCategory(base);
@@ -84,13 +96,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
                   updatedAt: now,
                 });
 
-                await useLogStore.getState().addLog({
-                  acao: 'LIBERAR_SALA_AUTOMATICO',
-                  usuarioId: 'SISTEMA',
-                  usuarioNome: 'Sistema (Auto-Liberador)',
-                  entidade: 'SALAS',
-                  detalhes: `O bloqueio temporário da sala ${room.nome} expirou e o ambiente foi reativado.`,
-                });
+                await useLogStore
+                  .getState()
+                  .addLog({
+                    acao: 'LIBERAR_SALA_AUTOMATICO',
+                    usuarioId: 'SISTEMA',
+                    usuarioNome: 'Sistema (Auto-Liberador)',
+                    entidade: 'SALAS',
+                    detalhes: `O bloqueio temporário da sala ${room.nome} expirou e o ambiente foi reativado.`,
+                  })
+                  .catch(() => {});
               } catch (err) {
                 console.error(`Erro ao liberar sala ${room.nome} automaticamente:`, err);
               }
@@ -98,10 +113,19 @@ export const useRoomStore = create<RoomState>((set, get) => ({
           }
         }
 
-        set({ rooms, loading: false });
+        set({ rooms, loading: false, initialized: true, error: null });
       },
       (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'salas');
+        try {
+          handleFirestoreError(error, OperationType.LIST, 'salas');
+        } catch {
+          // Erro registrado estruturadamente
+        }
+        set({
+          loading: false,
+          initialized: true,
+          error: getFriendlyErrorMessage(error, 'Erro ao sincronizar ambientes.'),
+        });
       }
     );
 
@@ -138,30 +162,35 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     assertAdminRole();
     try {
       const now = Date.now();
-      const cleanData: Record<string, unknown> = {};
-      Object.entries(roomData).forEach(([k, v]) => {
-        if (v !== undefined) cleanData[k] = v;
-      });
+      const cleanData = stripUndefinedFields(
+        roomData as unknown as Record<string, unknown>
+      );
 
       await withRetry(() =>
-        addDoc(collection(db, 'salas'), {
-          ...cleanData,
-          liberadaParaReserva: roomData.liberadaParaReserva !== false,
-          categoria: inferSpaceCategory(roomData),
-          createdAt: now,
-          updatedAt: now,
-        })
+        addDoc(
+          collection(db, 'salas'),
+          stripUndefinedFields({
+            ...cleanData,
+            liberadaParaReserva: roomData.liberadaParaReserva !== false,
+            categoria: inferSpaceCategory(roomData),
+            createdAt: now,
+            updatedAt: now,
+          })
+        )
       );
 
       const { user } = useAuthStore.getState();
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'CRIAR_SALA',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'SALAS',
-          detalhes: `Espaço "${roomData.nome}" (${roomData.id}) cadastrado no inventário.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'CRIAR_SALA',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'SALAS',
+            detalhes: `Espaço "${roomData.nome}" (${roomData.id}) cadastrado no inventário.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'salas');
@@ -171,28 +200,31 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   updateRoom: async (firestoreId, data) => {
     assertAdminRole();
     try {
-      const cleanData: Record<string, unknown> = {};
-      Object.entries(data).forEach(([k, v]) => {
-        if (v !== undefined) cleanData[k] = v;
-      });
+      const cleanData = stripUndefinedFields(data as unknown as Record<string, unknown>);
 
       const roomRef = doc(db, 'salas', firestoreId);
       await withRetry(() =>
-        updateDoc(roomRef, {
-          ...cleanData,
-          updatedAt: Date.now(),
-        })
+        updateDoc(
+          roomRef,
+          stripUndefinedFields({
+            ...cleanData,
+            updatedAt: Date.now(),
+          })
+        )
       );
 
       const { user } = useAuthStore.getState();
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'ATUALIZAR_SALA',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'SALAS',
-          detalhes: `Espaço ${data.nome || firestoreId} atualizado no inventário.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'ATUALIZAR_SALA',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'SALAS',
+            detalhes: `Espaço ${data.nome || firestoreId} atualizado no inventário.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `salas/${firestoreId}`);
@@ -219,13 +251,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       );
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'STATUS_ESPACO_TEMPO_REAL',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'SALAS',
-          detalhes: `Status de "${room.nome}" (${room.id}) alterado em tempo real para "${REALTIME_SPACE_STATUS_LABELS[targetStatus]}".`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'STATUS_ESPACO_TEMPO_REAL',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'SALAS',
+            detalhes: `Status de "${room.nome}" (${room.id}) alterado em tempo real para "${REALTIME_SPACE_STATUS_LABELS[targetStatus]}".`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `salas/${room.firestoreId}`);
@@ -259,15 +294,18 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       );
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: nextReleased ? 'LIBERAR_SALA_RESERVAS' : 'BLOQUEAR_SALA_RESERVAS',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'SALAS',
-          detalhes: `Sala "${room.nome}" (${room.id}) ${
-            nextReleased ? 'liberada explicitamente' : 'bloqueada'
-          } pelo ADM para reservas de usuários comuns.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: nextReleased ? 'LIBERAR_SALA_RESERVAS' : 'BLOQUEAR_SALA_RESERVAS',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'SALAS',
+            detalhes: `Sala "${room.nome}" (${room.id}) ${
+              nextReleased ? 'liberada explicitamente' : 'bloqueada'
+            } pelo ADM para reservas de usuários comuns.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `salas/${room.firestoreId}`);
@@ -281,13 +319,16 @@ export const useRoomStore = create<RoomState>((set, get) => ({
 
       const { user } = useAuthStore.getState();
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'EXCLUIR_SALA',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'SALAS',
-          detalhes: `Espaço "${roomName || firestoreId}" excluído do inventário.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'EXCLUIR_SALA',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'SALAS',
+            detalhes: `Espaço "${roomName || firestoreId}" excluído do inventário.`,
+          })
+          .catch(() => {});
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `salas/${firestoreId}`);

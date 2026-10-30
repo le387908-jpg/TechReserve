@@ -64,6 +64,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const unsubscribe = subscribeToTabAuthState({
       onAuthenticated: (userData) => {
+        if (!userData?.id) {
+          syncTabAuthState({
+            user: null,
+            loading: false,
+            initialized: true,
+            error: null,
+          });
+          return;
+        }
         if (lastTabUidRef.current && lastTabUidRef.current !== userData.id) {
           clearCurrentTabDataStores();
         }
@@ -102,14 +111,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       window.clearTimeout(safetyTimeout);
-      unsubscribe();
+      try {
+        unsubscribe();
+      } catch (err) {
+        console.warn('[AuthContext] Erro ao cancelar inscrição de auth:', err);
+      }
     };
   }, [syncTabAuthState]);
 
   const signOut = React.useCallback(async () => {
-    await storeSignOut();
-    lastTabUidRef.current = null;
-    clearCurrentTabDataStores();
+    try {
+      await storeSignOut();
+    } finally {
+      lastTabUidRef.current = null;
+      clearCurrentTabDataStores();
+    }
   }, [storeSignOut]);
 
   const value = useMemo<AuthContextValue>(

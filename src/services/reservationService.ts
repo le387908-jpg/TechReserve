@@ -27,10 +27,13 @@ import { getDayNameFromISO, isSundayOrHoliday } from '../utils/reservationRules'
 import { GRADE_CURRICULAR_FATEC } from '../data/gradeCurricular';
 import {
   buildAvailableSlotId,
+  hydrateAvailableSlotDoc,
   isSlotActiveOrReleased,
   matchesSlotRoom,
+  normalizeTimeHHMM,
   useAvailableSlotsStore,
 } from '../store/useAvailableSlotsStore';
+import { useAuthStore } from '../store/useAuthStore';
 
 /**
  * Mensagem estrita exigida para bloqueio por cota semanal atingida.
@@ -52,8 +55,8 @@ export function formatNoShowTag(dateISO: string): string {
 }
 
 /**
- * Normaliza texto removendo acentos e pontuação supérflua para casamento seguro entre
- * nomes da grade curricular (`1º. andar Sala 3`) e cadastro de salas (`Sala de Aula 03...`).
+ * Normaliza texto removendo acentos, pontuação supérflua e zeros à esquerda em números
+ * (`Sala 01` == `Sala 1`), sem jamais confundir `Sala 1` com `Sala 10`.
  */
 function normalizeRoomToken(value: string): string {
   return (value || '')
@@ -61,8 +64,71 @@ function normalizeRoomToken(value: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[ºª.]/g, ' ')
+    .replace(/\b0+(\d+)\b/g, '$1')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * Compara dois nomes de sala/laboratório com segurança contra colisão numérica
+ * (ex: `"1º. andar Sala 1"` NUNCA colide com `"1º. andar Sala 10"`).
+ */
+export function doRoomNamesMatch(nameA: string, nameB: string): boolean {
+  const normA = normalizeRoomToken(nameA);
+  const normB = normalizeRoomToken(nameB);
+  if (!normA || !normB) return false;
+  if (normA === normB) return true;
+
+  // Se ambos citam uma sala numerada ("sala X" / "sala de aula X"), os números devem coincidir exatamente
+  const salaNumA = normA.match(/\bsala\s*(?:de\s*aula\s*)?(\d+)\b/);
+  const salaNumB = normB.match(/\bsala\s*(?:de\s*aula\s*)?(\d+)\b/);
+  if (salaNumA && salaNumB) {
+    return salaNumA[1] === salaNumB[1];
+  }
+  if (salaNumA || salaNumB) {
+    return false;
+  }
+
+  // Se ambos citam um laboratório de informática numerado ("lab info X"), os números devem coincidir
+  const labInfoA = normA.match(/\blab(?:oratorio)?\s*(?:de\s*)?info(?:rmatica)?\s*(\d+)\b/);
+  const labInfoB = normB.match(/\blab(?:oratorio)?\s*(?:de\s*)?info(?:rmatica)?\s*(\d+)\b/);
+  if (labInfoA && labInfoB) {
+    return labInfoA[1] === labInfoB[1];
+  }
+  if (labInfoA || labInfoB) {
+    return false;
+  }
+
+  // Para espaços nomeados sem sufixo numérico conflitante (ex: Auditório, Química, Hidráulica, Braile, AutoCAD)
+  const keywords = [
+    'auditorio',
+    'quimica',
+    'hidraulica',
+    'eletrotecnica',
+    'fisica',
+    'materiais',
+    'instalacoes',
+    'braile',
+    'braille',
+    'autocad',
+    'biblioteca',
+    'maquete',
+    'vidro',
+    'desenho',
+  ];
+  for (const kw of keywords) {
+    if (normA.includes(kw) && normB.includes(kw)) {
+      return true;
+    }
+  }
+
+  // Fallback por fronteira de palavras inteiras (impede "sala 1" de casar com "sala 10")
+  const escapedA = normA.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escapedB = normB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return (
+    new RegExp(`(?:^|\\s)${escapedA}(?:$|\\s)`).test(normB) ||
+    new RegExp(`(?:^|\\s)${escapedB}(?:$|\\s)`).test(normA)
+  );
 }
 
 /**
@@ -73,14 +139,10 @@ export function doesCurriculumClassMatchRoom(
   room: Pick<Room, 'id' | 'codigo' | 'nome'>
 ): boolean {
   const normAula = normalizeRoomToken(aulaSala);
-  const normNome = normalizeRoomToken(room.nome);
   const normId = (room.id || '').toUpperCase().trim();
   const normCodigo = (room.codigo || '').toUpperCase().trim();
 
   if (!normAula) return false;
-  if (normNome && (normAula.includes(normNome) || normNome.includes(normAula))) {
-    return true;
-  }
 
   // Salas numeradas: SALA-001 .. SALA-012 -> casa exatamente "sala 1" / "sala 01", sem confundir 1 com 10/11/12
   const salaMatch = normId.match(/^SALA-0*(\d+)$/);
@@ -142,7 +204,7 @@ export function doesCurriculumClassMatchRoom(
     return normAula.includes('vidro');
   }
 
-  return false;
+  return doRoomNamesMatch(aulaSala, room.nome);
 }
 
 /**
@@ -158,7 +220,31 @@ export function getCurriculumClassesForRoomOnDate(
 
   return GRADE_CURRICULAR_FATEC.filter(
     (aula) => aula.diaSemana === dayName && doesCurriculumClassMatchRoom(aula.sala, room)
-  ).sort((a, b) => a.horarioInicio.localeCompare(b.horarioInicio));
+  ).sort((a, b) => (a.horarioInicio || '').localeCompare(b.horarioInicio || ''));
+}
+
+/**
+ * Retorna todas as datas ISO (`>= minDateISO`) que possuem ao menos 1 horário liberado pelo ADM
+ * em `available_slots` para a sala informada.
+ */
+export function getReleasedDatesForRoom(
+  room: Room | undefined | null,
+  minDateISO: string,
+  availableSlotsOverride?: AvailableSlot[]
+): string[] {
+  if (!room) return [];
+  const rawSlots = availableSlotsOverride ?? useAvailableSlotsStore.getState().slots;
+  const allSlots = Array.isArray(rawSlots) ? rawSlots : [];
+  const dateSet = new Set<string>();
+
+  for (const slot of allSlots) {
+    if (!slot?.data || slot.data < minDateISO) continue;
+    if (!isSlotActiveOrReleased(slot)) continue;
+    if (!matchesSlotRoom(slot, room)) continue;
+    dateSet.add(slot.data);
+  }
+
+  return Array.from(dateSet).sort((a, b) => a.localeCompare(b));
 }
 
 /**
@@ -249,43 +335,49 @@ export function getReleasedBlocksForRoomOnDate(
   reason?: string;
   exception?: ScheduleException;
 } {
-  if (!room) {
+  const safeJanelaInicio = config?.janelaInicio || '07:00';
+  const safeJanelaFim = config?.janelaFim || '22:00';
+  const safeExceptions = Array.isArray(exceptions) ? exceptions : [];
+
+  if (!room || !dateISO) {
     return {
       released: false,
       blocks: [],
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
-      reason: 'Selecione uma sala válida.',
+      janelaInicio: safeJanelaInicio,
+      janelaFim: safeJanelaFim,
+      reason: 'Selecione uma sala e uma data válidas.',
     };
   }
+
+  const normalizedDate = normalizeDateToISO(dateISO);
 
   const spaceCheck = isSpaceReleasedByAdmin(room, now);
   if (!spaceCheck.released) {
     return {
       released: false,
       blocks: [],
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
+      janelaInicio: safeJanelaInicio,
+      janelaFim: safeJanelaFim,
       reason: spaceCheck.reason,
     };
   }
 
-  if (!config.reservasAbertas) {
+  if (config && config.reservasAbertas === false) {
     return {
       released: false,
       blocks: [],
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
+      janelaInicio: safeJanelaInicio,
+      janelaFim: safeJanelaFim,
       reason: 'A abertura de novos agendamentos encontra-se suspensa pela Coordenação.',
     };
   }
 
   // Verifica exceção específica da sala primeiro; caso não exista, verifica exceção global ('TODAS')
-  const roomSpecificException = exceptions.find(
-    (ex) => ex.data === dateISO && ex.salaId === room.firestoreId
+  const roomSpecificException = safeExceptions.find(
+    (ex) => ex?.data === normalizedDate && ex.salaId === room.firestoreId
   );
-  const globalException = exceptions.find(
-    (ex) => ex.data === dateISO && (!ex.salaId || ex.salaId === 'TODAS')
+  const globalException = safeExceptions.find(
+    (ex) => ex?.data === normalizedDate && (!ex.salaId || ex.salaId === 'TODAS')
   );
   const exception = roomSpecificException || globalException;
 
@@ -293,8 +385,8 @@ export function getReleasedBlocksForRoomOnDate(
     return {
       released: false,
       blocks: [],
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
+      janelaInicio: safeJanelaInicio,
+      janelaFim: safeJanelaFim,
       reason: `Data fechada pelo ADM (${exception.titulo}${
         exception.motivo ? `: ${exception.motivo}` : ''
       }).`,
@@ -302,17 +394,69 @@ export function getReleasedBlocksForRoomOnDate(
     };
   }
 
-  if (!exception && isSundayOrHoliday(dateISO)) {
+  const rawSlots = availableSlotsOverride ?? useAvailableSlotsStore.getState().slots;
+  const allSlots = Array.isArray(rawSlots) ? rawSlots : [];
+  const curriculumClasses = getCurriculumClassesForRoomOnDate(room, normalizedDate);
+
+  // Filtra apenas os documentos de `available_slots` com status `liberado`/`ativo`/`disponivel` para a sala e data,
+  // excluindo eventuais sobreposições com aulas regulares da grade acadêmica.
+  const explicitReleased = allSlots
+    .filter((slot) => {
+      if (!slot || slot.data !== normalizedDate) return false;
+      if (!matchesSlotRoom(slot, room)) return false;
+      if (!isSlotActiveOrReleased(slot)) return false;
+
+      const overlapsClass = curriculumClasses.some(
+        (aula) => slot.inicio < aula.horarioFim && slot.fim > aula.horarioInicio
+      );
+      return !overlapsClass;
+    })
+    .sort((a, b) => (a.inicio || '').localeCompare(b.inicio || ''));
+
+  const baseJanelaInicio = exception?.janelaInicio || safeJanelaInicio;
+  const baseJanelaFim = exception?.janelaFim || safeJanelaFim;
+
+  // Se o ADM liberou explicitamente horários em `available_slots` para esta sala e data,
+  // respeita imediatamente a liberação explícita da coordenação.
+  if (explicitReleased.length > 0) {
+    const releasedBlocks = explicitReleased.map((slot) => ({
+      id: slot.id,
+      availableSlotId: slot.id,
+      label: slot.label || `Horário ${slot.inicio}–${slot.fim}`,
+      inicio: normalizeTimeHHMM(slot.inicio),
+      fim: normalizeTimeHHMM(slot.fim),
+      ativo: true,
+    }));
+
+    const effectiveJanelaInicio = releasedBlocks.reduce(
+      (min, b) => (b.inicio < min ? b.inicio : min),
+      releasedBlocks[0].inicio
+    );
+    const effectiveJanelaFim = releasedBlocks.reduce(
+      (max, b) => (b.fim > max ? b.fim : max),
+      releasedBlocks[0].fim
+    );
+
+    return {
+      released: true,
+      blocks: releasedBlocks,
+      janelaInicio: effectiveJanelaInicio,
+      janelaFim: effectiveJanelaFim,
+      exception,
+    };
+  }
+
+  if (!exception && isSundayOrHoliday(normalizedDate)) {
     return {
       released: false,
       blocks: [],
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
+      janelaInicio: baseJanelaInicio,
+      janelaFim: baseJanelaFim,
       reason: 'Não há horários liberados aos domingos ou feriados oficiais.',
     };
   }
 
-  const dayName = getDayNameFromISO(dateISO);
+  const dayName = getDayNameFromISO(normalizedDate);
   if (
     !exception &&
     (dayName === 'Domingo' ||
@@ -323,67 +467,18 @@ export function getReleasedBlocksForRoomOnDate(
     return {
       released: false,
       blocks: [],
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
+      janelaInicio: baseJanelaInicio,
+      janelaFim: baseJanelaFim,
       reason: `O administrador não habilitou agendamentos para ${dayName}.`,
     };
   }
 
-  const allSlots = availableSlotsOverride ?? useAvailableSlotsStore.getState().slots;
-  const curriculumClasses = getCurriculumClassesForRoomOnDate(room, dateISO);
-
-  // Filtra apenas os documentos de `available_slots` com status `liberado` ou `ativo` para a sala e data,
-  // excluindo eventuais sobreposições com aulas regulares da grade acadêmica.
-  const explicitReleased = allSlots
-    .filter((slot) => {
-      if (slot.data !== dateISO) return false;
-      if (!matchesSlotRoom(slot, room)) return false;
-      if (!isSlotActiveOrReleased(slot)) return false;
-
-      const overlapsClass = curriculumClasses.some(
-        (aula) => slot.inicio < aula.horarioFim && slot.fim > aula.horarioInicio
-      );
-      return !overlapsClass;
-    })
-    .sort((a, b) => a.inicio.localeCompare(b.inicio));
-
-  const baseJanelaInicio = exception?.janelaInicio || config.janelaInicio;
-  const baseJanelaFim = exception?.janelaFim || config.janelaFim;
-
-  if (explicitReleased.length === 0) {
-    return {
-      released: false,
-      blocks: [],
-      janelaInicio: baseJanelaInicio,
-      janelaFim: baseJanelaFim,
-      reason: `${UNAVAILABLE_AWAITING_RELEASE_LABEL} para esta sala em ${formatDataBR(dateISO)}.`,
-      exception,
-    };
-  }
-
-  const releasedBlocks = explicitReleased.map((slot) => ({
-    id: slot.id,
-    availableSlotId: slot.id,
-    label: slot.label || `Horário ${slot.inicio}–${slot.fim}`,
-    inicio: slot.inicio,
-    fim: slot.fim,
-    ativo: true,
-  }));
-
-  const effectiveJanelaInicio = releasedBlocks.reduce(
-    (min, b) => (b.inicio < min ? b.inicio : min),
-    baseJanelaInicio
-  );
-  const effectiveJanelaFim = releasedBlocks.reduce(
-    (max, b) => (b.fim > max ? b.fim : max),
-    baseJanelaFim
-  );
-
   return {
-    released: true,
-    blocks: releasedBlocks,
-    janelaInicio: effectiveJanelaInicio,
-    janelaFim: effectiveJanelaFim,
+    released: false,
+    blocks: [],
+    janelaInicio: baseJanelaInicio,
+    janelaFim: baseJanelaFim,
+    reason: `${UNAVAILABLE_AWAITING_RELEASE_LABEL} para esta sala em ${formatDataBR(normalizedDate)}.`,
     exception,
   };
 }
@@ -392,8 +487,13 @@ export type RoomSlotVisualState =
   | 'LIBERADO'
   | 'AGUARDANDO_LIBERACAO'
   | 'OCUPADO_AULA'
-  | 'OCUPADO_RESERVA'
+  | 'OCUPADO_RESERVA_OUTRO'
+  | 'OCUPADO_RESERVA_PROPRIA'
   | 'ENCERRADO';
+
+export function isSlotOccupiedByReservation(state: RoomSlotVisualState): boolean {
+  return state === 'OCUPADO_RESERVA_OUTRO' || state === 'OCUPADO_RESERVA_PROPRIA';
+}
 
 export interface RoomScheduleSlotView {
   key: string;
@@ -411,11 +511,12 @@ export interface RoomScheduleSlotView {
 }
 
 /**
- * Monta a grade completa de slots da sala para uma data específica:
- * - Apenas slots com registro explícito `liberado` ou `ativo` em `available_slots` (e sem conflitos) ficam `selectableForUser: true`.
- * - Aulas regulares da grade aparecem como ocupação acadêmica (`OCUPADO_AULA`).
- * - Reservas ativas aparecem como ocupadas (`OCUPADO_RESERVA`).
- * - Todos os demais horários permanecem desabilitados com "Indisponível - Aguardando liberação da coordenação".
+ * Monta a grade completa de slots da sala para uma data específica com os 5 estados visuais oficiais:
+ * - `OCUPADO_AULA`: Aulas regulares da grade -> Status `"Ocupado"` (Azul, bloqueado)
+ * - `OCUPADO_RESERVA_OUTRO`: Reservado por outro usuário -> Status `"Reservado"` (Vermelho, bloqueado)
+ * - `OCUPADO_RESERVA_PROPRIA`: Reservado pelo próprio usuário logado -> Status `"Sua Reserva"` (Verde, exibe detalhes)
+ * - `LIBERADO`: Horários liberados pelo ADM -> Status `"Disponível"` (Destaque interativo, clicável)
+ * - `AGUARDANDO_LIBERACAO` / `ENCERRADO`: Horários não liberados -> Status `"Indisponível"` (Cinza, bloqueado)
  */
 export function getRoomScheduleSlotsForDate(params: {
   room: Room | undefined | null;
@@ -424,6 +525,7 @@ export function getRoomScheduleSlotsForDate(params: {
   exceptions: ScheduleException[];
   availableSlots: AvailableSlot[];
   reservations: Reservation[];
+  currentUserId?: string;
   now?: Date;
 }): {
   slots: RoomScheduleSlotView[];
@@ -437,6 +539,7 @@ export function getRoomScheduleSlotsForDate(params: {
     exceptions,
     availableSlots,
     reservations,
+    currentUserId = useAuthStore.getState().user?.id,
     now = new Date(),
   } = params;
 
@@ -444,26 +547,34 @@ export function getRoomScheduleSlotsForDate(params: {
     return { slots: [], curriculumClasses: [], reservableCount: 0 };
   }
 
-  const curriculumClasses = getCurriculumClassesForRoomOnDate(room, dateISO);
+  const normalizedDate = normalizeDateToISO(dateISO);
+  const curriculumClasses = getCurriculumClassesForRoomOnDate(room, normalizedDate);
+  const safeReservations = Array.isArray(reservations) ? reservations : [];
+  const safeAvailableSlots = Array.isArray(availableSlots) ? availableSlots : [];
+  const safeExceptions = Array.isArray(exceptions) ? exceptions : [];
 
-  const activeReservationsForRoom = reservations
-    .filter(
-      (r) =>
-        (r.salaId === room.firestoreId || r.salaInstitutionalId === room.id) &&
-        r.data === dateISO &&
-        (r.status === 'PENDENTE' || r.status === 'CONFIRMADA')
-    )
-    .sort((a, b) => a.inicio.localeCompare(b.inicio));
+  const activeReservationsForRoom = safeReservations
+    .filter((r) => {
+      if (!r || r.data !== normalizedDate) return false;
+      if (r.status !== 'PENDENTE' && r.status !== 'CONFIRMADA') return false;
+      if (r.salaId === room.firestoreId) return true;
+      if (room.id && (r.salaInstitutionalId === room.id || r.salaId === room.id)) return true;
+      if (r.salaNome && room.nome && doRoomNamesMatch(r.salaNome, room.nome)) return true;
+      return false;
+    })
+    .sort((a, b) => (a.inicio || '').localeCompare(b.inicio || ''));
 
-  const roomAvailableDocs = availableSlots.filter(
-    (s) => s.data === dateISO && matchesSlotRoom(s, room)
+  const roomAvailableDocs = safeAvailableSlots.filter(
+    (s) => s?.data === normalizedDate && matchesSlotRoom(s, room)
   );
 
-  // Constrói o conjunto de faixas horárias candidatas: blocos institucionais da sala/config + slots customizados em `available_slots`
+  // Constrói o conjunto de faixas horárias candidatas: blocos institucionais + slots liberados + reservas ativas
   const templateBlocks =
-    room.blocosHorarios && room.blocosHorarios.length > 0
+    Array.isArray(room.blocosHorarios) && room.blocosHorarios.length > 0
       ? room.blocosHorarios
-      : config.blocosPadrao || [];
+      : Array.isArray(config?.blocosPadrao)
+      ? config.blocosPadrao
+      : [];
 
   const candidateMap = new Map<
     string,
@@ -471,84 +582,130 @@ export function getRoomScheduleSlotsForDate(params: {
   >();
 
   for (const blk of templateBlocks) {
-    if (!blk.inicio || !blk.fim || blk.inicio >= blk.fim) continue;
-    const key = `${blk.inicio}_${blk.fim}`;
+    if (!blk) continue;
+    const inicio = normalizeTimeHHMM(blk.inicio);
+    const fim = normalizeTimeHHMM(blk.fim);
+    if (!inicio || !fim || inicio >= fim) continue;
+    const key = `${inicio}_${fim}`;
     candidateMap.set(key, {
-      inicio: blk.inicio,
-      fim: blk.fim,
-      label: blk.label || `Bloco ${blk.inicio}–${blk.fim}`,
+      inicio,
+      fim,
+      label: blk.label || `Bloco ${inicio}–${fim}`,
     });
   }
 
   for (const slotDoc of roomAvailableDocs) {
-    if (!slotDoc.inicio || !slotDoc.fim || slotDoc.inicio >= slotDoc.fim) continue;
-    const key = `${slotDoc.inicio}_${slotDoc.fim}`;
+    const inicio = normalizeTimeHHMM(slotDoc.inicio);
+    const fim = normalizeTimeHHMM(slotDoc.fim);
+    if (!inicio || !fim || inicio >= fim) continue;
+    const key = `${inicio}_${fim}`;
     if (!candidateMap.has(key)) {
       candidateMap.set(key, {
-        inicio: slotDoc.inicio,
-        fim: slotDoc.fim,
-        label: slotDoc.label || `Horário ${slotDoc.inicio}–${slotDoc.fim}`,
+        inicio,
+        fim,
+        label: slotDoc.label || `Horário ${inicio}–${fim}`,
       });
     } else if (slotDoc.label) {
       candidateMap.set(key, {
-        inicio: slotDoc.inicio,
-        fim: slotDoc.fim,
+        inicio,
+        fim,
         label: slotDoc.label,
       });
     }
   }
 
+  for (const res of activeReservationsForRoom) {
+    const inicio = normalizeTimeHHMM(res.inicio);
+    const fim = normalizeTimeHHMM(res.fim);
+    if (!inicio || !fim || inicio >= fim) continue;
+    const key = `${inicio}_${fim}`;
+    if (!candidateMap.has(key)) {
+      candidateMap.set(key, {
+        inicio,
+        fim,
+        label: `Horário ${inicio}–${fim}`,
+      });
+    }
+  }
+
   const spaceCheck = isSpaceReleasedByAdmin(room, now);
-  const roomSpecificException = exceptions.find(
-    (ex) => ex.data === dateISO && ex.salaId === room.firestoreId
+  const roomSpecificException = safeExceptions.find(
+    (ex) => ex?.data === normalizedDate && ex.salaId === room.firestoreId
   );
-  const globalException = exceptions.find(
-    (ex) => ex.data === dateISO && (!ex.salaId || ex.salaId === 'TODAS')
+  const globalException = safeExceptions.find(
+    (ex) => ex?.data === normalizedDate && (!ex.salaId || ex.salaId === 'TODAS')
   );
   const exception = roomSpecificException || globalException;
-  const dayName = getDayNameFromISO(dateISO);
+  const dayName = getDayNameFromISO(normalizedDate);
+
+  const hasExplicitAdminSlotOnDate = roomAvailableDocs.some((s) => isSlotActiveOrReleased(s));
 
   const isDateOperational =
     spaceCheck.released &&
-    config.reservasAbertas &&
+    (config ? config.reservasAbertas !== false : true) &&
     !exception?.fechado &&
-    (Boolean(exception) || !isSundayOrHoliday(dateISO)) &&
-    (Boolean(exception) ||
-      (dayName !== 'Domingo' &&
-        (!config.diasSemanaPermitidos ||
-          config.diasSemanaPermitidos.length === 0 ||
-          config.diasSemanaPermitidos.includes(dayName))));
+    (hasExplicitAdminSlotOnDate ||
+      ((Boolean(exception) || !isSundayOrHoliday(normalizedDate)) &&
+        (Boolean(exception) ||
+          (dayName !== 'Domingo' &&
+            (!Array.isArray(config?.diasSemanaPermitidos) ||
+              config.diasSemanaPermitidos.length === 0 ||
+              config.diasSemanaPermitidos.includes(dayName))))));
 
   const todayISO = getTodayLocalISO(now);
   const nowWithTolerance = new Date(now.getTime() - 60000);
 
   const sortedCandidates = Array.from(candidateMap.values()).sort((a, b) =>
-    a.inicio.localeCompare(b.inicio)
+    (a.inicio || '').localeCompare(b.inicio || '')
   );
 
   const slots: RoomScheduleSlotView[] = sortedCandidates.map((cand) => {
     const key = `${cand.inicio}_${cand.fim}`;
-    const matchingRes = activeReservationsForRoom.find(
-      (r) => cand.inicio < r.fim && cand.fim > r.inicio
-    );
+    const matchingRes = activeReservationsForRoom.find((r) => {
+      const rInicio = normalizeTimeHHMM(r.inicio);
+      const rFim = normalizeTimeHHMM(r.fim);
+      return cand.inicio < rFim && cand.fim > rInicio;
+    });
     const matchingClass = curriculumClasses.find(
       (aula) => cand.inicio < aula.horarioFim && cand.fim > aula.horarioInicio
     );
     const matchingSlotDoc = roomAvailableDocs.find(
-      (s) => s.inicio === cand.inicio && s.fim === cand.fim
+      (s) =>
+        normalizeTimeHHMM(s.inicio) === cand.inicio &&
+        normalizeTimeHHMM(s.fim) === cand.fim
     );
 
     if (matchingRes) {
+      const isOwnReservation = Boolean(currentUserId && matchingRes.usuarioId === currentUserId);
+      if (isOwnReservation) {
+        return {
+          key,
+          availableSlotId: matchingSlotDoc?.id,
+          inicio: cand.inicio,
+          fim: cand.fim,
+          label: cand.label,
+          state: 'OCUPADO_RESERVA_PROPRIA',
+          selectableForUser: false,
+          statusBadge: 'Sua Reserva',
+          statusDetail:
+            matchingRes.status === 'CONFIRMADA'
+              ? 'Reservado por você · Check-in confirmado (clique para ver detalhes)'
+              : 'Reservado por você · Aguardando check-in via QR Code (clique para ver detalhes)',
+          reservation: matchingRes,
+          rawAvailableSlot: matchingSlotDoc,
+        };
+      }
+
       return {
         key,
         availableSlotId: matchingSlotDoc?.id,
         inicio: cand.inicio,
         fim: cand.fim,
         label: cand.label,
-        state: 'OCUPADO_RESERVA',
+        state: 'OCUPADO_RESERVA_OUTRO',
         selectableForUser: false,
         statusBadge: 'Reservado',
-        statusDetail: 'Indisponível - Horário já reservado',
+        statusDetail: 'Reservado por outro usuário neste horário',
         reservation: matchingRes,
         rawAvailableSlot: matchingSlotDoc,
       };
@@ -563,16 +720,31 @@ export function getRoomScheduleSlotsForDate(params: {
         label: cand.label,
         state: 'OCUPADO_AULA',
         selectableForUser: false,
-        statusBadge: 'Aula da Grade',
-        statusDetail: `Ocupado - Aula regular (${matchingClass.materia} · ${matchingClass.curso} ${matchingClass.semestre}º Sem)`,
+        statusBadge: 'Ocupado',
+        statusDetail: `Aula regular: ${matchingClass.materia} (${matchingClass.curso} · ${matchingClass.semestre}º Sem)`,
         curriculumClass: matchingClass,
         rawAvailableSlot: matchingSlotDoc,
       };
     }
 
     if (isDateOperational && matchingSlotDoc && isSlotActiveOrReleased(matchingSlotDoc)) {
-      if (dateISO === todayISO) {
-        const slotStart = createSafeLocalDateTime(dateISO, cand.inicio);
+      if (normalizedDate < todayISO) {
+        return {
+          key,
+          availableSlotId: matchingSlotDoc.id,
+          inicio: cand.inicio,
+          fim: cand.fim,
+          label: cand.label,
+          state: 'ENCERRADO',
+          selectableForUser: false,
+          statusBadge: 'Indisponível',
+          statusDetail: 'Indisponível - Data encerrada',
+          rawAvailableSlot: matchingSlotDoc,
+        };
+      }
+
+      if (normalizedDate === todayISO) {
+        const slotStart = createSafeLocalDateTime(normalizedDate, cand.inicio);
         if (slotStart < nowWithTolerance) {
           return {
             key,
@@ -582,14 +754,13 @@ export function getRoomScheduleSlotsForDate(params: {
             label: cand.label,
             state: 'ENCERRADO',
             selectableForUser: false,
-            statusBadge: 'Encerrado',
-            statusDetail: 'Indisponível - Horário já iniciado',
+            statusBadge: 'Indisponível',
+            statusDetail: 'Indisponível - Horário já iniciado hoje',
             rawAvailableSlot: matchingSlotDoc,
           };
         }
       }
 
-      const rawStatus = String(matchingSlotDoc.status || 'liberado').toLowerCase();
       return {
         key,
         availableSlotId: matchingSlotDoc.id,
@@ -598,8 +769,8 @@ export function getRoomScheduleSlotsForDate(params: {
         label: cand.label,
         state: 'LIBERADO',
         selectableForUser: true,
-        statusBadge: rawStatus === 'ativo' ? 'Ativo' : 'Liberado',
-        statusDetail: 'Liberado pela coordenação - Disponível para agendamento',
+        statusBadge: 'Disponível',
+        statusDetail: 'Liberado pelo ADM · Clique para selecionar e reservar',
         rawAvailableSlot: matchingSlotDoc,
       };
     }
@@ -612,7 +783,7 @@ export function getRoomScheduleSlotsForDate(params: {
       label: cand.label,
       state: 'AGUARDANDO_LIBERACAO',
       selectableForUser: false,
-      statusBadge: 'Bloqueado',
+      statusBadge: 'Indisponível',
       statusDetail: UNAVAILABLE_AWAITING_RELEASE_LABEL,
       rawAvailableSlot: matchingSlotDoc,
     };
@@ -629,17 +800,22 @@ export function getRoomScheduleSlotsForDate(params: {
 
 /**
  * Valida diretamente no Firestore a existência de um registro explícito em `available_slots`
- * com status `liberado` ou `ativo` para a sala, data e faixa horária informadas.
+ * com status `liberado`, `ativo` ou `disponivel` para a sala, data e faixa horária informadas.
  */
 export async function verifyAvailableSlotFirestore(
   room: Room,
   dateISO: string,
   inicio: string,
-  fim: string
+  fim: string,
+  candidateSlotId?: string
 ): Promise<AvailableSlot> {
-  const curriculumClasses = getCurriculumClassesForRoomOnDate(room, dateISO);
+  const normDate = normalizeDateToISO(dateISO);
+  const normInicio = normalizeTimeHHMM(inicio);
+  const normFim = normalizeTimeHHMM(fim);
+
+  const curriculumClasses = getCurriculumClassesForRoomOnDate(room, normDate);
   const classConflict = curriculumClasses.find(
-    (aula) => inicio < aula.horarioFim && fim > aula.horarioInicio
+    (aula) => normInicio < aula.horarioFim && normFim > aula.horarioInicio
   );
   if (classConflict) {
     throw new Error(
@@ -647,103 +823,97 @@ export async function verifyAvailableSlotFirestore(
     );
   }
 
-  // 1. Tenta o ID determinístico padrão primeiro (1 leitura rápida)
-  const deterministicId = buildAvailableSlotId(room.firestoreId, dateISO, inicio, fim);
-  const directSnap = await getDoc(doc(db, 'available_slots', deterministicId));
-  if (directSnap.exists()) {
-    const raw = directSnap.data() as Partial<AvailableSlot>;
-    const hydrated: AvailableSlot = {
-      id: directSnap.id,
-      salaId: String(raw.salaId || ''),
-      salaInstitutionalId: raw.salaInstitutionalId ? String(raw.salaInstitutionalId) : undefined,
-      salaNome: String(raw.salaNome || room.nome),
-      data: String(raw.data || ''),
-      inicio: String(raw.inicio || ''),
-      fim: String(raw.fim || ''),
-      label: raw.label ? String(raw.label) : undefined,
-      status: (String(raw.status || 'bloqueado').toLowerCase() as AvailableSlot['status']),
-      ativo: typeof raw.ativo === 'boolean' ? raw.ativo : false,
-      createdAt: Number(raw.createdAt || 0),
-      updatedAt: Number(raw.updatedAt || 0),
-    };
-    if (
-      matchesSlotRoom(hydrated, room) &&
-      hydrated.data === dateISO &&
-      hydrated.inicio === inicio &&
-      hydrated.fim === fim &&
-      isSlotActiveOrReleased(hydrated)
-    ) {
-      return hydrated;
-    }
-  }
+  const matchesTargetSlot = (hydrated: AvailableSlot): boolean =>
+    matchesSlotRoom(hydrated, room) &&
+    hydrated.data === normDate &&
+    hydrated.inicio === normInicio &&
+    hydrated.fim === normFim &&
+    isSlotActiveOrReleased(hydrated);
 
-  // 2. Fallback para documentos criados em `available_slots` com IDs customizados
-  const qBySala = query(
-    collection(db, 'available_slots'),
-    where('salaId', '==', room.firestoreId),
-    where('data', '==', dateISO)
+  // 1. Verifica primeiro pelo `candidateSlotId` ou slot já sincronizado em memória (`onSnapshot`)
+  const storeSlots = useAvailableSlotsStore.getState().slots;
+  const safeStoreSlots = Array.isArray(storeSlots) ? storeSlots : [];
+  const inMemorySlot = safeStoreSlots.find((s) => s && matchesTargetSlot(s));
+
+  const directIdsToTry = Array.from(
+    new Set(
+      [
+        candidateSlotId,
+        inMemorySlot?.id,
+        buildAvailableSlotId(room.firestoreId, normDate, normInicio, normFim),
+        room.id ? buildAvailableSlotId(room.id, normDate, normInicio, normFim) : undefined,
+      ].filter((id): id is string => Boolean(id && id.trim()))
+    )
   );
-  const snapBySala = await getDocs(qBySala);
-  for (const d of snapBySala.docs) {
-    const raw = d.data() as Partial<AvailableSlot>;
-    const hydrated: AvailableSlot = {
-      id: d.id,
-      salaId: String(raw.salaId || ''),
-      salaInstitutionalId: raw.salaInstitutionalId ? String(raw.salaInstitutionalId) : undefined,
-      salaNome: String(raw.salaNome || room.nome),
-      data: String(raw.data || ''),
-      inicio: String(raw.inicio || ''),
-      fim: String(raw.fim || ''),
-      label: raw.label ? String(raw.label) : undefined,
-      status: (String(raw.status || 'bloqueado').toLowerCase() as AvailableSlot['status']),
-      ativo: typeof raw.ativo === 'boolean' ? raw.ativo : false,
-      createdAt: Number(raw.createdAt || 0),
-      updatedAt: Number(raw.updatedAt || 0),
-    };
-    if (
-      hydrated.inicio === inicio &&
-      hydrated.fim === fim &&
-      isSlotActiveOrReleased(hydrated)
-    ) {
-      return hydrated;
+
+  for (const slotId of directIdsToTry) {
+    try {
+      const directSnap = await getDoc(doc(db, 'available_slots', slotId));
+      if (directSnap.exists()) {
+        const hydrated = hydrateAvailableSlotDoc(
+          directSnap.id,
+          (directSnap.data() || {}) as Record<string, unknown>,
+          room.nome
+        );
+        if (matchesTargetSlot(hydrated)) {
+          return hydrated;
+        }
+      }
+    } catch (err) {
+      console.warn('[Reservas] Falha ao consultar slot direto:', slotId, err);
     }
   }
 
-  if (room.id) {
-    const qByInst = query(
+  // 2. Fallback para consultas indexadas cobrindo tanto `salaId`/`roomId` quanto `data`/`date`
+  const fallbackQueries = [
+    query(
       collection(db, 'available_slots'),
-      where('salaInstitutionalId', '==', room.id),
-      where('data', '==', dateISO)
-    );
-    const snapByInst = await getDocs(qByInst);
-    for (const d of snapByInst.docs) {
-      const raw = d.data() as Partial<AvailableSlot>;
-      const hydrated: AvailableSlot = {
-        id: d.id,
-        salaId: String(raw.salaId || ''),
-        salaInstitutionalId: raw.salaInstitutionalId ? String(raw.salaInstitutionalId) : undefined,
-        salaNome: String(raw.salaNome || room.nome),
-        data: String(raw.data || ''),
-        inicio: String(raw.inicio || ''),
-        fim: String(raw.fim || ''),
-        label: raw.label ? String(raw.label) : undefined,
-        status: (String(raw.status || 'bloqueado').toLowerCase() as AvailableSlot['status']),
-        ativo: typeof raw.ativo === 'boolean' ? raw.ativo : false,
-        createdAt: Number(raw.createdAt || 0),
-        updatedAt: Number(raw.updatedAt || 0),
-      };
-      if (
-        hydrated.inicio === inicio &&
-        hydrated.fim === fim &&
-        isSlotActiveOrReleased(hydrated)
-      ) {
-        return hydrated;
+      where('salaId', '==', room.firestoreId),
+      where('data', '==', normDate)
+    ),
+    ...(room.id
+      ? [
+          query(
+            collection(db, 'available_slots'),
+            where('salaInstitutionalId', '==', room.id),
+            where('data', '==', normDate)
+          ),
+          query(
+            collection(db, 'available_slots'),
+            where('salaId', '==', room.id),
+            where('data', '==', normDate)
+          ),
+        ]
+      : []),
+    query(
+      collection(db, 'available_slots'),
+      where('roomId', '==', room.firestoreId)
+    ),
+    ...(room.id
+      ? [query(collection(db, 'available_slots'), where('roomId', '==', room.id))]
+      : []),
+  ];
+
+  for (const qRef of fallbackQueries) {
+    try {
+      const snap = await getDocs(qRef);
+      for (const d of snap.docs) {
+        const hydrated = hydrateAvailableSlotDoc(
+          d.id,
+          (d.data() || {}) as Record<string, unknown>,
+          room.nome
+        );
+        if (matchesTargetSlot(hydrated)) {
+          return hydrated;
+        }
       }
+    } catch (err) {
+      console.warn('[Reservas] Aviso na consulta complementar de available_slots:', err);
     }
   }
 
   throw new Error(
-    `${UNAVAILABLE_AWAITING_RELEASE_LABEL}. Este horário não consta como liberado pelo Administrador para ${room.nome} em ${formatDataBR(dateISO)}.`
+    `${UNAVAILABLE_AWAITING_RELEASE_LABEL}. Este horário não consta como liberado pelo Administrador para ${room.nome} em ${formatDataBR(normDate)}.`
   );
 }
 
@@ -764,12 +934,13 @@ export function checkWeeklyQuotaLocal(
   error?: string;
 } {
   const weekBounds = getWeekBoundsISO(targetDateISO);
+  const safeReservations = Array.isArray(reservations) ? reservations : [];
 
-  const consuming = reservations.filter(
+  const consuming = safeReservations.filter(
     (r) =>
-      r.usuarioId === userId &&
-      r.data >= weekBounds.startISO &&
-      r.data <= weekBounds.endISO &&
+      r?.usuarioId === userId &&
+      (r.data || '') >= weekBounds.startISO &&
+      (r.data || '') <= weekBounds.endISO &&
       (r.status === 'PENDENTE' || r.status === 'CONFIRMADA' || r.status === 'CONCLUIDA')
   );
 
@@ -825,10 +996,11 @@ export function checkNoShowSuspensionForDate(
     return { blocked: false, blockedDate: null };
   }
 
+  const safePunishments = Array.isArray(punishments) ? punishments : [];
   const userBlockedDate = user.blockedDate ? normalizeDateToISO(user.blockedDate) : '';
-  const matchingPunishment = punishments.find(
+  const matchingPunishment = safePunishments.find(
     (p) =>
-      p.usuarioId === user.id &&
+      p?.usuarioId === user.id &&
       p.ativa &&
       p.blockedDate &&
       normalizeDateToISO(p.blockedDate) === targetDateISO
@@ -860,8 +1032,9 @@ export function getUserNoShowBlockedDate(
     return normalizeDateToISO(user.blockedDate);
   }
 
-  const activePunishment = punishments
-    .filter((p) => p.usuarioId === user.id && p.ativa && Boolean(p.blockedDate))
+  const safePunishments = Array.isArray(punishments) ? punishments : [];
+  const activePunishment = safePunishments
+    .filter((p) => p?.usuarioId === user.id && p.ativa && Boolean(p.blockedDate))
     .sort((a, b) => (b.dataInicio || 0) - (a.dataInicio || 0))[0];
 
   if (activePunishment?.blockedDate) {

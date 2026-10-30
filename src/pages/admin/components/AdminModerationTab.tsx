@@ -24,6 +24,7 @@ import { PunishmentCategory, User } from '../../../types';
 import { PUNISHMENT_CATEGORY_LABELS, USER_VINCULO_LABELS } from '../../../constants';
 import { formatNoShowTag } from '../../../services/reservationService';
 import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 
 interface AdminModerationTabProps {
@@ -42,12 +43,14 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
   const [todayISO, setTodayISO] = useState(() => getTodayLocalISO());
 
   const {
-    punishments,
+    punishments: rawPunishments,
     fetchPunishments,
     applyManualPunishment,
     revokeUserPunishment,
   } = usePunishmentStore();
-  const reservations = useReservationStore((state) => state.reservations);
+  const punishments = Array.isArray(rawPunishments) ? rawPunishments : [];
+  const rawReservations = useReservationStore((state) => state.reservations);
+  const reservations = Array.isArray(rawReservations) ? rawReservations : [];
 
   const [search, setSearch] = useState('');
   const [vinculoFilter, setVinculoFilter] = useState<'TODOS' | 'ALUNO' | 'SERVIDOR'>('TODOS');
@@ -68,7 +71,13 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
 
   useEffect(() => {
     const unsubPunishments = fetchPunishments();
-    return () => unsubPunishments();
+    return () => {
+      try {
+        unsubPunishments();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+    };
   }, [fetchPunishments]);
 
   useEffect(() => {
@@ -85,16 +94,26 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
       },
       () => setLoadingUsers(false)
     );
-    return () => unsub();
+    return () => {
+      try {
+        unsub();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+    };
   }, [externalUsers]);
 
-  const users = externalUsers || internalUsers;
+  const users = Array.isArray(externalUsers)
+    ? externalUsers
+    : Array.isArray(internalUsers)
+    ? internalUsers
+    : [];
 
   // Contabiliza faltas (no-show) por usuário a partir das reservas PUNIDA
   const noShowCountMap = useMemo(() => {
     const map: Record<string, number> = {};
     reservations.forEach((r) => {
-      if (r.status === 'PUNIDA') {
+      if (r?.status === 'PUNIDA' && r?.usuarioId) {
         map[r.usuarioId] = (map[r.usuarioId] || 0) + 1;
       }
     });
@@ -103,9 +122,9 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
 
   const moderatableUsers = useMemo(() => {
     return users
-      .filter((u) => u.role !== 'ADMIN')
+      .filter((u) => u && u.role !== 'ADMIN')
       .filter((u) => {
-        const vinculo = u.tipoVinculo || 'ALUNO';
+        const vinculo = u?.tipoVinculo || 'ALUNO';
         if (vinculoFilter !== 'TODOS' && vinculo !== vinculoFilter) return false;
 
         const normBlocked = u.blockedDate ? normalizeDateToISO(u.blockedDate) : '';
@@ -172,8 +191,8 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
         `Restrição registrada para ${targetUser.nome}: bloqueado apenas em ${formatDataBR(blockedDate)}.`
       );
       setTargetUser(null);
-    } catch {
-      toast.error('Erro ao registrar restrição no perfil do usuário.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao registrar restrição no perfil do usuário.'));
     } finally {
       setIsSubmitting(false);
     }
@@ -182,9 +201,9 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
   const handleRevoke = async (u: User) => {
     try {
       await revokeUserPunishment(u, 'Liberação manual pela Coordenação');
-      toast.success(`Restrição de ${u.nome} revogada com sucesso.`);
-    } catch {
-      toast.error('Não foi possível revogar a restrição.');
+      toast.success(`Restrição de ${u?.nome || 'usuário'} revogada com sucesso.`);
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Não foi possível revogar a restrição.'));
     }
   };
 

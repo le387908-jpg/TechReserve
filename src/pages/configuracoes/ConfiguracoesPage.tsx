@@ -39,8 +39,10 @@ import {
   validatePhone,
 } from '../../utils/formatters';
 import { sendTestWhatsAppAlert } from '../../services/whatsappService';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { EditProfileModal } from '../../components/profile/EditProfileModal';
 import { WhatsAppGatewayCard } from '../../components/admin/WhatsAppGatewayCard';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
 
 const COURSES_DICT: Record<string, { sigla: string; nome: string }> = {
   GTI: { sigla: 'GTI', nome: 'Gestão da Tecnologia da Informação' },
@@ -133,8 +135,8 @@ export function ConfiguracoesPage() {
         });
         toast.success('Perfil acadêmico e preferências de WhatsApp atualizados.');
       }
-    } catch (err: any) {
-      toast.error(err.message || 'Erro ao atualizar configurações.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao atualizar configurações.'));
     } finally {
       setLoading(false);
     }
@@ -154,9 +156,11 @@ export function ConfiguracoesPage() {
             ? 'Alertas e lembretes via WhatsApp ativados.'
             : 'Alertas via WhatsApp silenciados.'
         );
-      } catch {
+      } catch (err) {
         setWhatsappNotificationsEnabled(!nextValue);
-        toast.error('Não foi possível salvar a preferência de notificação.');
+        toast.error(
+          getFriendlyErrorMessage(err, 'Não foi possível salvar a preferência de notificação.')
+        );
       } finally {
         setTogglingWhatsApp(false);
       }
@@ -203,9 +207,9 @@ export function ConfiguracoesPage() {
           result.reason || 'Falha ao enviar mensagem de teste via Evolution API. Verifique o console para detalhes.'
         );
       }
-    } catch (err: any) {
+      } catch (err) {
       console.error('[Configurações][Teste WhatsApp] Exceção:', err);
-      toast.error(err.message || 'Erro ao validar alerta WhatsApp.');
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao validar alerta WhatsApp.'));
     } finally {
       setTestingWhatsApp(false);
     }
@@ -217,8 +221,8 @@ export function ConfiguracoesPage() {
       await deactivateMyProfile();
       toast.success('Seu perfil foi encerrado e marcado como inativo.');
       navigate('/login');
-    } catch {
-      toast.error('Não foi possível excluir o perfil no momento.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Não foi possível excluir o perfil no momento.'));
     } finally {
       setIsDeactivating(false);
       setIsDeleteModalOpen(false);
@@ -519,7 +523,11 @@ export function ConfiguracoesPage() {
       </div>
 
       {/* GATEWAY INSTITUCIONAL WHATSAPP (EXCLUSIVO PERFIL ADM) */}
-      {isAdmin && <WhatsAppGatewayCard />}
+      {isAdmin && (
+        <ErrorBoundary variant="inline">
+          <WhatsAppGatewayCard />
+        </ErrorBoundary>
+      )}
 
       {/* PREFERÊNCIAS DE NOTIFICAÇÃO VIA WHATSAPP */}
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
@@ -635,8 +643,10 @@ export function ConfiguracoesPage() {
                   try {
                     await useAuthStore.getState().resetPassword(user.email);
                     toast.success('E-mail de redefinição enviado com sucesso.');
-                  } catch {
-                    toast.error('Erro ao enviar e-mail de redefinição.');
+                  } catch (err) {
+                    toast.error(
+                      getFriendlyErrorMessage(err, 'Erro ao enviar e-mail de redefinição.')
+                    );
                   }
                 }
               }}

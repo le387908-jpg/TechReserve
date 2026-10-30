@@ -51,6 +51,7 @@ import { Reservation, ReservationStatus } from '../../types';
 import { cn } from '../../lib/utils';
 import { toast } from 'sonner';
 import { getTodayLocalISO, formatDataBR, createSafeLocalDateTime } from '../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 
 function UsageTimer({ resId, data, inicio, fim, isConfirmed, onCancel }: { resId: string, data: string, inicio: string, fim: string, isConfirmed: boolean, onCancel: () => void }) {
   const [current, setCurrent] = useState(Date.now());
@@ -147,12 +148,12 @@ function NoShowDayNotice({ dateISO }: { dateISO: string }) {
   );
 }
 
-function calculateDuration(inicio: string, fim: string): string {
+function calculateDuration(inicio?: string, fim?: string): string {
   try {
-    const [h1, m1] = inicio.split(':').map(Number);
-    const [h2, m2] = fim.split(':').map(Number);
+    const [h1, m1] = String(inicio || '00:00').split(':').map(Number);
+    const [h2, m2] = String(fim || '00:00').split(':').map(Number);
     const diffMins = (h2 * 60 + m2) - (h1 * 60 + m1);
-    if (diffMins <= 0) return 'Período padrão';
+    if (!Number.isFinite(diffMins) || diffMins <= 0) return 'Período padrão';
     const hours = Math.floor(diffMins / 60);
     const mins = diffMins % 60;
     if (hours === 0) return `${mins} min`;
@@ -166,18 +167,29 @@ function calculateDuration(inicio: string, fim: string): string {
 export function ReservasPage() {
   const navigate = useNavigate();
   const user = useAuthStore(state => state.user);
-  const reservations = useReservationStore(state => state.reservations);
+  const rawReservations = useReservationStore(state => state.reservations);
+  const resLoading = useReservationStore(state => state.loading);
+  const resInitialized = useReservationStore(state => state.initialized);
   const fetchReservations = useReservationStore(state => state.fetchReservations);
   const updateReservation = useReservationStore(state => state.updateReservation);
   const deleteReservation = useReservationStore(state => state.deleteReservation);
   const hideForUser = useReservationStore(state => state.hideForUser);
   const setScanningResId = useReservationStore(state => state.setScanningResId);
   
-  const rooms = useRoomStore(state => state.rooms);
+  const rawRooms = useRoomStore(state => state.rooms);
   const fetchRooms = useRoomStore(state => state.fetchRooms);
   const activePunishment = usePunishmentStore(state => state.activePunishment);
   const fetchUserPunishments = usePunishmentStore(state => state.fetchUserPunishments);
   const isAdmin = user?.role === 'ADMIN';
+
+  const reservations = useMemo(
+    () => (Array.isArray(rawReservations) ? rawReservations : []),
+    [rawReservations]
+  );
+  const rooms = useMemo(
+    () => (Array.isArray(rawRooms) ? rawRooms : []),
+    [rawRooms]
+  );
 
   // Expansion & Filter State
   const [scope, setScope] = useState<'MINHAS' | 'TODAS'>('MINHAS');
@@ -238,10 +250,10 @@ export function ReservasPage() {
     }
     
     return () => {
-      unsubRes();
-      unsubRooms();
-      unsubUserPunishments();
-      if (unsubUsers) unsubUsers();
+      try { unsubRes(); } catch {}
+      try { unsubRooms(); } catch {}
+      try { unsubUserPunishments(); } catch {}
+      try { if (unsubUsers) unsubUsers(); } catch {}
     };
   }, [fetchReservations, fetchRooms, fetchUserPunishments, user?.id, isAdmin]);
 
@@ -264,18 +276,9 @@ export function ReservasPage() {
       } else {
         toast.success('Reserva cancelada com sucesso.');
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Cancel reservation error:', err);
-      let errorMsg = 'Erro ao atualizar reserva. Verifique sua conexão.';
-      try {
-        if (err.message && err.message.startsWith('{')) {
-          const errorData = JSON.parse(err.message);
-          errorMsg = `Erro: ${errorData.error}`;
-        }
-      } catch (e) {
-        console.error('Failed to parse error message:', e);
-      }
-      toast.error(errorMsg);
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao atualizar reserva. Verifique sua conexão.'));
     } finally {
       setCancellingIds(prev => {
         const next = new Set(prev);
@@ -296,7 +299,7 @@ export function ReservasPage() {
       setConfirmingDeleteId(null);
       toast.success('Registro excluído com sucesso.');
     } catch (err) {
-      toast.error('Erro ao excluir registro.');
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao excluir registro.'));
     }
   };
 
@@ -305,7 +308,7 @@ export function ReservasPage() {
       await hideForUser(id);
       toast.success('Registro removido do seu histórico.');
     } catch (err) {
-      toast.error('Erro ao remover registro.');
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao remover registro.'));
     }
   };
 
@@ -316,14 +319,15 @@ export function ReservasPage() {
     if (isAdmin && scope === 'TODAS') {
       return reservations;
     }
-    return reservations.filter(r => r.usuarioId === user?.id && !r.ocultoParaUsuario);
+    return reservations.filter(r => r?.usuarioId === user?.id && !r?.ocultoParaUsuario);
   }, [reservations, isAdmin, scope, user?.id]);
 
   // Tab & Search filtering
   const filteredReservations = useMemo(() => {
     return baseReservations.filter(res => {
-      const room = rooms.find(r => r.firestoreId === res.salaId);
-      const roomName = room?.nome || 'Sala';
+      if (!res) return false;
+      const room = rooms.find(r => r?.firestoreId === res.salaId);
+      const roomName = room?.nome || res.salaNome || 'Sala';
       const requester = usersMap[res.usuarioId]?.nome || res.usuarioId || '';
 
       // Status Tab filter
@@ -339,7 +343,7 @@ export function ReservasPage() {
       if (searchTerm.trim()) {
         const term = searchTerm.toLowerCase();
         const matchesRoom = roomName.toLowerCase().includes(term);
-        const matchesDate = res.data.includes(term);
+        const matchesDate = (res.data || '').includes(term);
         const matchesUser = requester.toLowerCase().includes(term);
         const matchesObs = (res.observacoes || '').toLowerCase().includes(term);
         if (!matchesRoom && !matchesDate && !matchesUser && !matchesObs) {
@@ -500,13 +504,12 @@ export function ReservasPage() {
               type="button"
               onClick={() => setStatusTab('ATIVAS')}
               className={cn(
-                "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5",
+                "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0",
                 statusTab === 'ATIVAS' ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-900"
               )}
             >
-              <span className="h-2 w-2 rounded-full bg-emerald-500" />
               <span>Ativas / Em Uso</span>
-              <span className="px-1.5 py-0.2 rounded-md bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+              <span className="px-1.5 py-0.2 rounded-md bg-emerald-100 text-emerald-800 text-[10px] font-bold tabular-nums">
                 {metrics.ativas + metrics.pendentes}
               </span>
             </button>
@@ -514,7 +517,7 @@ export function ReservasPage() {
               type="button"
               onClick={() => setStatusTab('HOJE')}
               className={cn(
-                "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5",
+                "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0",
                 statusTab === 'HOJE' ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-900"
               )}
             >
@@ -525,12 +528,12 @@ export function ReservasPage() {
               type="button"
               onClick={() => setStatusTab('HISTORICO')}
               className={cn(
-                "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5",
+                "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0",
                 statusTab === 'HISTORICO' ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-900"
               )}
             >
               <span>Histórico</span>
-              <span className="px-1.5 py-0.2 rounded-md bg-slate-200 text-slate-700 text-[10px] font-bold">
+              <span className="px-1.5 py-0.2 rounded-md bg-slate-200 text-slate-700 text-[10px] font-bold tabular-nums">
                 {metrics.historico}
               </span>
             </button>
@@ -543,7 +546,7 @@ export function ReservasPage() {
                 type="button"
                 onClick={() => setScope('MINHAS')}
                 className={cn(
-                  "px-3 py-1.5 rounded-xl text-xs font-black transition-all",
+                  "px-3 py-1.5 rounded-xl text-xs font-black transition-all whitespace-nowrap shrink-0",
                   scope === 'MINHAS' ? "bg-fatec-red text-white shadow-sm" : "text-slate-400 hover:text-white"
                 )}
               >
@@ -553,7 +556,7 @@ export function ReservasPage() {
                 type="button"
                 onClick={() => setScope('TODAS')}
                 className={cn(
-                  "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5",
+                  "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 whitespace-nowrap shrink-0",
                   scope === 'TODAS' ? "bg-fatec-red text-white shadow-sm" : "text-slate-400 hover:text-white"
                 )}
               >
@@ -579,7 +582,16 @@ export function ReservasPage() {
 
       {/* RESERVATIONS LIST WITH ACCORDION EXPANSION */}
       <div className="grid grid-cols-1 gap-4">
-        {filteredReservations.length === 0 ? (
+        {resLoading && !resInitialized && filteredReservations.length === 0 ? (
+          <div className="space-y-4">
+            {Array.from({ length: 3 }).map((_, idx) => (
+              <div
+                key={idx}
+                className="h-32 bg-white rounded-3xl border border-slate-200 p-5 animate-pulse"
+              />
+            ))}
+          </div>
+        ) : filteredReservations.length === 0 ? (
           <div className="bg-white rounded-3xl border border-dashed border-slate-200 p-16 text-center">
             <div className="h-16 w-16 bg-slate-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
               <CalendarCheck2 className="h-8 w-8 text-slate-300" />
@@ -598,11 +610,11 @@ export function ReservasPage() {
           </div>
         ) : (
           filteredReservations.map((res) => {
-            const room = rooms.find(r => r.firestoreId === res.salaId);
+            const room = rooms.find(r => r?.firestoreId === res.salaId);
             const isPending = res.status === 'PENDENTE';
             const isConfirmed = res.status === 'CONFIRMADA';
             const isToday = res.data === todayStr;
-            const canCheckIn = isPending && !isAdmin && isToday && (readyReservations[res.id] || new Date().toTimeString().slice(0, 5) >= res.inicio);
+            const canCheckIn = isPending && !isAdmin && isToday && (readyReservations[res.id] || new Date().toTimeString().slice(0, 5) >= (res.inicio || '23:59'));
             const canCancel = isPending || isConfirmed;
             const canManage = !isPending && !isConfirmed;
             const isExpanded = expandedIds.has(res.id);
@@ -769,9 +781,9 @@ export function ReservasPage() {
                                 toast.success('Reserva confirmada com sucesso!', {
                                   icon: <CheckCircle2 className="h-5 w-5 text-emerald-500" />
                                 });
-                              } catch (err) {
-                                toast.error('Erro ao confirmar reserva.');
-                              }
+                                } catch (err) {
+                                  toast.error(getFriendlyErrorMessage(err, 'Erro ao confirmar reserva.'));
+                                }
                             }}
                             className="flex-1 bg-white text-amber-600 hover:bg-neutral-50 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 flex items-center justify-center gap-1.5 shadow-md shadow-amber-600/10 font-bold"
                           >
@@ -945,7 +957,7 @@ export function ReservasPage() {
                             <div>
                               <span className="text-slate-400 font-bold block mb-1.5">Equipamentos & Recursos:</span>
                               <div className="flex flex-wrap gap-1.5">
-                                {room?.equipamentos && room.equipamentos.length > 0 ? (
+                                {Array.isArray(room?.equipamentos) && room.equipamentos.length > 0 ? (
                                   room.equipamentos.map((rec, i) => (
                                     <span key={i} className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-[10px] font-bold">
                                       {rec}

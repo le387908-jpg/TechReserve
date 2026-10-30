@@ -24,27 +24,32 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidSlotId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_:\\-]+$');
+    }
+
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
 
     function isActiveUserDoc(userData) {
-      return (!('bloqueado' in userData) || userData.bloqueado == false) &&
-             (!('inativo' in userData) || userData.inativo == false);
+      return (!('bloqueado' in userData) || userData.bloqueado == null || userData.bloqueado == false) &&
+             (!('inativo' in userData) || userData.inativo == null || userData.inativo == false);
     }
 
     // Regra 3: Bloqueio por No-Show restrito estritamente à data exata da falta (blockedDate)
     function isNotBlockedOnDate(userData, dateStr) {
       return !('blockedDate' in userData) ||
              userData.blockedDate == null ||
+             userData.blockedDate == '' ||
              userData.blockedDate != dateStr;
     }
 
     // Regra 1: Sala deve estar explicitamente liberada pelo ADM e ativa para reserva de usuários comuns
     function isRoomReleasedForUser(roomData) {
-      return (!('liberadaParaReserva' in roomData) || roomData.liberadaParaReserva == true) &&
-             !(roomData.get('status', 'ATIVO') in ['INATIVO', 'MANUTENCAO']) &&
-             (!('statusManual' in roomData) || roomData.statusManual != 'MANUTENCAO') &&
+      return (!('liberadaParaReserva' in roomData) || roomData.liberadaParaReserva == null || roomData.liberadaParaReserva == true) &&
+             (!('status' in roomData) || roomData.status == null || !(roomData.status in ['INATIVO', 'MANUTENCAO'])) &&
+             (!('statusManual' in roomData) || roomData.statusManual == null || roomData.statusManual != 'MANUTENCAO') &&
              (!('bloqueadaAte' in roomData) || roomData.bloqueadaAte == null ||
               (roomData.bloqueadaAte is number && roomData.bloqueadaAte <= request.time.toMillis()));
     }
@@ -54,16 +59,40 @@ service cloud.firestore {
     // para aquela sala, data e horário exatos.
     function isSlotReleasedForReservation(slotData, resData) {
       return (
-               slotData.get('status', '') in ['liberado', 'ativo', 'LIBERADO', 'ATIVO'] ||
-               (!('status' in slotData) && slotData.get('ativo', false) == true)
+               slotData.get('status', '') in [
+                 'liberado', 'ativo', 'disponivel', 'livre', 'available', 'open',
+                 'LIBERADO', 'ATIVO', 'DISPONIVEL', 'LIVRE', 'AVAILABLE', 'OPEN'
+               ] ||
+               (!('status' in slotData) && (slotData.get('ativo', false) == true || slotData.get('available', false) == true))
              ) &&
-             (!('ativo' in slotData) || slotData.ativo == true) &&
-             (slotData.get('salaId', '') == resData.get('salaId', '') ||
-              ('salaInstitutionalId' in slotData && 'salaInstitutionalId' in resData &&
-               slotData.salaInstitutionalId == resData.salaInstitutionalId)) &&
-             slotData.get('data', '') == resData.get('data', '') &&
-             slotData.get('inicio', '') == resData.get('inicio', '') &&
-             slotData.get('fim', '') == resData.get('fim', '');
+             (!('ativo' in slotData) || slotData.ativo == null || slotData.ativo == true) &&
+             (!('available' in slotData) || slotData.available == null || slotData.available == true) &&
+             (
+               slotData.get('salaId', '') == resData.get('salaId', '') ||
+               slotData.get('roomId', '') == resData.get('salaId', '') ||
+               slotData.get('room_id', '') == resData.get('salaId', '') ||
+               (resData.get('salaInstitutionalId', '') != '' && (
+                 slotData.get('salaId', '') == resData.get('salaInstitutionalId', '') ||
+                 slotData.get('roomId', '') == resData.get('salaInstitutionalId', '') ||
+                 slotData.get('salaInstitutionalId', '') == resData.get('salaInstitutionalId', '') ||
+                 slotData.get('roomCode', '') == resData.get('salaInstitutionalId', '')
+               )) ||
+               (resData.get('salaNome', '') != '' && (
+                 slotData.get('salaNome', '') == resData.get('salaNome', '') ||
+                 slotData.get('roomName', '') == resData.get('salaNome', '')
+               ))
+             ) &&
+             slotData.get('data', slotData.get('date', '')) == resData.get('data', '') &&
+             (
+               (slotData.get('inicio', slotData.get('startTime', slotData.get('start', ''))) == resData.get('inicio', '') &&
+                slotData.get('fim', slotData.get('endTime', slotData.get('end', ''))) == resData.get('fim', '')) ||
+               slotData.get('timeSlot', slotData.get('horario', '')) in [
+                 resData.get('inicio', '') + ' - ' + resData.get('fim', ''),
+                 resData.get('inicio', '') + '-' + resData.get('fim', ''),
+                 resData.get('inicio', '') + ' – ' + resData.get('fim', ''),
+                 resData.get('inicio', '') + ' às ' + resData.get('fim', '')
+               ]
+             );
     }
 
     function isBootstrapAdmin() {
@@ -221,7 +250,7 @@ service cloud.firestore {
         return data.keys().hasAll(['salaId', 'salaNome', 'data', 'inicio', 'fim', 'status', 'ativo', 'createdAt', 'updatedAt']) &&
                data.keys().hasOnly([
                  'id', 'salaId', 'salaInstitutionalId', 'salaNome',
-                 'data', 'inicio', 'fim', 'label',
+                 'data', 'inicio', 'fim', 'timeSlot', 'label',
                  'status', 'ativo', 'liberadoPorId', 'liberadoPorNome',
                  'createdAt', 'updatedAt'
                ]) &&
@@ -232,8 +261,12 @@ service cloud.firestore {
                data.data is string && data.data.size() >= 8 && data.data.size() <= 16 &&
                data.inicio is string && data.inicio.size() >= 4 && data.inicio.size() <= 8 &&
                data.fim is string && data.fim.size() >= 4 && data.fim.size() <= 8 &&
+               (!('timeSlot' in data) || data.timeSlot == null || (data.timeSlot is string && data.timeSlot.size() <= 32)) &&
                (!('label' in data) || data.label == null || (data.label is string && data.label.size() <= 120)) &&
-               data.status is string && data.status in ['liberado', 'ativo', 'bloqueado', 'inativo', 'LIBERADO', 'ATIVO', 'BLOQUEADO', 'INATIVO'] &&
+               data.status is string && data.status in [
+                 'liberado', 'ativo', 'disponivel', 'bloqueado', 'inativo',
+                 'LIBERADO', 'ATIVO', 'DISPONIVEL', 'BLOQUEADO', 'INATIVO'
+               ] &&
                data.ativo is bool &&
                (!('liberadoPorId' in data) || data.liberadoPorId == null || (data.liberadoPorId is string && data.liberadoPorId.size() <= 128)) &&
                (!('liberadoPorNome' in data) || data.liberadoPorNome == null || (data.liberadoPorNome is string && data.liberadoPorNome.size() <= 120)) &&
@@ -241,14 +274,14 @@ service cloud.firestore {
                data.updatedAt is number;
       }
 
-      allow get: if isSignedIn() && isValidId(slotId);
+      allow get: if isSignedIn() && isValidSlotId(slotId);
       allow list: if isSignedIn();
-      allow create: if isAdmin() && isValidId(slotId) && isValidAvailableSlot(incoming()) &&
+      allow create: if isAdmin() && isValidSlotId(slotId) && isValidAvailableSlot(incoming()) &&
                     exists(/databases/$(database)/documents/salas/$(incoming().salaId));
-      allow update: if isAdmin() && isValidId(slotId) && isValidAvailableSlot(incoming()) &&
+      allow update: if isAdmin() && isValidSlotId(slotId) && isValidAvailableSlot(incoming()) &&
                     incoming().salaId == existing().salaId &&
                     incoming().data == existing().data;
-      allow delete: if isAdmin() && isValidId(slotId);
+      allow delete: if isAdmin() && isValidSlotId(slotId);
     }
 
     // 4. RESERVAS (/reservas/{reservaId})
@@ -257,8 +290,8 @@ service cloud.firestore {
         return data.get('status', '') is string &&
                data.get('status', '') in ['PENDENTE', 'CONFIRMADA', 'CANCELADA', 'CONCLUIDA', 'PUNIDA'] &&
                data.get('salaId', '') is string && data.get('salaId', '').size() >= 1 && data.get('salaId', '').size() <= 128 &&
-               (!('salaInstitutionalId' in data) || (data.salaInstitutionalId is string && data.salaInstitutionalId.size() <= 64)) &&
-               (!('salaNome' in data) || (data.salaNome is string && data.salaNome.size() <= 140)) &&
+               (!('salaInstitutionalId' in data) || data.salaInstitutionalId == null || (data.salaInstitutionalId is string && data.salaInstitutionalId.size() <= 64)) &&
+               (!('salaNome' in data) || data.salaNome == null || (data.salaNome is string && data.salaNome.size() <= 140)) &&
                data.get('usuarioId', '') is string && data.get('usuarioId', '').size() >= 1 && data.get('usuarioId', '').size() <= 128 &&
                data.get('data', '') is string && data.get('data', '').size() >= 8 && data.get('data', '').size() <= 16 &&
                data.get('inicio', '') is string && data.get('inicio', '').size() >= 4 && data.get('inicio', '').size() <= 8 &&
@@ -287,7 +320,7 @@ service cloud.firestore {
                       (isAdmin() && incoming().status in ['PENDENTE', 'CONFIRMADA']) ||
                       (isOwner(incoming().usuarioId) &&
                        'availableSlotId' in incoming() &&
-                       isValidId(incoming().availableSlotId) &&
+                       isValidSlotId(incoming().availableSlotId) &&
                        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
                        isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
                        isNotBlockedOnDate(get(/databases/$(database)/documents/users/$(request.auth.uid)).data, incoming().data) &&

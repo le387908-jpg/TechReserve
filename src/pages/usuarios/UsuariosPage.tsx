@@ -12,6 +12,7 @@ import { useAuth } from '../../context/AuthContext';
 import { User } from '../../types';
 import { AdminUsersTab } from '../admin/components/AdminUsersTab';
 import { AdminModerationTab } from '../admin/components/AdminModerationTab';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
 import { cn } from '../../lib/utils';
 
 type UsersViewTab = 'base' | 'moderacao';
@@ -39,7 +40,13 @@ export function UsuariosPage() {
         console.warn('Users page listener warning:', err);
       }
     );
-    return () => unsub();
+    return () => {
+      try {
+        unsub();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+    };
   }, [isAdmin]);
 
   if (!isAdmin) {
@@ -102,14 +109,16 @@ export function UsuariosPage() {
         </button>
       </div>
 
-      {activeView === 'base' ? (
-        <AdminUsersTab
-          externalUsers={users}
-          onNavigateToModeration={() => setActiveView('moderacao')}
-        />
-      ) : (
-        <AdminModerationTab externalUsers={users} />
-      )}
+      <ErrorBoundary resetKey={activeView} variant="inline">
+        {activeView === 'base' ? (
+          <AdminUsersTab
+            externalUsers={users}
+            onNavigateToModeration={() => setActiveView('moderacao')}
+          />
+        ) : (
+          <AdminModerationTab externalUsers={users} />
+        )}
+      </ErrorBoundary>
     </div>
   );
 }

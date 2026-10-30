@@ -33,6 +33,7 @@ import {
 } from '../../../types';
 import { REALTIME_SPACE_STATUS_LABELS, SPACE_CATEGORY_LABELS } from '../../../constants';
 import { cn } from '../../../lib/utils';
+import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 
 const FLOORS = ['Térreo', '1º andar', '2º andar'];
 const CATEGORIES: { id: 'TODAS' | SpaceCategory; label: string }[] = [
@@ -86,12 +87,12 @@ export function AdminSpacesTab() {
 
   const openRoomModal = (room: Room | null) => {
     setEditingRoom(room);
-    if (room?.blocosHorarios && room.blocosHorarios.length > 0) {
+    if (Array.isArray(room?.blocosHorarios) && room.blocosHorarios.length > 0) {
       setUseCustomRoomBlocks(true);
       setRoomBlocksDraft(room.blocosHorarios.map((b) => ({ ...b })));
     } else {
       setUseCustomRoomBlocks(false);
-      setRoomBlocksDraft((scheduleConfig.blocosPadrao || []).map((b) => ({ ...b })));
+      setRoomBlocksDraft((scheduleConfig?.blocosPadrao || []).map((b) => ({ ...b })));
     }
     setIsModalOpen(true);
   };
@@ -101,8 +102,10 @@ export function AdminSpacesTab() {
     return () => clearInterval(t);
   }, []);
 
+  const safeRooms = useMemo(() => (Array.isArray(rooms) ? rooms : []), [rooms]);
+
   const enrichedRooms = useMemo(() => {
-    return rooms.map((room) => {
+    return safeRooms.map((room) => {
       const categoria = inferSpaceCategory(room);
       const realtime = resolveRoomRealtimeStatus(room, reservations, now);
       return {
@@ -111,17 +114,19 @@ export function AdminSpacesTab() {
         realtime,
       };
     });
-  }, [rooms, reservations, now]);
+  }, [safeRooms, reservations, now]);
 
   const filteredRooms = useMemo(() => {
     return enrichedRooms.filter(({ room, categoria, realtime }) => {
+      if (!room) return false;
       if (categoryFilter !== 'TODAS' && categoria !== categoryFilter) return false;
       if (statusFilter !== 'TODOS' && realtime.status !== statusFilter) return false;
       if (floorFilter !== 'TODOS' && room.andar !== floorFilter) return false;
 
       if (search.trim()) {
         const q = search.toLowerCase();
-        const hay = `${room.id} ${room.codigo} ${room.nome} ${room.andar} ${room.equipamentos.join(' ')}`.toLowerCase();
+        const equips = Array.isArray(room.equipamentos) ? room.equipamentos.join(' ') : '';
+        const hay = `${room.id || ''} ${room.codigo || ''} ${room.nome || ''} ${room.andar || ''} ${equips}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -136,7 +141,9 @@ export function AdminSpacesTab() {
       MANUTENCAO: 0,
     };
     enrichedRooms.forEach(({ realtime }) => {
-      acc[realtime.status]++;
+      if (realtime?.status && acc[realtime.status] !== undefined) {
+        acc[realtime.status]++;
+      }
     });
     return acc;
   }, [enrichedRooms]);
@@ -146,8 +153,8 @@ export function AdminSpacesTab() {
     try {
       await setRoomRealtimeStatus(room, nextStatus);
       toast.success(`Status de "${room.nome}" alterado para ${REALTIME_SPACE_STATUS_LABELS[nextStatus]}.`);
-    } catch {
-      toast.error('Não foi possível alterar o status do espaço.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Não foi possível alterar o status do espaço.'));
     } finally {
       setBusyRoomId(null);
     }
@@ -162,8 +169,8 @@ export function AdminSpacesTab() {
           ? `"${room.nome}" reativado e disponível para reservas.`
           : `"${room.nome}" suspenso temporariamente para manutenção.`
       );
-    } catch {
-      toast.error('Falha ao alternar modo de manutenção.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Falha ao alternar modo de manutenção.'));
     } finally {
       setBusyRoomId(null);
     }
@@ -215,8 +222,8 @@ export function AdminSpacesTab() {
       }
       setIsModalOpen(false);
       setEditingRoom(null);
-    } catch {
-      toast.error('Erro ao salvar espaço no inventário.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao salvar espaço no inventário.'));
     }
   };
 
@@ -226,7 +233,7 @@ export function AdminSpacesTab() {
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-white border border-slate-200 rounded-2xl p-6">
         <div className="space-y-1">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono tabular-nums">
-            <span>{rooms.length} ambientes cadastrados</span>
+            <span>{safeRooms.length} ambientes cadastrados</span>
             <span aria-hidden="true">·</span>
             <span className="text-emerald-700 font-semibold">{countsByStatus.DISPONIVEL} disponíveis</span>
             <span aria-hidden="true">·</span>
@@ -243,12 +250,16 @@ export function AdminSpacesTab() {
         </div>
 
         <div className="flex items-center gap-2.5 shrink-0">
-          {rooms.length === 0 && (
+          {safeRooms.length === 0 && (
             <button
               type="button"
               onClick={async () => {
-                await seedRooms();
-                toast.success('Inventário inicial padrão importado.');
+                try {
+                  await seedRooms();
+                  toast.success('Inventário inicial padrão importado.');
+                } catch (err) {
+                  toast.error(getFriendlyErrorMessage(err, 'Erro ao importar salas padrão.'));
+                }
               }}
               className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
             >
@@ -382,7 +393,7 @@ export function AdminSpacesTab() {
                               </>
                             )}
                           </div>
-                          {room.equipamentos?.length > 0 && (
+                          {Array.isArray(room.equipamentos) && room.equipamentos.length > 0 && (
                             <p className="text-[11px] text-slate-400 truncate max-w-xs mt-0.5">
                               {room.equipamentos.join(' · ')}
                             </p>
@@ -419,8 +430,8 @@ export function AdminSpacesTab() {
                                     ? `"${room.nome}" liberada para reservas de usuários.`
                                     : `"${room.nome}" bloqueada para reservas de usuários.`
                                 );
-                              } catch {
-                                toast.error('Erro ao alterar liberação do espaço.');
+                              } catch (err) {
+                                toast.error(getFriendlyErrorMessage(err, 'Erro ao alterar liberação do espaço.'));
                               } finally {
                                 setBusyRoomId(null);
                               }
@@ -445,7 +456,7 @@ export function AdminSpacesTab() {
                             )}
                           </button>
                           <span className="text-[11px] font-mono tabular-nums text-slate-500">
-                            {room.blocosHorarios && room.blocosHorarios.length > 0
+                            {Array.isArray(room.blocosHorarios) && room.blocosHorarios.length > 0
                               ? `${room.blocosHorarios.filter((b) => b.ativo).length} blocos próprios`
                               : 'Usa blocos globais ADM'}
                           </span>
@@ -530,12 +541,20 @@ export function AdminSpacesTab() {
                           <div className="inline-flex items-center gap-1.5">
                             <button
                               type="button"
+                              disabled={isBusy}
                               onClick={async () => {
-                                await deleteRoom(room.firestoreId, room.nome);
-                                setConfirmDeleteId(null);
-                                toast.success('Espaço removido do inventário.');
+                                setBusyRoomId(room.firestoreId);
+                                try {
+                                  await deleteRoom(room.firestoreId, room.nome);
+                                  setConfirmDeleteId(null);
+                                  toast.success('Espaço removido do inventário.');
+                                } catch (err) {
+                                  toast.error(getFriendlyErrorMessage(err, 'Erro ao excluir espaço do inventário.'));
+                                } finally {
+                                  setBusyRoomId(null);
+                                }
                               }}
-                              className="px-2.5 py-1 bg-red-600 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                              className="px-2.5 py-1 bg-red-600 text-white rounded-lg text-xs font-semibold cursor-pointer disabled:opacity-50"
                             >
                               Excluir
                             </button>
@@ -736,7 +755,7 @@ export function AdminSpacesTab() {
                   </label>
                   <input
                     name="equipamentos"
-                    defaultValue={editingRoom?.equipamentos?.join(', ') || ''}
+                    defaultValue={Array.isArray(editingRoom?.equipamentos) ? editingRoom.equipamentos.join(', ') : ''}
                     placeholder="Ex: Projetor HD, 40 Computadores, Ar Condicionado, Lousa Branca"
                     className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-900 outline-none focus:ring-2 focus:ring-fatec-red"
                   />

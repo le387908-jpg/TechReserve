@@ -14,7 +14,12 @@ import {
 import { doc, getDoc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
 import { auth, db, ensureTabIsolationReady } from './firebase/config';
 import { User, UserRole, UserVinculo, CalendarCourse } from '../types';
-import { OperationType, handleFirestoreError, withRetry } from './firebase/utils';
+import {
+  OperationType,
+  handleFirestoreError,
+  stripUndefinedFields,
+  withRetry,
+} from './firebase/utils';
 import { normalizeDateToISO } from '../utils/dateUtils';
 import {
   formatPhone,
@@ -135,36 +140,43 @@ export function translateAuthError(code?: string, fallback?: string): string {
  * - Apenas documentos explicitamente gravados com `role === 'ADMIN'` recebem perfil ADM.
  * - Qualquer outro documento permanece estritamente como `USUARIO` (`ALUNO` ou `SERVIDOR`).
  */
-export function hydrateUserDocument(raw: Record<string, any>, fallbackUid: string): User {
-  const nome = raw.nome || raw.name || 'Usuário';
-  const resolvedRole: UserRole = raw.role === 'ADMIN' ? 'ADMIN' : 'USUARIO';
+export function hydrateUserDocument(
+  raw: Record<string, any> | undefined | null,
+  fallbackUid: string
+): User {
+  const safeRaw = raw || {};
+  const nome = String(safeRaw.nome || safeRaw.name || 'Usuário');
+  const resolvedRole: UserRole = safeRaw.role === 'ADMIN' ? 'ADMIN' : 'USUARIO';
   const resolvedVinculo: UserVinculo =
     resolvedRole === 'ADMIN'
       ? 'COORDENACAO'
-      : raw.tipoVinculo === 'SERVIDOR'
+      : safeRaw.tipoVinculo === 'SERVIDOR'
       ? 'SERVIDOR'
       : 'ALUNO';
-  const curso = raw.curso || raw.course;
-  const semestre = raw.semestre ?? raw.semester;
-  const sanitizedPhone = sanitizePhone(raw.phone || raw.phoneFormatted || raw.telefone || '');
+  const curso = safeRaw.curso || safeRaw.course;
+  const semestre = safeRaw.semestre ?? safeRaw.semester;
+  const sanitizedPhone = sanitizePhone(
+    safeRaw.phone || safeRaw.phoneFormatted || safeRaw.telefone || ''
+  );
   const formattedPhone = sanitizedPhone ? formatPhone(sanitizedPhone) : '';
 
   return {
-    ...(raw as User),
-    id: raw.id || fallbackUid,
+    ...(safeRaw as User),
+    id: String(safeRaw.id || fallbackUid || ''),
     nome,
     name: nome,
+    email: String(safeRaw.email || ''),
     role: resolvedRole,
     tipoVinculo: resolvedVinculo,
     phone: sanitizedPhone,
     phoneFormatted: formattedPhone,
-    whatsappNotificationsEnabled: raw.whatsappNotificationsEnabled !== false,
-    blockedDate: raw.blockedDate ? normalizeDateToISO(raw.blockedDate) : '',
+    whatsappNotificationsEnabled: safeRaw.whatsappNotificationsEnabled !== false,
+    blockedDate: safeRaw.blockedDate ? normalizeDateToISO(safeRaw.blockedDate) : '',
     ...(curso ? { curso, course: curso } : {}),
     ...(semestre !== undefined && semestre !== null ? { semestre, semester: semestre } : {}),
-    dataNascimento: raw.dataNascimento
-      ? normalizeDateToISO(raw.dataNascimento)
-      : raw.dataNascimento,
+    dataNascimento: safeRaw.dataNascimento
+      ? normalizeDateToISO(safeRaw.dataNascimento)
+      : safeRaw.dataNascimento || '2000-01-01',
   };
 }
 
@@ -205,7 +217,7 @@ function buildDefaultUserDocument(uid: string, email: string, displayName?: stri
  * Realiza login por e-mail e senha mantendo a sessão estritamente isolada na aba atual (`browserSessionPersistence`).
  */
 export async function loginWithEmail(email: string, pass: string): Promise<User> {
-  const cleanEmail = email.trim().toLowerCase();
+  const cleanEmail = String(email || '').trim().toLowerCase();
 
   try {
     await ensureTabIsolationReady();
@@ -227,12 +239,12 @@ export async function loginWithEmail(email: string, pass: string): Promise<User>
         userEmail,
         userCredential.user.displayName
       );
-      await setDoc(userRef, userData);
+      await setDoc(userRef, stripUndefinedFields(userData));
     }
 
     if (userData.bloqueado || userData.inativo) {
       clearTabUserSession();
-      await firebaseSignOut(auth);
+      await firebaseSignOut(auth).catch(() => {});
       throw new Error('Sua conta está bloqueada ou suspensa pela administração.');
     }
 
@@ -266,9 +278,9 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
   } = payload;
 
   isRegisteringInTab = true;
-  const cleanEmail = email.trim().toLowerCase();
+  const cleanEmail = String(email || '').trim().toLowerCase();
   const isAdminTarget = role === 'ADMIN';
-  const submittedCode = isAdminTarget ? (code || '').trim() : '';
+  const submittedCode = isAdminTarget ? String(code || '').trim() : '';
 
   if (!validatePhone(phone)) {
     isRegisteringInTab = false;
@@ -303,7 +315,7 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
       : tipoVinculo === 'SERVIDOR'
       ? 'SERVIDOR'
       : 'ALUNO';
-    const cleanName = nome.trim().slice(0, 120);
+    const cleanName = String(nome || '').trim().slice(0, 120) || 'Usuário';
     const resolvedCourse: CalendarCourse = curso || 'GTI';
     const resolvedSemester = semestre || 1;
     const now = Date.now();
@@ -338,20 +350,23 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
       updatedAt: now,
     };
 
-    await setDoc(doc(db, 'users', createdFirebaseUser.uid), userData);
+    await setDoc(doc(db, 'users', createdFirebaseUser.uid), stripUndefinedFields(userData));
 
     // Salva imediatamente na sessão exclusiva desta aba antes de encerrar a flag de registro
     saveTabUserSession(userData);
 
-    await useLogStore.getState().addLog({
-      acao: isAdminTarget ? 'CADASTRO_NOVO_ADMIN' : 'CADASTRO_NOVO_USUARIO',
-      usuarioId: createdFirebaseUser.uid,
-      usuarioNome: userData.nome,
-      entidade: 'USERS',
-      detalhes: `Novo perfil ${
-        isAdminTarget ? 'ADMINISTRATIVO' : resolvedVinculo
-      } cadastrado (${cleanEmail} · WhatsApp: ${formattedPhone}).`,
-    });
+    await useLogStore
+      .getState()
+      .addLog({
+        acao: isAdminTarget ? 'CADASTRO_NOVO_ADMIN' : 'CADASTRO_NOVO_USUARIO',
+        usuarioId: createdFirebaseUser.uid,
+        usuarioNome: userData.nome,
+        entidade: 'USERS',
+        detalhes: `Novo perfil ${
+          isAdminTarget ? 'ADMINISTRATIVO' : resolvedVinculo
+        } cadastrado (${cleanEmail} · WhatsApp: ${formattedPhone}).`,
+      })
+      .catch(() => {});
 
     return userData;
   } catch (err: any) {
@@ -366,7 +381,7 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
       try {
         await deleteUser(createdFirebaseUser);
       } catch {
-        await firebaseSignOut(auth);
+        await firebaseSignOut(auth).catch(() => {});
       }
       throw new Error(
         'Código de autorização administrativa (code-auth) inválido ou cadastro de novos administradores desativado.'
@@ -386,14 +401,14 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
  */
 export async function logoutTabSession(): Promise<void> {
   clearTabUserSession();
-  await firebaseSignOut(auth);
+  await firebaseSignOut(auth).catch(() => {});
 }
 
 /**
  * Envia e-mail de redefinição de senha via Firebase Auth.
  */
 export async function sendPasswordReset(email: string): Promise<void> {
-  await sendPasswordResetEmail(auth, email.trim());
+  await sendPasswordResetEmail(auth, String(email || '').trim());
 }
 
 /**
@@ -457,17 +472,21 @@ export async function updateUserProfileInFirestore(
 
   const now = Date.now();
   const preservedRole: UserRole = currentUser.role === 'ADMIN' ? 'ADMIN' : 'USUARIO';
+  const cleanUpdatePayload = stripUndefinedFields({
+    ...sanitizedData,
+    updatedAt: now,
+  });
   const updatedUser: User = {
     ...currentUser,
-    ...sanitizedData,
+    ...cleanUpdatePayload,
     role: preservedRole,
     updatedAt: now,
   };
-  saveTabUserSession(updatedUser);
 
   try {
     const userRef = doc(db, 'users', currentUser.id);
-    await updateDoc(userRef, { ...sanitizedData, updatedAt: now });
+    await updateDoc(userRef, cleanUpdatePayload);
+    saveTabUserSession(updatedUser);
     return updatedUser;
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.id}`);
@@ -481,13 +500,16 @@ export async function updateUserProfileInFirestore(
 export async function deactivateCurrentUserProfile(currentUser: User): Promise<void> {
   const now = Date.now();
   try {
-    await useLogStore.getState().addLog({
-      acao: 'CONTA_EXCLUIDA_USUARIO',
-      usuarioId: currentUser.id,
-      usuarioNome: currentUser.nome,
-      entidade: 'USERS',
-      detalhes: `O usuário ${currentUser.nome} (${currentUser.email}) solicitou a exclusão/inativação do próprio perfil.`,
-    });
+    await useLogStore
+      .getState()
+      .addLog({
+        acao: 'CONTA_EXCLUIDA_USUARIO',
+        usuarioId: currentUser.id,
+        usuarioNome: currentUser.nome,
+        entidade: 'USERS',
+        detalhes: `O usuário ${currentUser.nome} (${currentUser.email}) solicitou a exclusão/inativação do próprio perfil.`,
+      })
+      .catch(() => {});
 
     const userRef = doc(db, 'users', currentUser.id);
     await updateDoc(userRef, {
@@ -497,7 +519,7 @@ export async function deactivateCurrentUserProfile(currentUser: User): Promise<v
     });
 
     clearTabUserSession();
-    await firebaseSignOut(auth);
+    await firebaseSignOut(auth).catch(() => {});
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.id}`);
   }
@@ -527,7 +549,11 @@ export function subscribeToTabAuthState(callbacks: TabAuthSubscriptionCallbacks)
         if (disposed) return;
 
         if (unsubscribeUserSnapshot) {
-          unsubscribeUserSnapshot();
+          try {
+            unsubscribeUserSnapshot();
+          } catch {
+            // Ignora falha de encerramento de listener anterior
+          }
           unsubscribeUserSnapshot = null;
         }
 
@@ -552,7 +578,7 @@ export function subscribeToTabAuthState(callbacks: TabAuthSubscriptionCallbacks)
                 callbacks.onUnauthenticated(
                   'Sua conta está bloqueada ou inativa pela administração.'
                 );
-                void firebaseSignOut(auth);
+                void firebaseSignOut(auth).catch(() => {});
               } else {
                 saveTabUserSession(data);
                 callbacks.onAuthenticated(data);
@@ -575,7 +601,7 @@ export function subscribeToTabAuthState(callbacks: TabAuthSubscriptionCallbacks)
                 firebaseUser.email || '',
                 firebaseUser.displayName
               );
-              setDoc(userRef, defaultUserData)
+              setDoc(userRef, stripUndefinedFields(defaultUserData))
                 .then(() => {
                   if (disposed || auth.currentUser?.uid !== activeUid) return;
                   saveTabUserSession(defaultUserData);
@@ -592,7 +618,11 @@ export function subscribeToTabAuthState(callbacks: TabAuthSubscriptionCallbacks)
           },
           (err) => {
             if (disposed || auth.currentUser?.uid !== activeUid) return;
-            console.error('Auth snapshot error:', err);
+            try {
+              handleFirestoreError(err, OperationType.GET, `users/${activeUid}`);
+            } catch {
+              // Erro estruturado registrado para diagnóstico
+            }
             const cached = loadTabUserSession();
             if (cached && cached.id === activeUid) {
               callbacks.onAuthenticated(cached);
@@ -613,11 +643,19 @@ export function subscribeToTabAuthState(callbacks: TabAuthSubscriptionCallbacks)
   return () => {
     disposed = true;
     if (unsubscribeUserSnapshot) {
-      unsubscribeUserSnapshot();
+      try {
+        unsubscribeUserSnapshot();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
       unsubscribeUserSnapshot = null;
     }
     if (unsubscribeAuthListener) {
-      unsubscribeAuthListener();
+      try {
+        unsubscribeAuthListener();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
       unsubscribeAuthListener = null;
     }
   };

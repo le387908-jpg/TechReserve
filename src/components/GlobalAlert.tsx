@@ -18,7 +18,8 @@ import { useReservationStore } from '../store/useReservationStore';
 import { useAuthStore } from '../store/useAuthStore';
 import { useRoomStore } from '../store/useRoomStore';
 import { formatNoShowTag } from '../services/reservationService';
-import { getTodayLocalISO } from '../utils/dateUtils';
+import { formatDataBR, getTodayLocalISO } from '../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../services/firebase/utils';
 import { QRScanner } from './QRScanner';
 import { toast } from 'sonner';
 import { cn } from '../lib/utils';
@@ -45,10 +46,19 @@ export function GlobalAlert() {
     return () => clearInterval(interval);
   }, []);
 
+  const safeReservations = useMemo(
+    () => (Array.isArray(reservations) ? reservations.filter(Boolean) : []),
+    [reservations]
+  );
+  const safeRooms = useMemo(
+    () => (Array.isArray(rooms) ? rooms.filter(Boolean) : []),
+    [rooms]
+  );
+
   useEffect(() => {
-    processMissedCheckIns();
+    void Promise.resolve(processMissedCheckIns()).catch(() => {});
     const interval = setInterval(() => {
-      processMissedCheckIns();
+      void Promise.resolve(processMissedCheckIns()).catch(() => {});
     }, 5000);
     return () => clearInterval(interval);
   }, [processMissedCheckIns]);
@@ -56,75 +66,90 @@ export function GlobalAlert() {
   // Verifica punição de No-Show estritamente para o usuário logado e apenas na data de hoje (Regra do Dia Faltante)
   const todayISO = useMemo(() => getTodayLocalISO(), [now]);
   const activePunishmentRes = useMemo(() => {
-    if (!user || user.role === 'ADMIN') return null;
+    if (!user?.id || user?.role === 'ADMIN') return null;
     return (
-      reservations.find(
+      safeReservations.find(
         (r) =>
-          r.usuarioId === user.id &&
-          r.status === 'PUNIDA' &&
-          (r.blockedDate || r.data) === todayISO
+          r?.usuarioId === user.id &&
+          r?.status === 'PUNIDA' &&
+          (r?.blockedDate || r?.data) === todayISO
       ) || null
     );
-  }, [reservations, user, todayISO]);
+  }, [safeReservations, user, todayISO]);
 
   // Find pending check-in (within 5-minute check-in window)
   const pendingCheckInRes = useMemo(() => {
-    if (!user || user.role !== 'USUARIO' || activePunishmentRes) return null;
-    return reservations.find(r => 
-      r.usuarioId === user.id &&
-      r.status === 'PENDENTE' && 
-      r.checkInExpiracao && 
-      r.checkInExpiracao > now &&
-      (r.checkInExpiracao - now) <= 5 * 60 * 1000 // 5 minutes QR check-in limit
+    if (!user?.id || user?.role !== 'USUARIO' || activePunishmentRes) return null;
+    return safeReservations.find(
+      (r) =>
+        r?.usuarioId === user.id &&
+        r?.status === 'PENDENTE' &&
+        Boolean(r?.checkInExpiracao) &&
+        (r.checkInExpiracao as number) > now &&
+        (r.checkInExpiracao as number) - now <= 5 * 60 * 1000
     );
-  }, [reservations, user, now, activePunishmentRes]);
+  }, [safeReservations, user, now, activePunishmentRes]);
 
   // Find active ongoing confirmed/checked-in reservation today
   const activeConfirmedRes = useMemo(() => {
-    if (!user) return null;
-    const todayStr = new Date().toLocaleDateString('en-CA');
-    return reservations.find(r => 
-      r.usuarioId === user.id &&
-      r.status === 'CONFIRMADA' &&
-      r.checkInRealizado &&
-      r.data === todayStr
+    if (!user?.id) return null;
+    const todayStr = getTodayLocalISO();
+    return safeReservations.find(
+      (r) =>
+        r?.usuarioId === user.id &&
+        r?.status === 'CONFIRMADA' &&
+        Boolean(r?.checkInRealizado) &&
+        r?.data === todayStr
     );
-  }, [reservations, user]);
+  }, [safeReservations, user]);
 
   const activeConfirmedTimeLeft = useMemo(() => {
-    if (!activeConfirmedRes || !activeConfirmedRes.fim || !activeConfirmedRes.inicio) return 0;
+    if (
+      !activeConfirmedRes?.data ||
+      !activeConfirmedRes?.fim ||
+      !activeConfirmedRes?.inicio
+    ) {
+      return 0;
+    }
     const [year, month, day] = activeConfirmedRes.data.split('-').map(Number);
     const [startHour, startMin] = activeConfirmedRes.inicio.split(':').map(Number);
     const [endHour, endMin] = activeConfirmedRes.fim.split(':').map(Number);
-    if (isNaN(year) || isNaN(month) || isNaN(day) || isNaN(startHour) || isNaN(startMin) || isNaN(endHour) || isNaN(endMin)) {
+    if (
+      isNaN(year) ||
+      isNaN(month) ||
+      isNaN(day) ||
+      isNaN(startHour) ||
+      isNaN(startMin) ||
+      isNaN(endHour) ||
+      isNaN(endMin)
+    ) {
       return 0;
     }
     const startTime = new Date(year, month - 1, day, startHour, startMin).getTime();
     const endTime = new Date(year, month - 1, day, endHour, endMin).getTime();
-    
-    // Only display usage counter on the reserved day AND during the reserved hours
+
     if (now < startTime || now > endTime) return 0;
-    
+
     return Math.max(0, endTime - now);
   }, [activeConfirmedRes, now]);
 
   // Find admin pending reservations waiting for confirmation (can display right after booking)
   const adminPendingConfirmationRes = useMemo(() => {
-    if (!user || user.role !== 'ADMIN') return null;
-    return reservations.find(r => 
-      r.usuarioId === user.id &&
-      r.status === 'PENDENTE' &&
-      !r.checkInRealizado
+    if (!user?.id || user?.role !== 'ADMIN') return null;
+    return safeReservations.find(
+      (r) =>
+        r?.usuarioId === user.id &&
+        r?.status === 'PENDENTE' &&
+        !r?.checkInRealizado
     );
-  }, [reservations, user]);
+  }, [safeReservations, user]);
 
   // Find admin's pending or confirmed reservations to alert them
   const adminReminderRes = useMemo(() => {
-    if (!user || user.role !== 'ADMIN') return null;
+    if (!user?.id || user?.role !== 'ADMIN') return null;
 
-    const adminReservations = reservations.filter(r => 
-      r.usuarioId === user.id && 
-      r.status === 'CONFIRMADA' // Only confirmed reminders now, as pending is handled above
+    const adminReservations = safeReservations.filter(
+      (r) => r?.usuarioId === user.id && r?.status === 'CONFIRMADA'
     );
 
     for (const res of adminReservations) {
@@ -168,44 +193,49 @@ export function GlobalAlert() {
       }
     }
     return null;
-  }, [reservations, user, now]);
+  }, [safeReservations, user, now]);
 
   const handleScan = async (scannedRoomId: string) => {
     if (!scanningResId) return;
-    
-    const res = reservations.find(r => r.id === scanningResId);
+
+    const res = safeReservations.find((r) => r?.id === scanningResId);
     if (!res) return;
 
-    const room = rooms.find(r => r.firestoreId === res.salaId);
+    const room = safeRooms.find((r) => r?.firestoreId === res.salaId);
     if (!room) return;
 
-    let normalizedScanned = scannedRoomId;
-    if (scannedRoomId.startsWith('TECHRESERVE:')) {
-      normalizedScanned = scannedRoomId.split(':')[2] ? scannedRoomId.substring(13) : scannedRoomId.split(':')[1];
+    const safeScanned = String(scannedRoomId || '').trim();
+    let normalizedScanned = safeScanned;
+    if (safeScanned.startsWith('TECHRESERVE:')) {
+      const parts = safeScanned.split(':');
+      normalizedScanned = parts[2] ? safeScanned.substring(13) : parts[1] || '';
     }
 
     if (res.checkInRealizado || res.status === 'CONFIRMADA') {
       toast.error('erro no check-in, código QR incompatível com sua reserva atual', {
-        icon: <AlertCircle className="h-5 w-5 text-fatec-red" />
+        icon: <AlertCircle className="h-5 w-5 text-fatec-red" />,
       });
       setScanningResId(null);
       return;
     }
 
-    // Check against institutional ID (SALA-001), codigo (LAB-XXX) or firestoreId
-    if (normalizedScanned === room.id || normalizedScanned === room.codigo || normalizedScanned === room.firestoreId) {
+    if (
+      normalizedScanned === room.id ||
+      normalizedScanned === room.codigo ||
+      normalizedScanned === room.firestoreId
+    ) {
       try {
         await checkIn(res.id);
         toast.success('Check-in realizado com sucesso!', {
-          icon: <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+          icon: <CheckCircle2 className="h-5 w-5 text-emerald-500" />,
         });
         setScanningResId(null);
       } catch (err) {
-        toast.error('Erro ao realizar check-in.');
+        toast.error(getFriendlyErrorMessage(err, 'Erro ao realizar check-in.'));
       }
     } else {
       toast.error('erro ao realizar check-in, Código QR inválido para esta sala', {
-        icon: <AlertCircle className="h-5 w-5 text-fatec-red" />
+        icon: <AlertCircle className="h-5 w-5 text-fatec-red" />,
       });
     }
   };
@@ -215,7 +245,7 @@ export function GlobalAlert() {
       await updateReservation(id, { status: 'CANCELADA' });
       toast.success('Reserva cancelada com sucesso.');
     } catch (err) {
-      toast.error('Erro ao cancelar reserva.');
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao cancelar reserva.'));
     }
   };
 
@@ -224,8 +254,8 @@ export function GlobalAlert() {
       const nextStatus = user?.role === 'ADMIN' ? 'CANCELADA' : 'CONCLUIDA';
       await updateReservation(id, { status: nextStatus });
       toast.success('Sessão encerrada e sala liberada.');
-    } catch {
-      toast.error('Erro ao encerrar reserva.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao encerrar reserva.'));
     }
   };
 
@@ -315,10 +345,10 @@ export function GlobalAlert() {
                       Reserva aguardando confirmação...
                     </p>
                     <p className="text-[11px] font-semibold text-slate-500 mt-2">
-                      Sala: <span className="font-extrabold text-slate-800">{adminPendingConfirmationRes.salaNome}</span>
+                      Sala: <span className="font-extrabold text-slate-800">{adminPendingConfirmationRes?.salaNome || 'Ambiente'}</span>
                     </p>
                     <p className="text-[10px] font-medium text-slate-400">
-                      Horário: {new Date(adminPendingConfirmationRes.data).toLocaleDateString()} ({adminPendingConfirmationRes.inicio} - {adminPendingConfirmationRes.fim})
+                      Horário: {formatDataBR(adminPendingConfirmationRes?.data)} ({adminPendingConfirmationRes?.inicio || '--:--'} - {adminPendingConfirmationRes?.fim || '--:--'})
                     </p>
                   </div>
 
@@ -334,7 +364,7 @@ export function GlobalAlert() {
                             icon: <CheckCircle2 className="h-5 w-5 text-emerald-500" />
                           });
                         } catch (err) {
-                          toast.error('Erro ao confirmar reserva.');
+                          toast.error(getFriendlyErrorMessage(err, 'Erro ao confirmar reserva.'));
                         }
                       }}
                       className="flex-1 bg-amber-500 hover:bg-amber-600 text-white py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 flex items-center justify-center gap-2 shadow-lg shadow-amber-100 font-bold"
@@ -373,7 +403,7 @@ export function GlobalAlert() {
                   <div>
                     <p className="text-[10px] font-black text-amber-600 uppercase tracking-tighter mb-1">Local da Reserva:</p>
                     <p className="text-sm font-bold text-slate-900">
-                      {rooms.find(r => r.firestoreId === pendingCheckInRes.salaId)?.nome || 'Sua Sala'}
+                      {safeRooms.find((r) => r?.firestoreId === pendingCheckInRes?.salaId)?.nome || pendingCheckInRes?.salaNome || 'Sua Sala'}
                     </p>
                     <p className="text-[10px] font-medium text-slate-400">
                       Expira em breve! Realize o check-in agora.

@@ -14,7 +14,11 @@ import {
 } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
 import { Log } from '../types';
-import { OperationType, handleFirestoreError } from '../services/firebase/utils';
+import {
+  OperationType,
+  handleFirestoreError,
+  stripUndefinedFields,
+} from '../services/firebase/utils';
 import { useAuthStore } from './useAuthStore';
 
 interface LogState {
@@ -40,10 +44,15 @@ export const useLogStore = create<LogState>((set) => ({
     const q = query(collection(db, 'logs'), orderBy('createdAt', 'desc'), limit(100));
     
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Log));
+      const logs = snapshot.docs.map(docSnap => ({ id: docSnap.id, ...(docSnap.data() || {}) } as Log));
       set({ logs, loading: false });
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'logs');
+      try {
+        handleFirestoreError(error, OperationType.LIST, 'logs');
+      } catch {
+        // Erro registrado estruturadamente
+      }
+      set({ loading: false });
     });
 
     return unsubscribe;
@@ -51,10 +60,18 @@ export const useLogStore = create<LogState>((set) => ({
 
   addLog: async (logData) => {
     try {
-      await addDoc(collection(db, 'logs'), {
-        ...logData,
-        createdAt: Date.now(),
-      });
+      await addDoc(
+        collection(db, 'logs'),
+        stripUndefinedFields({
+          ...logData,
+          acao: String(logData?.acao || 'ACAO_SISTEMA').slice(0, 120),
+          usuarioId: String(logData?.usuarioId || 'SISTEMA').slice(0, 128),
+          usuarioNome: String(logData?.usuarioNome || 'Usuário').slice(0, 140),
+          entidade: String(logData?.entidade || 'SISTEMA').slice(0, 80),
+          detalhes: String(logData?.detalhes || '').slice(0, 950),
+          createdAt: Date.now(),
+        })
+      );
     } catch (err) {
       console.error('Failed to log action:', err);
     }

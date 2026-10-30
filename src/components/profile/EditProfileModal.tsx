@@ -26,6 +26,7 @@ import {
   validatePhone,
 } from '../../utils/formatters';
 import { sendTestWhatsAppAlert } from '../../services/whatsappService';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { cn } from '../../lib/utils';
 
 interface EditProfileModalProps {
@@ -90,8 +91,8 @@ export function EditProfileModal({ isOpen, onClose }: EditProfileModalProps) {
       });
       toast.success('Perfil e preferências de WhatsApp atualizados com sucesso.');
       onClose();
-    } catch (err: any) {
-      toast.error(err.message || 'Não foi possível atualizar seu perfil.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Não foi possível atualizar seu perfil.'));
     } finally {
       setSaving(false);
     }
@@ -136,9 +137,9 @@ export function EditProfileModal({ isOpen, onClose }: EditProfileModalProps) {
           res.reason || 'Falha ao disparar teste de WhatsApp via Evolution API.'
         );
       }
-    } catch (err: any) {
+      } catch (err) {
       console.error('[Perfil][Teste WhatsApp] Exceção:', err);
-      toast.error(err?.message || 'Erro ao validar alerta de WhatsApp.');
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao validar alerta de WhatsApp.'));
     } finally {
       setTestingAlert(false);
     }

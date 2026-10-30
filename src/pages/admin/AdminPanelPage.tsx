@@ -22,6 +22,7 @@ import { AdminSpacesTab } from './components/AdminSpacesTab';
 import { AdminModerationTab } from './components/AdminModerationTab';
 import { AdminUsersTab } from './components/AdminUsersTab';
 import { WhatsAppGatewayCard } from '../../components/admin/WhatsAppGatewayCard';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
 import { cn } from '../../lib/utils';
 
 export type AdminTabKey = 'metricas' | 'horarios' | 'espacos' | 'moderacao' | 'usuarios';
@@ -73,7 +74,11 @@ export function AdminPanelPage() {
         console.warn('Admin users listener warning:', err);
       }
     );
-    return () => unsub();
+    return () => {
+      try {
+        unsub();
+      } catch {}
+    };
   }, [isAdmin]);
 
   if (!isAdmin) {
@@ -105,7 +110,12 @@ export function AdminPanelPage() {
       </div>
 
       {/* STATUS E CONEXÃO QR DO GATEWAY WHATSAPP INSTITUCIONAL */}
-      <WhatsAppGatewayCard compact />
+      <ErrorBoundary
+        variant="inline"
+        title="Falha ao carregar o cartão de integração WhatsApp"
+      >
+        <WhatsAppGatewayCard compact />
+      </ErrorBoundary>
 
       {/* BARRA DE NAVEGAÇÃO INTERNA DAS 5 FRENTES DO PERFIL ADM */}
       <div className="bg-white border border-slate-200 rounded-2xl p-1.5 flex items-center gap-1 overflow-x-auto">
@@ -132,18 +142,24 @@ export function AdminPanelPage() {
       </div>
 
       {/* CONTEÚDO DA ABA SELECIONADA */}
-      <div>
-        {activeTab === 'metricas' && <AdminAnalyticsTab />}
-        {activeTab === 'horarios' && <AdminSchedulesTab />}
-        {activeTab === 'espacos' && <AdminSpacesTab />}
-        {activeTab === 'moderacao' && <AdminModerationTab externalUsers={users} />}
-        {activeTab === 'usuarios' && (
-          <AdminUsersTab
-            externalUsers={users}
-            onNavigateToModeration={() => handleSelectTab('moderacao')}
-          />
-        )}
-      </div>
+      <ErrorBoundary
+        resetKey={activeTab}
+        variant="inline"
+        title="Falha ao renderizar esta seção administrativa"
+      >
+        <div>
+          {activeTab === 'metricas' && <AdminAnalyticsTab />}
+          {activeTab === 'horarios' && <AdminSchedulesTab />}
+          {activeTab === 'espacos' && <AdminSpacesTab />}
+          {activeTab === 'moderacao' && <AdminModerationTab externalUsers={users} />}
+          {activeTab === 'usuarios' && (
+            <AdminUsersTab
+              externalUsers={users}
+              onNavigateToModeration={() => handleSelectTab('moderacao')}
+            />
+          )}
+        </div>
+      </ErrorBoundary>
     </div>
   );
 }

@@ -59,28 +59,35 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
 
   const handleScan = async (decodedText: string) => {
     if (processingRef.current) return;
-    
+
     processingRef.current = true;
     setStatus('EVALUATING');
-    
-    // Firmly stop and clear before processing to avoid multiple reads or background restarts
+
     await stopScanner();
-    
-    const success = await processCheckIn(decodedText);
-    
-    if (success) {
-      setStatus('SUCCESS');
-      if (onScan) onScan(decodedText);
-      // Auto close after 2.5 seconds on success
-      setTimeout(() => {
-        onClose();
-      }, 2500);
-    } else {
-      const errorMsg = useCheckInStore.getState().message.text;
-      setError(errorMsg);
+
+    try {
+      const success = await processCheckIn(decodedText);
+
+      if (!isMountedRef.current) return;
+
+      if (success) {
+        setStatus('SUCCESS');
+        if (onScan) onScan(decodedText);
+        setTimeout(() => {
+          if (isMountedRef.current) {
+            onClose();
+          }
+        }, 2500);
+      } else {
+        const errorMsg = useCheckInStore.getState()?.message?.text || 'Código inválido para check-in.';
+        setError(errorMsg);
+        setStatus('ERROR');
+      }
+    } catch (err: unknown) {
+      if (!isMountedRef.current) return;
+      const errMsg = err instanceof Error ? err.message : 'Erro ao processar o check-in.';
+      setError(errMsg);
       setStatus('ERROR');
-      // DO NOT reset processingRef.current here. 
-      // Manual click on "Tentar Novamente" will call startScanning which resets it.
     }
   };
 
@@ -136,16 +143,22 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
         return;
       }
 
-      localStorage.setItem('camera_permission_asked', 'true');
+      try {
+        localStorage.setItem('camera_permission_asked', 'true');
+      } catch {
+        // Ignora bloqueios de armazenamento
+      }
       setStatus('SCANNING');
-    } catch (err: any) {
+    } catch (err: unknown) {
       if (!isMountedRef.current || currentScanIdRef.current !== scanId) return;
-      console.error("Erro ao iniciar scanner:", err?.message || String(err));
-      if (err.toString().toLowerCase().includes("denied") || err.toString().toLowerCase().includes("not allowed")) {
+      const errMessage = err instanceof Error ? err.message : String(err ?? '');
+      console.error('Erro ao iniciar scanner:', errMessage);
+      const lowerErr = errMessage.toLowerCase();
+      if (lowerErr.includes('denied') || lowerErr.includes('not allowed')) {
         setStatus('DENIED');
-        setError("O acesso à câmera é obrigatório para validar sua presença.");
+        setError('O acesso à câmera é obrigatório para validar sua presença.');
       } else {
-        setError(err.message || "Erro desconhecido ao acessar a câmera.");
+        setError(errMessage || 'Erro desconhecido ao acessar a câmera.');
         setStatus('DENIED');
       }
     }
@@ -228,12 +241,17 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
           {(status === 'LOADING' || status === 'SCANNING' || status === 'EVALUATING' || status === 'ERROR') && (
             <div className="space-y-6 animate-in fade-in duration-500">
               <div className="relative">
-                <div 
-                  id={containerId} 
+                <div
                   className={`overflow-hidden rounded-3xl border-4 border-slate-900 shadow-inner bg-black min-h-[250px] transition-opacity duration-300 ${
-                    (status === 'LOADING' || status === 'ERROR') ? 'opacity-20' : status === 'EVALUATING' ? 'opacity-50' : 'opacity-100'
+                    status === 'LOADING' || status === 'ERROR'
+                      ? 'opacity-20'
+                      : status === 'EVALUATING'
+                      ? 'opacity-50'
+                      : 'opacity-100'
                   }`}
-                />
+                >
+                  <div id={containerId} />
+                </div>
                 
                 {status === 'LOADING' && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 text-center">
@@ -311,7 +329,7 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
                 <CheckCircle2 className="h-16 w-16 text-emerald-500 mx-auto mb-4" />
                 <p className="text-emerald-900 font-black uppercase italic text-lg mb-2">Sucesso!</p>
                 <p className="text-emerald-700 font-bold">
-                  {message.text || "Check-in realizado com sucesso"}
+                  {message?.text || 'Check-in realizado com sucesso'}
                 </p>
               </div>
               <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest">

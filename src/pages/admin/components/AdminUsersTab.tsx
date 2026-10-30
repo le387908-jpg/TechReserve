@@ -46,7 +46,11 @@ import { USER_VINCULO_LABELS } from '../../../constants';
 import { formatNoShowTag } from '../../../services/reservationService';
 import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../../../utils/dateUtils';
 import { formatPhoneMask } from '../../../utils/phoneUtils';
-import { withRetry } from '../../../services/firebase/utils';
+import {
+  getFriendlyErrorMessage,
+  stripUndefinedFields,
+  withRetry,
+} from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 
 interface AdminUsersTabProps {
@@ -63,7 +67,8 @@ interface AdminUsersTabProps {
  */
 export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUsersTabProps) {
   const currentUser = useAuthStore((state) => state.user);
-  const { rooms } = useRoomStore();
+  const { rooms: rawRooms } = useRoomStore();
+  const rooms = Array.isArray(rawRooms) ? rawRooms : [];
   const {
     authConfig,
     fetchAdminAuthConfig,
@@ -76,8 +81,8 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
   const [now, setNow] = useState(() => Date.now());
 
   // Estado do painel `code-auth`
-  const [codeAuthInput, setCodeAuthInput] = useState(authConfig.codeAuth);
-  const [allowAdminSignup, setAllowAdminSignup] = useState(authConfig.allowAdminSignup);
+  const [codeAuthInput, setCodeAuthInput] = useState(authConfig?.codeAuth || '');
+  const [allowAdminSignup, setAllowAdminSignup] = useState(authConfig?.allowAdminSignup ?? true);
   const [showCodeAuth, setShowCodeAuth] = useState(false);
   const [isSavingCodeAuth, setIsSavingCodeAuth] = useState(false);
 
@@ -106,14 +111,18 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
     const unsubCode = fetchAdminAuthConfig();
     const t = setInterval(() => setNow(Date.now()), 15000);
     return () => {
-      unsubCode();
+      try {
+        unsubCode();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
       clearInterval(t);
     };
   }, [fetchAdminAuthConfig]);
 
   useEffect(() => {
-    setCodeAuthInput(authConfig.codeAuth);
-    setAllowAdminSignup(authConfig.allowAdminSignup);
+    setCodeAuthInput(authConfig?.codeAuth || '');
+    setAllowAdminSignup(authConfig?.allowAdminSignup ?? true);
   }, [authConfig]);
 
   useEffect(() => {
@@ -130,12 +139,18 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
       },
       () => setLoading(false)
     );
-    return () => unsub();
+    return () => {
+      try {
+        unsub();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+    };
   }, [externalUsers]);
 
   // Carrega histórico individual em tempo real ao abrir o modal de um usuário
   useEffect(() => {
-    if (!historyUser) {
+    if (!historyUser?.id) {
       setUserReservations([]);
       return;
     }
@@ -152,20 +167,35 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
       },
       () => setLoadingHistory(false)
     );
-    return () => unsub();
+    return () => {
+      try {
+        unsub();
+      } catch {
+        // Ignora falha de encerramento de listener
+      }
+    };
   }, [historyUser]);
 
-  const users = externalUsers || internalUsers;
+  const users = Array.isArray(externalUsers)
+    ? externalUsers
+    : Array.isArray(internalUsers)
+    ? internalUsers
+    : [];
 
   const todayISO = useMemo(() => getTodayLocalISO(), [now]);
 
   const filteredUsers = useMemo(() => {
     return users.filter((u) => {
+      if (!u) return false;
       const normBlocked = u.blockedDate ? normalizeDateToISO(u.blockedDate) : '';
       const isPunished = Boolean(normBlocked && normBlocked >= todayISO);
       const isBlocked = Boolean(u.bloqueado || u.inativo);
       const vinculo: UserVinculo =
-        u.role === 'ADMIN' ? 'COORDENACAO' : u.tipoVinculo || 'ALUNO';
+        u.role === 'ADMIN'
+          ? 'COORDENACAO'
+          : u.tipoVinculo === 'SERVIDOR'
+          ? 'SERVIDOR'
+          : 'ALUNO';
 
       if (roleFilter === 'ADMIN' && u.role !== 'ADMIN') return false;
       if (roleFilter === 'ALUNO' && (u.role === 'ADMIN' || vinculo !== 'ALUNO')) return false;
@@ -199,8 +229,8 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
         allowAdminSignup,
       });
       toast.success('Código de autorização (code-auth) atualizado com sucesso.');
-    } catch (err: any) {
-      toast.error(err.message || 'Erro ao salvar code-auth.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao salvar code-auth.'));
     } finally {
       setIsSavingCodeAuth(false);
     }
@@ -238,23 +268,28 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
         })
       );
 
-      await useLogStore.getState().addLog({
-        acao: nextState ? 'INATIVAR_USUARIO_ADM' : 'REATIVAR_USUARIO_ADM',
-        usuarioId: target.id,
-        usuarioNome: currentUser.nome,
-        entidade: 'USERS',
-        detalhes: `Conta de ${target.nome} (${target.email}) foi ${
-          nextState ? 'inativada (reservas e ações bloqueadas)' : 'reativada'
-        } pelo administrador.`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: nextState ? 'INATIVAR_USUARIO_ADM' : 'REATIVAR_USUARIO_ADM',
+          usuarioId: target.id,
+          usuarioNome: currentUser.nome,
+          entidade: 'USERS',
+          detalhes: `Conta de ${target.nome} (${target.email}) foi ${
+            nextState ? 'inativada (reservas e ações bloqueadas)' : 'reativada'
+          } pelo administrador.`,
+        })
+        .catch(() => {});
 
       toast.success(
         nextState
           ? `Usuário ${target.nome} inativado e bloqueado para reservas.`
           : `Usuário ${target.nome} reativado com sucesso.`
       );
-    } catch {
-      toast.error('Não foi possível alterar o status de ativação do usuário.');
+    } catch (err) {
+      toast.error(
+        getFriendlyErrorMessage(err, 'Não foi possível alterar o status de ativação do usuário.')
+      );
     }
   };
 
@@ -279,22 +314,27 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
         payload.semester = editVinculo === 'SERVIDOR' ? null : editSemestre;
       }
 
-      await withRetry(() => updateDoc(doc(db, 'users', editingUser.id), payload));
+      await withRetry(() =>
+        updateDoc(doc(db, 'users', editingUser.id), stripUndefinedFields(payload))
+      );
 
-      await useLogStore.getState().addLog({
-        acao: 'ATUALIZAR_CADASTRO_USUARIO',
-        usuarioId: editingUser.id,
-        usuarioNome: currentUser.nome,
-        entidade: 'USERS',
-        detalhes: `Cadastro de ${editingUser.nome} atualizado (RA: ${editRa || 'N/A'} · Inativo/Bloqueado: ${
-          editBloqueado ? 'Sim' : 'Não'
-        }).`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: 'ATUALIZAR_CADASTRO_USUARIO',
+          usuarioId: editingUser.id,
+          usuarioNome: currentUser.nome,
+          entidade: 'USERS',
+          detalhes: `Cadastro de ${editingUser.nome} atualizado (RA: ${editRa || 'N/A'} · Inativo/Bloqueado: ${
+            editBloqueado ? 'Sim' : 'Não'
+          }).`,
+        })
+        .catch(() => {});
 
       toast.success(`Dados cadastrais de ${editingUser.nome} atualizados.`);
       setEditingUser(null);
-    } catch {
-      toast.error('Erro ao salvar alterações do usuário.');
+    } catch (err) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao salvar alterações do usuário.'));
     } finally {
       setIsSavingUser(false);
     }
@@ -314,11 +354,11 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
               <span className="font-semibold text-slate-900">
                 Credencial Institucional de Governança (code-auth)
               </span>
-              {authConfig.updatedAt > 0 && (
+              {(authConfig?.updatedAt || 0) > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
                   <span className="font-mono tabular-nums">
-                    Atualizado por {authConfig.updatedByName} em{' '}
+                    Atualizado por {authConfig?.updatedByName || 'Administrador'} em{' '}
                     {new Date(authConfig.updatedAt).toLocaleDateString('pt-BR')}
                   </span>
                 </>
@@ -514,7 +554,11 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                   const isPunished = Boolean(normBlocked && normBlocked >= todayISO);
                   const isBlocked = Boolean(u.bloqueado || u.inativo);
                   const vinculo: UserVinculo =
-                    u.role === 'ADMIN' ? 'COORDENACAO' : u.tipoVinculo || 'ALUNO';
+                    u.role === 'ADMIN'
+                      ? 'COORDENACAO'
+                      : u.tipoVinculo === 'SERVIDOR'
+                      ? 'SERVIDOR'
+                      : 'ALUNO';
 
                   return (
                     <tr key={u.id} className="hover:bg-slate-50/70 transition-colors">
@@ -539,7 +583,7 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                       </td>
 
                       <td className="px-5 py-3.5 text-xs font-semibold text-slate-700 whitespace-nowrap">
-                        {USER_VINCULO_LABELS[vinculo]}
+                        {USER_VINCULO_LABELS[vinculo] || vinculo}
                       </td>
 
                       <td className="px-5 py-3.5 text-xs text-slate-700 whitespace-nowrap">

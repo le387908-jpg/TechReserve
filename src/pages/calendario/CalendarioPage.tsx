@@ -42,17 +42,22 @@ import { toast } from 'sonner';
 import { collection, onSnapshot } from 'firebase/firestore';
 import { db } from '../../services/firebase/config';
 import { isBookingWindowOpen, getReservationDateLimits } from '../../utils/reservationRules';
-import { isSpaceReleasedByAdmin } from '../../services/reservationService';
+import { doRoomNamesMatch, isSpaceReleasedByAdmin } from '../../services/reservationService';
+import { isSlotActiveOrReleased, useAvailableSlotsStore } from '../../store/useAvailableSlotsStore';
 import { getTodayLocalISO } from '../../utils/dateUtils';
+import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 
 const DAY_ORDER: DayOfWeek[] = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
 
-function getDayOfWeekFromDate(dateStr: string): DayOfWeek {
-  const [year, month, day] = dateStr.split('-').map(Number);
+function getDayOfWeekFromDate(dateStr?: string): DayOfWeek {
+  if (!dateStr || typeof dateStr !== 'string') return 'Segunda';
+  const parts = dateStr.split('-').map(Number);
+  if (parts.length < 3 || parts.some((n) => !Number.isFinite(n))) return 'Segunda';
+  const [year, month, day] = parts;
   const date = new Date(year, month - 1, day, 12, 0, 0);
   const days: (DayOfWeek | 'Domingo')[] = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
   const dayName = days[date.getDay()];
-  return (dayName === 'Domingo' ? 'Segunda' : dayName) as DayOfWeek;
+  return (dayName === 'Domingo' ? 'Segunda' : dayName || 'Segunda') as DayOfWeek;
 }
 
 /**
@@ -86,13 +91,27 @@ export function CalendarioPage() {
   const updateProfile = useAuthStore(state => state.updateProfile);
   const isAdmin = user?.role === 'ADMIN';
 
-  const reservations = useReservationStore(state => state.reservations);
+  const rawReservations = useReservationStore(state => state.reservations);
   const fetchReservations = useReservationStore(state => state.fetchReservations);
   const updateReservation = useReservationStore(state => state.updateReservation);
   const deleteReservation = useReservationStore(state => state.deleteReservation);
 
-  const rooms = useRoomStore(state => state.rooms);
+  const rawRooms = useRoomStore(state => state.rooms);
   const fetchRooms = useRoomStore(state => state.fetchRooms);
+  const rawAvailableSlots = useAvailableSlotsStore(state => state.slots);
+
+  const reservations = useMemo(
+    () => (Array.isArray(rawReservations) ? rawReservations : []),
+    [rawReservations]
+  );
+  const rooms = useMemo(
+    () => (Array.isArray(rawRooms) ? rawRooms : []),
+    [rawRooms]
+  );
+  const availableSlots = useMemo(
+    () => (Array.isArray(rawAvailableSlots) ? rawAvailableSlots : []),
+    [rawAvailableSlots]
+  );
 
   const availableRooms = useMemo(
     () => (isAdmin ? rooms : rooms.filter((r) => isSpaceReleasedByAdmin(r).released)),
@@ -166,9 +185,9 @@ export function CalendarioPage() {
     }
 
     return () => {
-      unsubRes();
-      unsubRooms();
-      if (unsubUsers) unsubUsers();
+      try { unsubRes(); } catch {}
+      try { unsubRooms(); } catch {}
+      try { if (unsubUsers) unsubUsers(); } catch {}
     };
   }, [fetchReservations, fetchRooms, isAdmin]);
 
@@ -176,38 +195,32 @@ export function CalendarioPage() {
   const allEvents = useMemo(() => {
     const events: CalendarEvent[] = [];
 
-    // 1. Add fixed curriculum classes (Verde)
+    // 1. Add fixed curriculum classes (Azul = Ocupado / Aula Regular)
     for (const aula of GRADE_CURRICULAR_FATEC) {
       if (aula.curso === selectedCourse && aula.semestre === selectedSemester) {
         events.push({
           ...aula,
-          cor: 'verde',
+          cor: 'azul',
         });
       }
     }
 
-    // 2. Add dynamic reservations from Firestore (Vermelho)
-    const activeRoomsInCurrentView = new Set(events.map(e => e.sala.toLowerCase().trim()));
-
+    // 2. Add dynamic reservations from Firestore (Verde = Sua Reserva, Vermelho = Reservado por Outro Usuário)
     for (const res of reservations) {
-      // 1. NEVER display finished/expired reservations on the calendar
-      // As requested: "não mantenha as reservas já terminadas no calendário. assim que uma reserva terminar ela deve sair do calendário e ficar apenas em no histórico de reservas."
-      if (isReservationFinished(res, currentTimestamp)) {
+      if (!res || !res.data || isReservationFinished(res, currentTimestamp)) {
         continue;
       }
 
       const dayOfWeek = getDayOfWeekFromDate(res.data);
-      const requesterName = usersMap[res.usuarioId] || (res.usuarioId === user?.id ? user?.nome : 'Usuário TechReserve');
-      const cleanSalaNome = (res.salaNome || '').toLowerCase().trim();
+      const isOwnRes = Boolean(user?.id && res.usuarioId === user.id);
+      const requesterName =
+        usersMap[res.usuarioId] || (isOwnRes ? user?.nome : 'Usuário TechReserve');
 
-      // Check if reservation is related to current view:
-      // A) User explicitly filtered by that room, OR
-      // B) The room is used by this course/semester, OR
-      // C) Reservation mentions the course/semester in observations, OR
-      // D) User filtered by room
-      const matchesRoom = selectedRoomId !== 'TODAS' && (cleanSalaNome.includes(selectedRoomId.toLowerCase()) || selectedRoomId.toLowerCase().includes(cleanSalaNome));
-      const roomUsedInCurriculum = activeRoomsInCurrentView.has(cleanSalaNome);
-      const mentionsCourse = (res.observacoes || '').toUpperCase().includes(selectedCourse);
+      const matchesRoom =
+        selectedRoomId !== 'TODAS' &&
+        (doRoomNamesMatch(res.salaNome || '', selectedRoomId) ||
+          res.salaId === selectedRoomId ||
+          res.salaInstitutionalId === selectedRoomId);
 
       if (selectedRoomId !== 'TODAS' && !matchesRoom) {
         continue;
@@ -219,15 +232,15 @@ export function CalendarioPage() {
         curso: selectedCourse,
         semestre: selectedSemester,
         diaSemana: dayOfWeek,
-        materia: res.observacoes || `Reserva: ${res.salaNome}`,
+        materia: res.observacoes || `Reserva: ${res.salaNome || 'Sala'}`,
         solicitante: requesterName,
         usuarioId: res.usuarioId,
-        sala: res.salaNome,
+        sala: res.salaNome || 'Sala',
         salaId: res.salaId,
         salaInstitutionalId: res.salaInstitutionalId,
-        horarioInicio: res.inicio,
-        horarioFim: res.fim,
-        cor: 'vermelho',
+        horarioInicio: res.inicio || '',
+        horarioFim: res.fim || '',
+        cor: isOwnRes ? 'verde' : 'vermelho',
         status: res.status === 'CONFIRMADA' ? 'Aprovada' : res.status === 'PENDENTE' ? 'Pendente' : res.status,
         data: res.data,
         observacoes: res.observacoes,
@@ -241,6 +254,7 @@ export function CalendarioPage() {
   // Filter events based on active filters
   const filteredEvents = useMemo(() => {
     return allEvents.filter(event => {
+      if (!event) return false;
       // Filter by Day
       if (selectedDay !== 'TODOS' && event.diaSemana !== selectedDay) {
         return false;
@@ -248,9 +262,11 @@ export function CalendarioPage() {
 
       // Filter by Room
       if (selectedRoomId !== 'TODAS') {
-        const cleanSelected = selectedRoomId.toLowerCase().trim();
-        const cleanEventRoom = event.sala.toLowerCase().trim();
-        if (!cleanEventRoom.includes(cleanSelected) && !cleanSelected.includes(cleanEventRoom)) {
+        const matchesRoom =
+          doRoomNamesMatch(event.sala || '', selectedRoomId) ||
+          event.salaId === selectedRoomId ||
+          event.salaInstitutionalId === selectedRoomId;
+        if (!matchesRoom) {
           return false;
         }
       }
@@ -263,17 +279,17 @@ export function CalendarioPage() {
       // Search Query
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
-        const matchMateria = event.materia.toLowerCase().includes(q);
+        const matchMateria = (event.materia || '').toLowerCase().includes(q);
         const matchProf = (event.professor || '').toLowerCase().includes(q);
         const matchSolicitante = (event.solicitante || '').toLowerCase().includes(q);
-        const matchSala = event.sala.toLowerCase().includes(q);
+        const matchSala = (event.sala || '').toLowerCase().includes(q);
         if (!matchMateria && !matchProf && !matchSolicitante && !matchSala) {
           return false;
         }
       }
 
       return true;
-    }).sort((a, b) => a.horarioInicio.localeCompare(b.horarioInicio));
+    }).sort((a, b) => (a.horarioInicio || '').localeCompare(b.horarioInicio || ''));
   }, [allEvents, selectedDay, selectedRoomId, showOnlyReservations, searchQuery]);
 
   // Group events by day of week
@@ -357,17 +373,27 @@ export function CalendarioPage() {
 
         {/* TOP ACTIONS & LEGEND */}
         <div className="flex flex-wrap items-center gap-3">
-          {/* LEGEND BADGES (Mandatory: Verde = Grade, Vermelho = Reservas) */}
-          <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-2xl px-3 py-2 shadow-2xs">
-            <div className="flex items-center gap-1.5">
-              <span className="h-3 w-3 rounded-full bg-emerald-500 shadow-sm" />
-              <span className="text-[11px] font-black text-slate-700">Grade Fixa</span>
-            </div>
-            <span className="text-slate-300">|</span>
-            <div className="flex items-center gap-1.5">
-              <span className="h-3 w-3 rounded-full bg-fatec-red shadow-sm" />
-              <span className="text-[11px] font-black text-slate-700">Reservado</span>
-            </div>
+          {/* LEGEND: Azul = Ocupado (Aula), Vermelho = Reservado, Verde = Sua Reserva, Destaque = Disponível */}
+          <div className="flex flex-wrap items-center gap-2.5 bg-white border border-slate-200 rounded-2xl px-3.5 py-2 shadow-2xs text-[11px] font-bold text-slate-700">
+            <span className="flex items-center gap-1.5 whitespace-nowrap">
+              <span className="h-2.5 w-2.5 rounded-xs bg-blue-600 shrink-0" />
+              Ocupado
+            </span>
+            <span className="text-slate-300" aria-hidden="true">·</span>
+            <span className="flex items-center gap-1.5 whitespace-nowrap">
+              <span className="h-2.5 w-2.5 rounded-xs bg-rose-600 shrink-0" />
+              Reservado
+            </span>
+            <span className="text-slate-300" aria-hidden="true">·</span>
+            <span className="flex items-center gap-1.5 whitespace-nowrap">
+              <span className="h-2.5 w-2.5 rounded-xs bg-emerald-600 shrink-0" />
+              Sua Reserva
+            </span>
+            <span className="text-slate-300" aria-hidden="true">·</span>
+            <span className="flex items-center gap-1.5 whitespace-nowrap">
+              <span className="h-2.5 w-2.5 rounded-xs border-2 border-amber-500 bg-amber-100 shrink-0" />
+              Disponível
+            </span>
           </div>
 
           <button
@@ -381,7 +407,7 @@ export function CalendarioPage() {
               setBookingPrefill({ startTime: '17:00' });
               setIsNewReservationOpen(true);
             }}
-            className="px-4 py-2.5 rounded-2xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-black uppercase tracking-wider shadow-sm shadow-red-500/20 flex items-center gap-2 transition-all active:scale-95"
+            className="px-4 py-2.5 rounded-2xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-black uppercase tracking-wider shadow-sm shadow-red-500/20 flex items-center gap-2 transition-all active:scale-95 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Plus className="h-4 w-4" />
             Nova Reserva
@@ -416,31 +442,29 @@ export function CalendarioPage() {
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs">
           <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Curso & Semestre</p>
-          <p className="text-lg font-black text-slate-900 mt-0.5">{selectedCourse} • {selectedSemester}º Sem</p>
+          <p className="text-lg font-black text-slate-900 mt-0.5 tabular-nums">{selectedCourse} · {selectedSemester}º Sem</p>
         </div>
-        <div className="bg-white border border-emerald-200/60 rounded-2xl p-4 shadow-2xs">
-          <p className="text-[10px] font-black uppercase tracking-wider text-emerald-600 flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full bg-emerald-500" />
-            Aulas da Grade
+        <div className="bg-white border border-blue-200/70 rounded-2xl p-4 shadow-2xs">
+          <p className="text-[10px] font-black uppercase tracking-wider text-blue-700">
+            Aulas Regulares · Ocupado
           </p>
-          <p className="text-lg font-black text-emerald-950 mt-0.5">{stats.gradeCount} aulas</p>
+          <p className="text-lg font-black text-blue-950 mt-0.5 tabular-nums">{stats.gradeCount} aulas</p>
         </div>
-        <div className="bg-white border border-rose-200/60 rounded-2xl p-4 shadow-2xs">
-          <p className="text-[10px] font-black uppercase tracking-wider text-fatec-red flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full bg-fatec-red" />
+        <div className="bg-white border border-rose-200/70 rounded-2xl p-4 shadow-2xs">
+          <p className="text-[10px] font-black uppercase tracking-wider text-fatec-red">
             Reservas Ativas
           </p>
-          <p className="text-lg font-black text-rose-950 mt-0.5">{stats.reservaCount} ativas</p>
+          <p className="text-lg font-black text-rose-950 mt-0.5 tabular-nums">{stats.reservaCount} ativas</p>
         </div>
         {isAdmin ? (
           <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs">
             <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Pendentes ADM</p>
-            <p className="text-lg font-black text-amber-600 mt-0.5">{stats.pendingCount} para avaliar</p>
+            <p className="text-lg font-black text-amber-600 mt-0.5 tabular-nums">{stats.pendingCount} para avaliar</p>
           </div>
         ) : (
-          <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs">
-            <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Minhas Reservas</p>
-            <p className="text-lg font-black text-slate-900 mt-0.5">{stats.myReservaCount} agendadas</p>
+          <div className="bg-white border border-emerald-200/70 rounded-2xl p-4 shadow-2xs">
+            <p className="text-[10px] font-black uppercase tracking-wider text-emerald-700">Sua Reserva</p>
+            <p className="text-lg font-black text-emerald-950 mt-0.5 tabular-nums">{stats.myReservaCount} agendadas</p>
           </div>
         )}
       </div>
@@ -459,24 +483,49 @@ export function CalendarioPage() {
             selectedRoomId={selectedRoomId}
             onSelectEvent={setSelectedEvent}
             onNewReservationOnDate={(dateStr, startTime, roomName) => {
+              const targetRoomName =
+                roomName || (selectedRoomId !== 'TODAS' ? selectedRoomId : undefined);
+              const targetRoom = targetRoomName
+                ? availableRooms.find(
+                    (r) =>
+                      doRoomNamesMatch(r.nome, targetRoomName) ||
+                      r.id === targetRoomName ||
+                      r.firestoreId === targetRoomName
+                  )
+                : undefined;
+
+              const hasReleasedOnDate = availableSlots.some(
+                (s) =>
+                  s.data === dateStr &&
+                  isSlotActiveOrReleased(s) &&
+                  (!targetRoom ||
+                    s.salaId === targetRoom.firestoreId ||
+                    s.salaInstitutionalId === targetRoom.id ||
+                    doRoomNamesMatch(s.salaNome, targetRoom.nome))
+              );
+
               const windowCheck = isBookingWindowOpen(new Date(), isAdmin);
               if (!windowCheck.isOpen) {
                 toast.error(windowCheck.message);
                 return;
               }
-              const { minDate, maxDate } = getReservationDateLimits();
+
+              const { minDate, maxDate } = getReservationDateLimits(
+                new Date(),
+                targetRoom?.firestoreId
+              );
               if (dateStr < minDate) {
                 toast.error('Não é permitido realizar reservas em datas passadas.');
                 return;
               }
-              if (!isAdmin && dateStr > maxDate) {
+              if (!isAdmin && dateStr > maxDate && !hasReleasedOnDate) {
                 toast.error(`Reservas antecipadas estão limitadas até ${maxDate}.`);
                 return;
               }
               setSelectedDate(dateStr);
               setBookingPrefill({
-                roomName: roomName || (selectedRoomId !== 'TODAS' ? selectedRoomId : undefined),
-                startTime: startTime || '17:00'
+                roomName: targetRoom?.nome || targetRoomName,
+                startTime: startTime || '17:00',
               });
               setIsNewReservationOpen(true);
             }}
@@ -546,26 +595,56 @@ export function CalendarioPage() {
                     ) : (
                       dayEvents.map((event) => {
                         const isGrade = event.tipo === 'AULA_GRADE';
+                        const isOwnReservation =
+                          !isGrade && Boolean(user?.id && event.usuarioId === user.id);
+                        const canClick = isAdmin || isOwnReservation;
+
                         return (
                           <div
                             key={event.id}
-                            onClick={() => setSelectedEvent(event)}
+                            role={canClick ? 'button' : undefined}
+                            tabIndex={canClick ? 0 : undefined}
+                            aria-disabled={!canClick}
+                            onClick={() => {
+                              if (canClick) setSelectedEvent(event);
+                            }}
+                            onKeyDown={(e) => {
+                              if (canClick && (e.key === 'Enter' || e.key === ' ')) {
+                                e.preventDefault();
+                                setSelectedEvent(event);
+                              }
+                            }}
                             className={cn(
-                              "p-3 rounded-2xl border text-left cursor-pointer transition-all duration-150 relative group hover:shadow-md",
+                              'p-3 rounded-2xl border text-left transition-all duration-150 relative group',
                               isGrade
-                                ? "bg-emerald-50/70 border-emerald-200/80 hover:border-emerald-400 text-emerald-950"
-                                : "bg-rose-50/70 border-rose-200/90 hover:border-rose-400 text-rose-950"
+                                ? 'bg-blue-50/80 border-blue-200 text-blue-950'
+                                : isOwnReservation
+                                ? 'bg-emerald-50/85 border-emerald-300 text-emerald-950'
+                                : 'bg-rose-50/80 border-rose-200 text-rose-950',
+                              canClick
+                                ? 'cursor-pointer hover:shadow-md'
+                                : 'cursor-not-allowed select-none opacity-95'
                             )}
                           >
                             {/* EVENT TYPE BADGE & TIME */}
                             <div className="flex items-center justify-between gap-1 mb-1.5">
-                              <span className={cn(
-                                "text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider",
-                                isGrade ? "bg-emerald-200/80 text-emerald-900" : "bg-rose-200/90 text-rose-900"
-                              )}>
-                                {isGrade ? 'Grade' : (event.status || 'Reserva')}
+                              <span
+                                className={cn(
+                                  'text-[9px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider whitespace-nowrap',
+                                  isGrade
+                                    ? 'bg-blue-600 text-white'
+                                    : isOwnReservation
+                                    ? 'bg-emerald-600 text-white'
+                                    : 'bg-rose-600 text-white'
+                                )}
+                              >
+                                {isGrade
+                                  ? 'Ocupado'
+                                  : isOwnReservation
+                                  ? 'Sua Reserva'
+                                  : 'Reservado'}
                               </span>
-                              <span className="text-[10px] font-mono font-black text-slate-700 flex items-center gap-1">
+                              <span className="text-[10px] font-mono tabular-nums font-black text-slate-700 flex items-center gap-1">
                                 <Clock className="h-3 w-3 text-slate-400" />
                                 {event.horarioInicio} às {event.horarioFim}
                               </span>
@@ -579,7 +658,9 @@ export function CalendarioPage() {
                             {/* PROFESSOR OU SOLICITANTE */}
                             <p className="text-[11px] text-slate-600 font-medium mt-1 flex items-center gap-1 line-clamp-1">
                               {isGrade ? (
-                                <GraduationCap className="h-3 w-3 shrink-0 text-emerald-600" />
+                                <GraduationCap className="h-3 w-3 shrink-0 text-blue-600" />
+                              ) : isOwnReservation ? (
+                                <User className="h-3 w-3 shrink-0 text-emerald-600" />
                               ) : (
                                 <User className="h-3 w-3 shrink-0 text-fatec-red" />
                               )}
@@ -592,20 +673,29 @@ export function CalendarioPage() {
                               <span>{event.sala}</span>
                             </p>
 
+                            {isOwnReservation && !isAdmin && (
+                              <p className="text-[10px] font-semibold text-emerald-700 mt-1.5">
+                                Clique para ver detalhes da sua reserva
+                              </p>
+                            )}
+
                             {/* QUICK ACTIONS FOR ADM (Direct Approve / Cancel from calendar card) */}
                             {isAdmin && !isGrade && event.status === 'Pendente' && (
                               <div className="mt-2 pt-2 border-t border-rose-200/70 flex items-center justify-between">
                                 <span className="text-[9px] font-black text-amber-700 uppercase">Pendente</span>
                                 <button
                                   type="button"
-                                  onClick={(e) => {
+                                  onClick={async (e) => {
                                     e.stopPropagation();
-                                    if (event.reservationId) {
-                                      handleApproveReservation(event.reservationId);
+                                    if (!event.reservationId) return;
+                                    try {
+                                      await handleApproveReservation(event.reservationId);
                                       toast.success('Reserva aprovada!');
+                                    } catch (err) {
+                                      toast.error(getFriendlyErrorMessage(err, 'Erro ao aprovar reserva.'));
                                     }
                                   }}
-                                  className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-bold uppercase tracking-wider flex items-center gap-1"
+                                  className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-bold uppercase tracking-wider flex items-center gap-1 cursor-pointer"
                                 >
                                   <CheckCircle2 className="h-2.5 w-2.5" />
                                   Aprovar
@@ -633,7 +723,7 @@ export function CalendarioPage() {
                   <h3 className="text-xl font-black text-slate-900 tracking-tight">
                     Programação de {selectedDay}-feira
                   </h3>
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-slate-500 tabular-nums">
                     {filteredEvents.length} atividades programadas no {selectedSemester}º Semestre de {selectedCourse}.
                   </p>
                 </div>
@@ -646,7 +736,7 @@ export function CalendarioPage() {
                     setSelectedDay('TODOS');
                     setViewMode('SEMANA');
                   }}
-                  className="px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-700 hover:bg-slate-50 transition-all"
+                  className="px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-700 hover:bg-slate-50 transition-all cursor-pointer"
                 >
                   Grade Semanal
                 </button>
@@ -656,7 +746,7 @@ export function CalendarioPage() {
                     setSelectedDay('TODOS');
                     setViewMode('MES');
                   }}
-                  className="px-3 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-all"
+                  className="px-3 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-all cursor-pointer"
                 >
                   Calendário Normal (Mês)
                 </button>
@@ -673,25 +763,55 @@ export function CalendarioPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {filteredEvents.map((event) => {
                   const isGrade = event.tipo === 'AULA_GRADE';
+                  const isOwnReservation =
+                    !isGrade && Boolean(user?.id && event.usuarioId === user.id);
+                  const canClick = isAdmin || isOwnReservation;
+
                   return (
                     <div
                       key={event.id}
-                      onClick={() => setSelectedEvent(event)}
+                      role={canClick ? 'button' : undefined}
+                      tabIndex={canClick ? 0 : undefined}
+                      aria-disabled={!canClick}
+                      onClick={() => {
+                        if (canClick) setSelectedEvent(event);
+                      }}
+                      onKeyDown={(e) => {
+                        if (canClick && (e.key === 'Enter' || e.key === ' ')) {
+                          e.preventDefault();
+                          setSelectedEvent(event);
+                        }
+                      }}
                       className={cn(
-                        "p-5 rounded-3xl border text-left cursor-pointer transition-all duration-200 relative group hover:shadow-lg",
+                        'p-5 rounded-3xl border text-left transition-all duration-200 relative group',
                         isGrade
-                          ? "bg-emerald-50/70 border-emerald-200 hover:border-emerald-400 text-emerald-950"
-                          : "bg-rose-50/70 border-rose-200 hover:border-rose-400 text-rose-950"
+                          ? 'bg-blue-50/80 border-blue-200 text-blue-950'
+                          : isOwnReservation
+                          ? 'bg-emerald-50/85 border-emerald-300 text-emerald-950'
+                          : 'bg-rose-50/80 border-rose-200 text-rose-950',
+                        canClick
+                          ? 'cursor-pointer hover:shadow-lg'
+                          : 'cursor-not-allowed select-none opacity-95'
                       )}
                     >
                       <div className="flex items-center justify-between gap-2 mb-3">
-                        <span className={cn(
-                          "text-[10px] font-black px-2.5 py-1 rounded-lg uppercase tracking-wider",
-                          isGrade ? "bg-emerald-200/90 text-emerald-900" : "bg-rose-200 text-rose-900"
-                        )}>
-                          {isGrade ? '🟩 Aula da Grade' : '🟥 Sala Reservada'}
+                        <span
+                          className={cn(
+                            'text-[10px] font-black px-2.5 py-1 rounded-lg uppercase tracking-wider whitespace-nowrap',
+                            isGrade
+                              ? 'bg-blue-600 text-white'
+                              : isOwnReservation
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-rose-600 text-white'
+                          )}
+                        >
+                          {isGrade
+                            ? 'Ocupado'
+                            : isOwnReservation
+                            ? 'Sua Reserva'
+                            : 'Reservado'}
                         </span>
-                        <span className="text-xs font-mono font-black text-slate-700 flex items-center gap-1.5 bg-white/80 px-2.5 py-1 rounded-lg border border-slate-200/60">
+                        <span className="text-xs font-mono tabular-nums font-black text-slate-700 flex items-center gap-1.5 bg-white/80 px-2.5 py-1 rounded-lg border border-slate-200/60">
                           <Clock className="h-3.5 w-3.5 text-slate-400" />
                           {event.horarioInicio} - {event.horarioFim}
                         </span>
@@ -704,7 +824,9 @@ export function CalendarioPage() {
                       <div className="space-y-1.5 text-xs text-slate-600">
                         <p className="flex items-center gap-2 font-medium">
                           {isGrade ? (
-                            <GraduationCap className="h-4 w-4 text-emerald-600" />
+                            <GraduationCap className="h-4 w-4 text-blue-600" />
+                          ) : isOwnReservation ? (
+                            <User className="h-4 w-4 text-emerald-600" />
                           ) : (
                             <User className="h-4 w-4 text-fatec-red" />
                           )}
@@ -716,6 +838,12 @@ export function CalendarioPage() {
                         </p>
                       </div>
 
+                      {isOwnReservation && !isAdmin && (
+                        <p className="mt-3 pt-2.5 border-t border-emerald-200 text-[11px] font-semibold text-emerald-800">
+                          Clique para consultar os detalhes da sua reserva
+                        </p>
+                      )}
+
                       {isAdmin && !isGrade && (
                         <div className="mt-4 pt-3 border-t border-rose-200 flex items-center justify-between">
                           <span className="text-[10px] font-bold text-slate-500 uppercase">
@@ -725,14 +853,17 @@ export function CalendarioPage() {
                             {event.status === 'Pendente' && (
                               <button
                                 type="button"
-                                onClick={(e) => {
+                                onClick={async (e) => {
                                   e.stopPropagation();
-                                  if (event.reservationId) {
-                                    handleApproveReservation(event.reservationId);
+                                  if (!event.reservationId) return;
+                                  try {
+                                    await handleApproveReservation(event.reservationId);
                                     toast.success('Reserva aprovada!');
+                                  } catch (err) {
+                                    toast.error(getFriendlyErrorMessage(err, 'Erro ao aprovar reserva.'));
                                   }
                                 }}
-                                className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-all shadow-xs flex items-center gap-1"
+                                className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-all shadow-xs flex items-center gap-1 cursor-pointer"
                               >
                                 <CheckCircle2 className="h-3 w-3" />
                                 Aprovar
@@ -740,14 +871,17 @@ export function CalendarioPage() {
                             )}
                             <button
                               type="button"
-                              onClick={(e) => {
+                              onClick={async (e) => {
                                 e.stopPropagation();
-                                if (event.reservationId) {
-                                  handleCancelReservation(event.reservationId);
+                                if (!event.reservationId) return;
+                                try {
+                                  await handleCancelReservation(event.reservationId);
                                   toast.success('Reserva cancelada.');
+                                } catch (err) {
+                                  toast.error(getFriendlyErrorMessage(err, 'Erro ao cancelar reserva.'));
                                 }
                               }}
-                              className="px-2.5 py-1 rounded-lg bg-white border border-rose-200 text-fatec-red hover:bg-rose-50 text-xs font-bold transition-all"
+                              className="px-2.5 py-1 rounded-lg bg-white border border-rose-200 text-fatec-red hover:bg-rose-50 text-xs font-bold transition-all cursor-pointer"
                             >
                               Cancelar
                             </button>
@@ -768,7 +902,7 @@ export function CalendarioPage() {
         event={selectedEvent}
         onClose={() => setSelectedEvent(null)}
         currentUser={user}
-        roomDetails={rooms.find(r => selectedEvent && (r.nome.toLowerCase().includes(selectedEvent.sala.toLowerCase()) || selectedEvent.sala.toLowerCase().includes(r.nome.toLowerCase())))}
+        roomDetails={rooms.find(r => selectedEvent && doRoomNamesMatch(r.nome, selectedEvent.sala))}
         onApproveReservation={isAdmin ? handleApproveReservation : undefined}
         onCancelReservation={handleCancelReservation}
         onDeleteReservation={isAdmin ? handleDeleteReservation : undefined}
@@ -888,7 +1022,7 @@ export function CalendarioPage() {
                     setIsEditEnrollmentOpen(false);
                     toast.success('Semestre atualizado com sucesso!');
                   } catch (err) {
-                    toast.error('Erro ao atualizar matrícula.');
+                    toast.error(getFriendlyErrorMessage(err, 'Erro ao atualizar matrícula.'));
                   }
                 }}
                 className="px-5 py-2.5 rounded-xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-black uppercase tracking-wider transition-all shadow-sm active:scale-95"

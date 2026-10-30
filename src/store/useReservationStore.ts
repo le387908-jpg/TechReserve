@@ -17,7 +17,13 @@ import {
 } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
 import { Reservation, User } from '../types';
-import { OperationType, handleFirestoreError, withRetry } from '../services/firebase/utils';
+import {
+  OperationType,
+  getFriendlyErrorMessage,
+  handleFirestoreError,
+  stripUndefinedFields,
+  withRetry,
+} from '../services/firebase/utils';
 import { useLogStore } from './useLogStore';
 import { useAuthStore } from './useAuthStore';
 import { useRoomStore } from './useRoomStore';
@@ -43,6 +49,7 @@ import { toast } from 'sonner';
 interface ReservationState {
   reservations: Reservation[];
   loading: boolean;
+  initialized: boolean;
   error: string | null;
 
   fetchReservations: () => () => void;
@@ -60,6 +67,7 @@ interface ReservationState {
 export const useReservationStore = create<ReservationState>((set, get) => ({
   reservations: [],
   loading: false,
+  initialized: false,
   error: null,
   scanningResId: null,
 
@@ -71,16 +79,27 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       return () => {};
     }
 
-    set({ loading: true });
+    set({ loading: true, error: null });
     const q = query(collection(db, 'reservas'), orderBy('createdAt', 'desc'));
 
     const unsubscribe = onSnapshot(
       q,
       (snapshot) => {
-        const reservations = snapshot.docs.map(
-          (docSnap) => ({ id: docSnap.id, ...docSnap.data() } as Reservation)
-        );
-        set({ reservations, loading: false });
+        const reservations = snapshot.docs.map((docSnap) => {
+          const d = docSnap.data() || {};
+          return {
+            ...d,
+            id: docSnap.id,
+            salaId: String(d.salaId || ''),
+            salaNome: String(d.salaNome || ''),
+            usuarioId: String(d.usuarioId || ''),
+            data: String(d.data || ''),
+            inicio: String(d.inicio || ''),
+            fim: String(d.fim || ''),
+            status: d.status || 'PENDENTE',
+          } as Reservation;
+        });
+        set({ reservations, loading: false, initialized: true, error: null });
       },
       (error) => {
         try {
@@ -88,7 +107,11 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         } catch {
           // Erro já registrado estruturadamente
         }
-        set({ loading: false });
+        set({
+          loading: false,
+          initialized: true,
+          error: getFriendlyErrorMessage(error, 'Erro ao sincronizar reservas.'),
+        });
       }
     );
 
@@ -102,23 +125,23 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
     }
     const isAdmin = user.role === 'ADMIN';
     let verifiedAvailableSlotId: string | undefined = resData.availableSlotId;
+    const storeRooms = useRoomStore.getState().rooms;
+    const safeRooms = Array.isArray(storeRooms) ? storeRooms : [];
+    const resolvedRoom = safeRooms.find(
+      (r) =>
+        r?.firestoreId === resData.salaId ||
+        (resData.salaInstitutionalId && r?.id === resData.salaInstitutionalId) ||
+        (resData.salaNome && r?.nome === resData.salaNome)
+    );
 
     // Validações estritas de regras de negócio para usuários comuns antes de gravar no Firestore
     if (!isAdmin) {
-      const room = useRoomStore
-        .getState()
-        .rooms.find(
-          (r) =>
-            r.firestoreId === resData.salaId ||
-            r.id === resData.salaInstitutionalId
-        );
-
-      if (!room) {
+      if (!resolvedRoom) {
         throw new Error('Sala não encontrada no inventário institucional.');
       }
 
       // 1. Pré-requisito de liberação da sala e registro explícito em `available_slots` pelo ADM
-      const roomRelease = isSpaceReleasedByAdmin(room);
+      const roomRelease = isSpaceReleasedByAdmin(resolvedRoom);
       if (!roomRelease.released) {
         throw new Error(
           roomRelease.reason ||
@@ -126,12 +149,24 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         );
       }
 
+      // Confirma diretamente no Firestore (`available_slots`) e obtém o `availableSlotId` exigido pelas Security Rules
+      const verifiedSlot = await verifyAvailableSlotFirestore(
+        resolvedRoom,
+        resData.data,
+        resData.inicio,
+        resData.fim,
+        resData.availableSlotId
+      );
+      verifiedAvailableSlotId = verifiedSlot.id;
+
       const { config, exceptions } = useScheduleStore.getState();
       const blockRelease = getReleasedBlocksForRoomOnDate(
-        room,
-        resData.data,
+        resolvedRoom,
+        verifiedSlot.data,
         config,
-        exceptions
+        exceptions,
+        new Date(),
+        [verifiedSlot]
       );
       if (!blockRelease.released) {
         throw new Error(
@@ -139,24 +174,6 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
             'Indisponível - Aguardando liberação da coordenação para esta sala nesta data.'
         );
       }
-
-      const matchedLocalSlot = blockRelease.blocks.find(
-        (b) => b.ativo && b.inicio === resData.inicio && b.fim === resData.fim
-      );
-      if (!matchedLocalSlot) {
-        throw new Error(
-          'Indisponível - Aguardando liberação da coordenação. Selecione apenas um horário com status liberado.'
-        );
-      }
-
-      // Confirma diretamente no Firestore (`available_slots`) e obtém o `availableSlotId` exigido pelas Security Rules
-      const verifiedSlot = await verifyAvailableSlotFirestore(
-        room,
-        resData.data,
-        resData.inicio,
-        resData.fim
-      );
-      verifiedAvailableSlotId = verifiedSlot.id;
 
       // 2. Verificação de punição de No-Show (bloqueio exclusivo na data da falta)
       const { punishments, activePunishment } = usePunishmentStore.getState();
@@ -166,22 +183,32 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       const noShowCheck = checkNoShowSuspensionForDate(
         user,
         effectivePunishments,
-        resData.data
+        verifiedSlot.data
       );
       if (noShowCheck.blocked) {
         throw new Error(
-          noShowCheck.error || formatNoShowTag(resData.data)
+          noShowCheck.error || formatNoShowTag(verifiedSlot.data)
         );
       }
 
       // 3. Verificação em tempo real no Firestore da cota de 1 reserva por semana (Segunda a Domingo)
       const quotaCheck = await verifyWeeklyQuotaFirestore(
         user.id,
-        resData.data
+        verifiedSlot.data
       );
       if (!quotaCheck.allowed) {
         throw new Error(quotaCheck.error);
       }
+
+      resData = {
+        ...resData,
+        salaId: resolvedRoom.firestoreId,
+        salaInstitutionalId: resolvedRoom.id,
+        salaNome: resolvedRoom.nome,
+        data: verifiedSlot.data,
+        inicio: verifiedSlot.inicio,
+        fim: verifiedSlot.fim,
+      };
     }
 
     try {
@@ -194,98 +221,100 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
             availableSlotId: verifiedAvailableSlotId,
             status: 'PENDENTE' as const,
           };
-      const cleanData: Record<string, unknown> = {};
-      Object.entries(effectiveResData).forEach(([key, val]) => {
-        if (val !== undefined) cleanData[key] = val;
-      });
+      const cleanData = stripUndefinedFields(
+        effectiveResData as unknown as Record<string, unknown>
+      );
 
       const docRef = await withRetry(() =>
-        addDoc(collection(db, 'reservas'), {
-          ...cleanData,
-          ocultoParaUsuario: false,
-          whatsappConfirmacaoEnviada: false,
-          whatsappLembreteInicioEnviado: false,
-          whatsappAlertaDesocupacaoEnviado: false,
-          whatsappNoShowEnviado: false,
-          createdAt: now,
-          updatedAt: now,
-        })
+        addDoc(
+          collection(db, 'reservas'),
+          stripUndefinedFields({
+            ...cleanData,
+            ocultoParaUsuario: false,
+            whatsappConfirmacaoEnviada: false,
+            whatsappLembreteInicioEnviado: false,
+            whatsappAlertaDesocupacaoEnviado: false,
+            whatsappNoShowEnviado: false,
+            createdAt: now,
+            updatedAt: now,
+          })
+        )
       );
 
       if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'CRIAR_RESERVA',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'RESERVAS',
-          detalhes: `Reserva agendada para "${effectiveResData.salaNome}" em ${effectiveResData.data} (${effectiveResData.inicio} às ${effectiveResData.fim}).`,
-        });
+        try {
+          await useLogStore.getState().addLog({
+            acao: 'CRIAR_RESERVA',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'RESERVAS',
+            detalhes: `Reserva agendada para "${effectiveResData.salaNome}" em ${effectiveResData.data} (${effectiveResData.inicio} às ${effectiveResData.fim}).`,
+          });
+        } catch (logErr) {
+          console.warn('[Reservas] Falha secundária ao gravar log de criação:', logErr);
+        }
 
         // Dispara mensagem de confirmação via Evolution API (`/message/sendText/{instance}`)
         void (async () => {
-          let targetUser: User | null =
-            user.id === effectiveResData.usuarioId ? user : null;
+          try {
+            let targetUser: User | null =
+              user.id === effectiveResData.usuarioId ? user : null;
 
-          // Busca o documento atualizado em `users/{uid}` se for outro usuário (ADM) ou se o telefone em memória estiver vazio
-          if (!targetUser || (!targetUser.phone && !targetUser.phoneFormatted)) {
-            try {
-              const ownerSnap = await getDoc(
-                doc(db, 'users', effectiveResData.usuarioId)
-              );
-              if (ownerSnap.exists()) {
-                targetUser = hydrateUserDocument(ownerSnap.data(), ownerSnap.id);
+            // Busca o documento atualizado em `users/{uid}` se for outro usuário (ADM) ou se o telefone em memória estiver vazio
+            if (!targetUser || (!targetUser.phone && !targetUser.phoneFormatted)) {
+              try {
+                const ownerSnap = await getDoc(
+                  doc(db, 'users', effectiveResData.usuarioId)
+                );
+                if (ownerSnap.exists()) {
+                  targetUser = hydrateUserDocument(ownerSnap.data(), ownerSnap.id);
+                }
+              } catch (fetchErr) {
+                console.error(
+                  '[Reservas][WhatsApp Confirmação] Erro ao carregar perfil do usuário para envio:',
+                  fetchErr
+                );
               }
-            } catch (fetchErr) {
+            }
+
+            if (!targetUser) {
+              console.warn(
+                '[Reservas][WhatsApp Confirmação] Perfil de destino não encontrado para reserva:',
+                docRef.id
+              );
+              return;
+            }
+
+            const dispatchRes = await notifyReservationConfirmed(targetUser, {
+              id: docRef.id,
+              salaNome: effectiveResData.salaNome,
+              salaInstitutionalId: effectiveResData.salaInstitutionalId,
+              data: effectiveResData.data,
+              inicio: effectiveResData.inicio,
+              fim: effectiveResData.fim,
+              status: effectiveResData.status,
+            });
+
+            if (dispatchRes.delivered) {
+              try {
+                await updateDoc(doc(db, 'reservas', docRef.id), {
+                  whatsappConfirmacaoEnviada: true,
+                  updatedAt: Date.now(),
+                });
+              } catch {
+                // Ignora falha secundária de marcação
+              }
+              if (user.id === targetUser.id) {
+                toast.success('Confirmação enviada para o seu WhatsApp.');
+              }
+            } else if (!dispatchRes.skipped) {
               console.error(
-                '[Reservas][WhatsApp Confirmação] Erro ao carregar perfil do usuário para envio:',
-                fetchErr
+                '[Reservas][WhatsApp Confirmação] Falha no envio da confirmação:',
+                dispatchRes
               );
             }
-          }
-
-          if (!targetUser) {
-            console.warn(
-              '[Reservas][WhatsApp Confirmação] Perfil de destino não encontrado para reserva:',
-              docRef.id
-            );
-            return;
-          }
-
-          console.log('[Reservas][WhatsApp Confirmação] Iniciando disparo para reserva criada:', {
-            reservaId: docRef.id,
-            usuarioId: targetUser.id,
-            sala: effectiveResData.salaNome,
-            data: effectiveResData.data,
-            inicio: effectiveResData.inicio,
-          });
-
-          const dispatchRes = await notifyReservationConfirmed(targetUser, {
-            id: docRef.id,
-            salaNome: effectiveResData.salaNome,
-            salaInstitutionalId: effectiveResData.salaInstitutionalId,
-            data: effectiveResData.data,
-            inicio: effectiveResData.inicio,
-            fim: effectiveResData.fim,
-            status: effectiveResData.status,
-          });
-
-          if (dispatchRes.delivered) {
-            try {
-              await updateDoc(doc(db, 'reservas', docRef.id), {
-                whatsappConfirmacaoEnviada: true,
-                updatedAt: Date.now(),
-              });
-            } catch {
-              // Ignora falha secundária de marcação
-            }
-            if (user.id === targetUser.id) {
-              toast.success('Confirmação enviada para o seu WhatsApp.');
-            }
-          } else if (!dispatchRes.skipped) {
-            console.error(
-              '[Reservas][WhatsApp Confirmação] Falha no envio da confirmação:',
-              dispatchRes
-            );
+          } catch (waErr) {
+            console.warn('[Reservas][WhatsApp Confirmação] Falha assíncrona ignorada:', waErr);
           }
         })();
       }
@@ -322,16 +351,16 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
 
     try {
       const resRef = doc(db, 'reservas', id);
-      const cleanData: Record<string, unknown> = {};
-      Object.entries(data).forEach(([key, val]) => {
-        if (val !== undefined) cleanData[key] = val;
-      });
+      const cleanData = stripUndefinedFields(data as unknown as Record<string, unknown>);
 
       await withRetry(() =>
-        updateDoc(resRef, {
-          ...cleanData,
-          updatedAt: Date.now(),
-        })
+        updateDoc(
+          resRef,
+          stripUndefinedFields({
+            ...cleanData,
+            updatedAt: Date.now(),
+          })
+        )
       );
 
       if (data.status) {
@@ -341,90 +370,86 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           CONCLUIDA: 'CONCLUIR_RESERVA',
           PUNIDA: 'NO_SHOW_RESERVA',
         };
-        await useLogStore.getState().addLog({
-          acao: actionMap[data.status] || 'ATUALIZAR_RESERVA',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'RESERVAS',
-          detalhes: `Reserva ${
-            target?.salaNome
-              ? `em "${target.salaNome}" (${target.data} ${target.inicio}-${target.fim})`
-              : id
-          } alterada para ${data.status}.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: actionMap[data.status] || 'ATUALIZAR_RESERVA',
+            usuarioId: user.id,
+            usuarioNome: user.nome,
+            entidade: 'RESERVAS',
+            detalhes: `Reserva ${
+              target?.salaNome
+                ? `em "${target.salaNome}" (${target.data} ${target.inicio}-${target.fim})`
+                : id
+            } alterada para ${data.status}.`,
+          })
+          .catch(() => {});
 
         // Dispara notificações automáticas via Evolution API (cancelamento ou aprovação ADM)
         if ((data.status === 'CANCELADA' || data.status === 'CONFIRMADA') && target) {
           const snapshotTarget = target;
           void (async () => {
-            let ownerProfile: User | null =
-              user.id === snapshotTarget.usuarioId ? user : null;
+            try {
+              let ownerProfile: User | null =
+                user.id === snapshotTarget.usuarioId ? user : null;
 
-            if (!ownerProfile || (!ownerProfile.phone && !ownerProfile.phoneFormatted)) {
-              try {
-                const ownerSnap = await getDoc(doc(db, 'users', snapshotTarget.usuarioId));
-                if (ownerSnap.exists()) {
-                  ownerProfile = hydrateUserDocument(ownerSnap.data(), ownerSnap.id);
+              if (!ownerProfile || (!ownerProfile.phone && !ownerProfile.phoneFormatted)) {
+                try {
+                  const ownerSnap = await getDoc(doc(db, 'users', snapshotTarget.usuarioId));
+                  if (ownerSnap.exists()) {
+                    ownerProfile = hydrateUserDocument(ownerSnap.data(), ownerSnap.id);
+                  }
+                } catch (fetchErr) {
+                  console.error(
+                    '[Reservas][WhatsApp Atualização] Erro ao carregar perfil do usuário:',
+                    fetchErr
+                  );
                 }
-              } catch (fetchErr) {
-                console.error(
-                  '[Reservas][WhatsApp Atualização] Erro ao carregar perfil do usuário:',
-                  fetchErr
-                );
               }
-            }
 
-            if (!ownerProfile) return;
+              if (!ownerProfile) return;
 
-            if (data.status === 'CANCELADA') {
-              const cancelledBy: 'USUARIO' | 'ADMIN' =
-                user.role === 'ADMIN' && user.id !== snapshotTarget.usuarioId
-                  ? 'ADMIN'
-                  : 'USUARIO';
+              if (data.status === 'CANCELADA') {
+                const cancelledBy: 'USUARIO' | 'ADMIN' =
+                  user.role === 'ADMIN' && user.id !== snapshotTarget.usuarioId
+                    ? 'ADMIN'
+                    : 'USUARIO';
 
-              console.log('[Reservas][WhatsApp Cancelamento] Disparando aviso de cancelamento:', {
-                reservaId: snapshotTarget.id,
-                usuarioId: ownerProfile.id,
-                cancelledBy,
-              });
-
-              const cancelRes = await notifyReservationCancelled(
-                ownerProfile,
-                snapshotTarget,
-                cancelledBy,
-                data.observacoes
-              );
-              if (!cancelRes.delivered && !cancelRes.skipped) {
-                console.error(
-                  '[Reservas][WhatsApp Cancelamento] Falha no envio do cancelamento:',
-                  cancelRes
+                const cancelRes = await notifyReservationCancelled(
+                  ownerProfile,
+                  snapshotTarget,
+                  cancelledBy,
+                  data.observacoes
                 );
+                if (!cancelRes.delivered && !cancelRes.skipped) {
+                  console.error(
+                    '[Reservas][WhatsApp Cancelamento] Falha no envio do cancelamento:',
+                    cancelRes
+                  );
+                }
+              } else if (
+                data.status === 'CONFIRMADA' &&
+                snapshotTarget.status === 'PENDENTE' &&
+                !snapshotTarget.whatsappConfirmacaoEnviada
+              ) {
+                const confirmRes = await notifyReservationConfirmed(ownerProfile, {
+                  ...snapshotTarget,
+                  status: 'CONFIRMADA',
+                });
+                if (confirmRes.delivered) {
+                  await updateDoc(doc(db, 'reservas', id), {
+                    whatsappConfirmacaoEnviada: true,
+                    updatedAt: Date.now(),
+                  }).catch(() => {});
+                } else if (!confirmRes.skipped) {
+                  console.error(
+                    '[Reservas][WhatsApp Aprovação ADM] Falha no envio da confirmação:',
+                    confirmRes
+                  );
+                }
               }
-            } else if (
-              data.status === 'CONFIRMADA' &&
-              snapshotTarget.status === 'PENDENTE' &&
-              !snapshotTarget.whatsappConfirmacaoEnviada
-            ) {
-              console.log('[Reservas][WhatsApp Aprovação ADM] Disparando confirmação:', {
-                reservaId: snapshotTarget.id,
-                usuarioId: ownerProfile.id,
-              });
-
-              const confirmRes = await notifyReservationConfirmed(ownerProfile, {
-                ...snapshotTarget,
-                status: 'CONFIRMADA',
-              });
-              if (confirmRes.delivered) {
-                await updateDoc(doc(db, 'reservas', id), {
-                  whatsappConfirmacaoEnviada: true,
-                  updatedAt: Date.now(),
-                }).catch(() => {});
-              } else if (!confirmRes.skipped) {
-                console.error(
-                  '[Reservas][WhatsApp Aprovação ADM] Falha no envio da confirmação:',
-                  confirmRes
-                );
-              }
+            } catch (waErr) {
+              console.warn('[Reservas][WhatsApp Atualização] Falha assíncrona ignorada:', waErr);
             }
           })();
         }
@@ -454,13 +479,16 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         })
       );
 
-      await useLogStore.getState().addLog({
-        acao: 'CHECKIN_REALIZADO',
-        usuarioId: user.id,
-        usuarioNome: user.nome,
-        entidade: 'RESERVAS',
-        detalhes: `Check-in presencial confirmado em "${target?.salaNome || id}".`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: 'CHECKIN_REALIZADO',
+          usuarioId: user.id,
+          usuarioNome: user.nome,
+          entidade: 'RESERVAS',
+          detalhes: `Check-in presencial confirmado em "${target?.salaNome || id}".`,
+        })
+        .catch(() => {});
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `reservas/${id}`);
     }
@@ -495,29 +523,33 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       const resRef = doc(db, 'reservas', id);
       await deleteDoc(resRef);
 
-      await useLogStore.getState().addLog({
-        acao: 'EXCLUIR_RESERVA',
-        usuarioId: user.id,
-        usuarioNome: user.nome,
-        entidade: 'RESERVAS',
-        detalhes: `Registro de reserva ${
-          target?.salaNome ? `"${target.salaNome}" (${target.data})` : id
-        } removido pelo ADM.`,
-      });
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: 'EXCLUIR_RESERVA',
+          usuarioId: user.id,
+          usuarioNome: user.nome,
+          entidade: 'RESERVAS',
+          detalhes: `Registro de reserva ${
+            target?.salaNome ? `"${target.salaNome}" (${target.data})` : id
+          } removido pelo ADM.`,
+        })
+        .catch(() => {});
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `reservas/${id}`);
     }
   },
 
   processMissedCheckIns: async () => {
-    const { reservations } = get();
+    const rawReservations = get().reservations;
+    const reservations = Array.isArray(rawReservations) ? rawReservations : [];
     const now = Date.now();
     const { user: currentUser } = useAuthStore.getState();
     if (!currentUser) return;
 
     // 1. Conclui automaticamente reservas confirmadas (com check-in realizado) cujo horário de término já passou
     const completedCandidates = reservations.filter((r) => {
-      if (r.status !== 'CONFIRMADA') return false;
+      if (!r || r.status !== 'CONFIRMADA') return false;
       if (currentUser.role !== 'ADMIN' && r.usuarioId !== currentUser.id) return false;
       const endMs = createSafeLocalDateTime(r.data, r.fim).getTime();
       return endMs < now;
@@ -539,6 +571,7 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
     // 2. Processa No-Show (ausência de check-in em 5 minutos) aplicando punição EXCLUSIVA para o dia da falta
     const missed = reservations.filter(
       (r) =>
+        r &&
         r.status === 'PENDENTE' &&
         r.checkInExpiracao &&
         r.checkInExpiracao < now &&
@@ -649,17 +682,20 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           // Prossegue mesmo se o histórico secundário falhar
         }
 
-        await useLogStore.getState().addLog({
-          acao: 'NO_SHOW_AUTOMATICO',
-          usuarioId: res.usuarioId,
-          usuarioNome: targetUserName || 'SISTEMA',
-          entidade: 'RESERVAS',
-          detalhes: `No-Show em "${res.salaNome}" (${formatDataBR(
-            blockedDate
-          )} às ${res.inicio}). ${formatNoShowTag(
-            blockedDate
-          )}. Cota semanal liberada para outras datas.`,
-        });
+        await useLogStore
+          .getState()
+          .addLog({
+            acao: 'NO_SHOW_AUTOMATICO',
+            usuarioId: res.usuarioId,
+            usuarioNome: targetUserName || 'SISTEMA',
+            entidade: 'RESERVAS',
+            detalhes: `No-Show em "${res.salaNome}" (${formatDataBR(
+              blockedDate
+            )} às ${res.inicio}). ${formatNoShowTag(
+              blockedDate
+            )}. Cota semanal liberada para outras datas.`,
+          })
+          .catch(() => {});
 
         toast.error(
           `Reserva em ${res.salaNome} cancelada por No-Show. ${formatNoShowTag(blockedDate)}.`

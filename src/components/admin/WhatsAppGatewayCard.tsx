@@ -51,7 +51,7 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
   const [instanceInput, setInstanceInput] = useState(
-    whatsappIntegration.instanceName || 'techreserve'
+    whatsappIntegration?.instanceName || 'techreserve'
   );
   const [showQrPanel, setShowQrPanel] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -64,10 +64,10 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
   const autoPersistedRef = useRef(false);
 
   useEffect(() => {
-    if (whatsappIntegration.instanceName) {
+    if (whatsappIntegration?.instanceName) {
       setInstanceInput(whatsappIntegration.instanceName);
     }
-  }, [whatsappIntegration.instanceName]);
+  }, [whatsappIntegration?.instanceName]);
 
   const refreshStatus = useCallback(
     async (silent = false, overrideInstance?: string) => {
@@ -75,7 +75,7 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
       try {
         const next = await getWhatsAppGatewayStatus(overrideInstance);
         setStatus((prev) => {
-          if (prev && !prev.connected && next.connected) {
+          if (prev && !prev.connected && next?.connected) {
             toast.success(
               'WhatsApp institucional sincronizado! O envio automático via Evolution API está ativo.'
             );
@@ -85,6 +85,11 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
           }
           return next;
         });
+      } catch (err) {
+        console.warn('[WhatsAppGatewayCard] Falha ao consultar status da Evolution API:', err);
+        if (!silent) {
+          toast.error('Não foi possível consultar o status da Evolution API no momento.');
+        }
       } finally {
         if (!silent) setLoadingStatus(false);
       }
@@ -93,7 +98,7 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
   );
 
   useEffect(() => {
-    void refreshStatus(false);
+    void refreshStatus(true).finally(() => setLoadingStatus(false));
   }, [refreshStatus]);
 
   // Persiste automaticamente `whatsappConnected: true` e `isConfigured: true` no Firestore
@@ -107,27 +112,29 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
     );
     const firestoreAlreadyActive = Boolean(
       whatsappExistsInFirestore &&
-        (whatsappIntegration.whatsappConnected || whatsappIntegration.isConfigured)
+        (whatsappIntegration?.whatsappConnected || whatsappIntegration?.isConfigured)
     );
 
     if (serverHasParams && !firestoreAlreadyActive) {
       autoPersistedRef.current = true;
       const detectedInstance =
-        status.instanceName || whatsappIntegration.instanceName || 'techreserve';
+        status.instanceName || whatsappIntegration?.instanceName || 'techreserve';
       void saveWhatsAppIntegration({
         instanceName: detectedInstance,
         provider: status.provider || 'EVOLUTION',
         whatsappConnected: true,
         isConfigured: true,
         silentLog: true,
+      }).catch((err) => {
+        console.warn('[WhatsAppGatewayCard] Falha ao persistir flag automática no Firestore:', err);
       });
     }
   }, [
     whatsappInitialized,
     whatsappExistsInFirestore,
-    whatsappIntegration.whatsappConnected,
-    whatsappIntegration.isConfigured,
-    whatsappIntegration.instanceName,
+    whatsappIntegration?.whatsappConnected,
+    whatsappIntegration?.isConfigured,
+    whatsappIntegration?.instanceName,
     loadingStatus,
     status,
     saveWhatsAppIntegration,
@@ -146,7 +153,7 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
   }, [qrCodeBase64, pairingCode, status?.connected, refreshStatus, instanceInput]);
 
   const hasFirestoreFlag = Boolean(
-    whatsappIntegration.whatsappConnected || whatsappIntegration.isConfigured
+    whatsappIntegration?.whatsappConnected || whatsappIntegration?.isConfigured
   );
   const hasServerParams = Boolean(
     status?.configured || status?.hasApiToken || status?.connected
@@ -156,20 +163,20 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
   const effectiveInstanceName =
     (instanceInput || '').trim() ||
     status?.instanceName ||
-    whatsappIntegration.instanceName ||
+    whatsappIntegration?.instanceName ||
     'techreserve';
 
   const handleSaveIntegrationSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanInstance =
-      instanceInput.trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'techreserve';
+      (instanceInput || '').trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'techreserve';
     setInstanceInput(cleanInstance);
     setSavingSettings(true);
 
     try {
       await saveWhatsAppIntegration({
         instanceName: cleanInstance,
-        provider: status?.provider || whatsappIntegration.provider || 'EVOLUTION',
+        provider: status?.provider || whatsappIntegration?.provider || 'EVOLUTION',
         whatsappConnected: true,
         isConfigured: true,
       });
@@ -193,14 +200,14 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
     setConnecting(true);
     try {
       const cleanInstance =
-        instanceInput.trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'techreserve';
+        (instanceInput || '').trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'techreserve';
       const res = await connectWhatsAppGateway({
         phone: showPhonePairing && pairingPhone ? sanitizePhone(pairingPhone) : undefined,
         forceRecreate,
         instanceName: cleanInstance,
       });
 
-      if (res.connected) {
+      if (res?.connected) {
         setQrCodeBase64(null);
         setPairingCode(null);
         setShowQrPanel(false);
@@ -216,8 +223,8 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
         return;
       }
 
-      if (!res.success) {
-        toast.error(res.error || 'Não foi possível gerar o QR Code no momento.');
+      if (!res?.success) {
+        toast.error(res?.error || 'Não foi possível gerar o QR Code no momento.');
         return;
       }
 
@@ -230,6 +237,9 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
       if (res.pairingCode) {
         setPairingCode(res.pairingCode);
       }
+    } catch (err) {
+      console.error('[WhatsAppGatewayCard] Erro ao gerar QR Code:', err);
+      toast.error('Falha de comunicação ao gerar o QR Code da Evolution API.');
     } finally {
       setConnecting(false);
     }
@@ -239,14 +249,17 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
     setDisconnecting(true);
     try {
       const res = await disconnectWhatsAppGateway(effectiveInstanceName);
-      if (res.success) {
+      if (res?.success) {
         setQrCodeBase64(null);
         setPairingCode(null);
         toast.success('Sessão do aparelho desconectada.');
         await refreshStatus(false, effectiveInstanceName);
       } else {
-        toast.error(res.message);
+        toast.error(res?.message || 'Não foi possível desconectar a sessão.');
       }
+    } catch (err) {
+      console.error('[WhatsAppGatewayCard] Erro ao desconectar sessão:', err);
+      toast.error('Falha ao desconectar a sessão do WhatsApp.');
     } finally {
       setDisconnecting(false);
     }

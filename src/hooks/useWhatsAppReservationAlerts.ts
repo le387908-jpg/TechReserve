@@ -67,7 +67,8 @@ export function useWhatsAppReservationAlerts(): void {
   const userCacheRef = useRef<Map<string, { profile: User; expiresAt: number }>>(new Map());
 
   useEffect(() => {
-    if (!user) return;
+    if (!user?.id) return;
+    let disposed = false;
 
     const resolveTargetUser = async (usuarioId: string): Promise<User | null> => {
       if (usuarioId === user.id && (user.phone || user.phoneFormatted)) {
@@ -107,21 +108,25 @@ export function useWhatsAppReservationAlerts(): void {
     };
 
     const evaluateLifecycleAlerts = async () => {
+      if (disposed) return;
       const now = new Date();
       const nowMs = now.getTime();
       const todayISO = getTodayLocalISO(now);
       const deliveredSet = getLocalDeliveredSet();
       const isAdmin = user.role === 'ADMIN';
+      const safeReservations = Array.isArray(reservations) ? reservations : [];
 
-      const activeReservations = reservations.filter((r) => {
+      const activeReservations = safeReservations.filter((r) => {
+        if (!r || !r.id || !r.data) return false;
         if (r.status !== 'PENDENTE' && r.status !== 'CONFIRMADA') return false;
         if (!isAdmin && r.usuarioId !== user.id) return false;
         return r.data >= todayISO;
       });
 
       for (const res of activeReservations) {
-        const startMs = createSafeLocalDateTime(res.data, res.inicio).getTime();
-        const endMs = createSafeLocalDateTime(res.data, res.fim).getTime();
+        if (disposed) return;
+        const startMs = createSafeLocalDateTime(res.data, res.inicio || '00:00').getTime();
+        const endMs = createSafeLocalDateTime(res.data, res.fim || '00:00').getTime();
         if (endMs <= nowMs) continue;
 
         // 0. Retentativa automática de Confirmação caso não tenha sido entregue na criação (ex.: até 30 min após agendar)
@@ -258,7 +263,7 @@ export function useWhatsAppReservationAlerts(): void {
                   whatsappAlertaDesocupacaoEnviado: true,
                   updatedAt: Date.now(),
                 });
-                if (targetUser.id === user.id) {
+                if (!disposed && targetUser.id === user.id) {
                   toast.info(
                     `Alerta de desocupação enviado via WhatsApp: faltam cerca de 10 minutos para liberar ${res.salaNome}.`
                   );
@@ -281,10 +286,13 @@ export function useWhatsAppReservationAlerts(): void {
       }
     };
 
-    void evaluateLifecycleAlerts();
+    void evaluateLifecycleAlerts().catch(() => {});
     const interval = setInterval(() => {
-      void evaluateLifecycleAlerts();
+      void evaluateLifecycleAlerts().catch(() => {});
     }, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      disposed = true;
+      clearInterval(interval);
+    };
   }, [user, reservations]);
 }
