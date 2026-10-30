@@ -3,18 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { CalendarEvent, DayOfWeek } from '../types';
-import { getEffectiveWindowForDate } from './reservationRules';
+import { AvailableSlot, CalendarEvent, DayOfWeek } from '../types';
+import { isSlotActiveOrReleased } from '../store/useAvailableSlotsStore';
 
 export interface DayTimeSlot {
   id: string;
   start: string; // HH:mm
-  end: string;   // HH:mm
+  end: string; // HH:mm
   durationMinutes: number;
   type: 'LIVRE' | 'AULA_GRADE' | 'RESERVA_USUARIO';
   title: string;
   subtitle?: string;
   room?: string;
+  availableSlotId?: string;
   event?: CalendarEvent;
 }
 
@@ -47,10 +48,16 @@ export function getDayOfWeekFromDate(dateStr: string): DayOfWeek | null {
   return map[dayIndex] || null;
 }
 
+/**
+ * Calcula a ocupação acadêmica do dia (`AULA_GRADE` + `RESERVA_USUARIO`).
+ * REGRA DE BLOQUEIO PADRÃO: Não gera intervalos "livres" automáticos.
+ * Slots disponíveis só aparecem se houver registros explícitos em `availableSlots` (`liberado` ou `ativo`).
+ */
 export function calculateDayTimeSlots(
   dateStr: string,
   events: CalendarEvent[],
-  roomFilter?: string
+  roomFilter?: string,
+  availableSlots: AvailableSlot[] = []
 ): {
   occupiedSlots: DayTimeSlot[];
   freeSlots: DayTimeSlot[];
@@ -119,60 +126,47 @@ export function calculateDayTimeSlots(
     event: item.evt,
   }));
 
-  const mergedOccupied: { startM: number; endM: number }[] = [];
-  for (const item of occupiedRaw) {
-    if (mergedOccupied.length === 0) {
-      mergedOccupied.push({ startM: item.startM, endM: item.endM });
-    } else {
-      const last = mergedOccupied[mergedOccupied.length - 1];
-      if (item.startM <= last.endM) {
-        last.endM = Math.max(last.endM, item.endM);
-      } else {
-        mergedOccupied.push({ startM: item.startM, endM: item.endM });
+  // Apenas slots explicitamente liberados pelo ADM em `available_slots` para esta data (sem conflito)
+  const freeSlots: DayTimeSlot[] = availableSlots
+    .filter((slot) => {
+      if (slot.data !== dateStr) return false;
+      if (!isSlotActiveOrReleased(slot)) return false;
+      if (roomFilter && roomFilter !== 'TODAS') {
+        const roomMatch =
+          slot.salaNome.toLowerCase().includes(roomFilter.toLowerCase()) ||
+          roomFilter.toLowerCase().includes(slot.salaNome.toLowerCase());
+        if (!roomMatch) return false;
       }
-    }
-  }
 
-  const freeSlots: DayTimeSlot[] = [];
-  let currentCursor = dayStartMinutes;
+      const sStart = timeToMinutes(slot.inicio);
+      const sEnd = timeToMinutes(slot.fim);
+      if (sEnd <= sStart) return false;
 
-  for (let i = 0; i < mergedOccupied.length; i++) {
-    const occ = mergedOccupied[i];
-    if (occ.startM > currentCursor) {
-      const gapStart = currentCursor;
-      const gapEnd = occ.startM;
-      if (gapEnd - gapStart >= 15) {
-        freeSlots.push({
-          id: `free_${gapStart}_${gapEnd}`,
-          start: minutesToTime(gapStart),
-          end: minutesToTime(gapEnd),
-          durationMinutes: gapEnd - gapStart,
-          type: 'LIVRE',
-          title: getPeriodLabel(gapStart, gapEnd),
-          subtitle: 'Livre sem aula - Disponível para reserva',
-          room: roomFilter !== 'TODAS' ? roomFilter : undefined,
-        });
-      }
-    }
-    currentCursor = Math.max(currentCursor, occ.endM);
-  }
-
-  if (currentCursor < dayEndMinutes) {
-    const gapStart = currentCursor;
-    const gapEnd = dayEndMinutes;
-    if (gapEnd - gapStart >= 15) {
-      freeSlots.push({
-        id: `free_${gapStart}_${gapEnd}`,
-        start: minutesToTime(gapStart),
-        end: minutesToTime(gapEnd),
-        durationMinutes: gapEnd - gapStart,
-        type: 'LIVRE',
-        title: getPeriodLabel(gapStart, gapEnd),
-        subtitle: 'Livre sem aula - Disponível para reserva',
-        room: roomFilter !== 'TODAS' ? roomFilter : undefined,
+      const hasRoomConflict = occupiedRaw.some((occ) => {
+        const sameRoom =
+          occ.evt.sala.toLowerCase().includes(slot.salaNome.toLowerCase()) ||
+          slot.salaNome.toLowerCase().includes(occ.evt.sala.toLowerCase());
+        if (!sameRoom) return false;
+        return sStart < occ.endM && sEnd > occ.startM;
       });
-    }
-  }
+      return !hasRoomConflict;
+    })
+    .map((slot) => {
+      const sStart = timeToMinutes(slot.inicio);
+      const sEnd = timeToMinutes(slot.fim);
+      return {
+        id: `released_${slot.id}`,
+        availableSlotId: slot.id,
+        start: slot.inicio,
+        end: slot.fim,
+        durationMinutes: sEnd - sStart,
+        type: 'LIVRE' as const,
+        title: slot.label || 'Horário Liberado pela Coordenação',
+        subtitle: `Liberado para agendamento (${slot.salaNome})`,
+        room: slot.salaNome,
+      };
+    })
+    .sort((a, b) => timeToMinutes(a.start) - timeToMinutes(b.start));
 
   const allSlotsChronological: DayTimeSlot[] = [...occupiedSlots, ...freeSlots].sort(
     (a, b) => timeToMinutes(a.start) - timeToMinutes(b.start)
@@ -183,13 +177,6 @@ export function calculateDayTimeSlots(
     freeSlots,
     allSlotsChronological,
   };
-}
-
-function getPeriodLabel(startM: number, endM: number): string {
-  if (endM <= 12 * 60) return 'Manhã (Sem Aulas)';
-  if (startM >= 12 * 60 && endM <= 18 * 60 + 50) return 'Tarde (Sem Aulas)';
-  if (startM >= 18 * 60) return 'Noite (Sem Aulas)';
-  return 'Horário Livre (Sem Aulas)';
 }
 
 export function checkReservationConflict(
@@ -250,42 +237,8 @@ export function checkReservationConflict(
 }
 
 /**
- * Filtra e ajusta os intervalos livres para a janela operacional configurada pelo ADM (ou exceção da data).
+ * Retorna exclusivamente os slots que já vieram de `available_slots` com status liberado/ativo.
  */
-export function getReservableFreeSlots(
-  freeSlots: DayTimeSlot[],
-  dateStr?: string,
-  salaFirestoreId?: string
-): DayTimeSlot[] {
-  const effective = dateStr
-    ? getEffectiveWindowForDate(dateStr, salaFirestoreId)
-    : { isClosed: false, janelaInicio: '17:00', janelaFim: '22:00' };
-
-  if (effective.isClosed) return [];
-
-  const minM = timeToMinutes(effective.janelaInicio);
-  const maxM = timeToMinutes(effective.janelaFim);
-  const reservable: DayTimeSlot[] = [];
-
-  for (const slot of freeSlots) {
-    const startM = timeToMinutes(slot.start);
-    const endM = timeToMinutes(slot.end);
-    const clampedStart = Math.max(startM, minM);
-    const clampedEnd = Math.min(endM, maxM);
-
-    if (clampedEnd - clampedStart >= 15) {
-      reservable.push({
-        id: `res_free_${clampedStart}_${clampedEnd}`,
-        start: minutesToTime(clampedStart),
-        end: minutesToTime(clampedEnd),
-        durationMinutes: clampedEnd - clampedStart,
-        type: 'LIVRE',
-        title: getPeriodLabel(clampedStart, clampedEnd),
-        subtitle: `Janela liberada (${effective.janelaInicio} às ${effective.janelaFim})`,
-        room: slot.room,
-      });
-    }
-  }
-
-  return reservable;
+export function getReservableFreeSlots(freeSlots: DayTimeSlot[]): DayTimeSlot[] {
+  return freeSlots;
 }

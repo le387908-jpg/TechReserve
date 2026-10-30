@@ -5,7 +5,7 @@
 
 import React, { lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
-import { useAuthStore } from '../store/useAuthStore';
+import { useAuth } from '../context/AuthContext';
 import { MainLayout } from '../components/layout/MainLayout';
 
 // Lazy load pages
@@ -30,7 +30,7 @@ function LoadingFallback() {
 }
 
 function ProtectedRoute({ children, adminOnly = false }: { children: React.ReactNode, adminOnly?: boolean }) {
-  const { user, initialized } = useAuthStore();
+  const { user, initialized } = useAuth();
   const location = useLocation();
 
   if (!initialized) {
@@ -49,7 +49,7 @@ function ProtectedRoute({ children, adminOnly = false }: { children: React.React
 }
 
 function HomeRedirect() {
-  const { user, initialized } = useAuthStore();
+  const { user, initialized } = useAuth();
   if (!initialized) {
     return <LoadingFallback />;
   }

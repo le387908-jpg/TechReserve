@@ -7,6 +7,11 @@ import { getTodayLocalISO, createSafeLocalDateTime } from './dateUtils';
 import { DayOfWeek, ScheduleException, TimeBlock } from '../types';
 import { useScheduleStore, DEFAULT_SCHEDULE_CONFIG } from '../store/useScheduleStore';
 import { useRoomStore } from '../store/useRoomStore';
+import {
+  isSlotActiveOrReleased,
+  matchesSlotRoom,
+  useAvailableSlotsStore,
+} from '../store/useAvailableSlotsStore';
 
 export const RESERVATION_RULES = {
   get MIN_TIME() {
@@ -79,7 +84,8 @@ export function findApplicableException(
 
 /**
  * Retorna a janela operacional efetiva (início, fim, blocos disponíveis, se está fechada) para uma data e sala.
- * Exige que a sala esteja liberada pelo ADM e que existam blocos de horários ativos configurados.
+ * REGRA DE BLOQUEIO PADRÃO: Por padrão, NENHUM horário fica disponível automaticamente.
+ * Exige registros explícitos com status `liberado` ou `ativo` na coleção `available_slots` para a sala e data.
  */
 export function getEffectiveWindowForDate(
   dateStr: string,
@@ -125,58 +131,32 @@ export function getEffectiveWindowForDate(
     }
   }
 
-  const baseBlocks =
-    room?.blocosHorarios && room.blocosHorarios.length > 0
-      ? room.blocosHorarios
-      : config.blocosPadrao || [];
+  if (!config.reservasAbertas) {
+    return {
+      isClosed: true,
+      reason: 'A abertura de novos agendamentos encontra-se suspensa pela Coordenação.',
+      janelaInicio: config.janelaInicio,
+      janelaFim: config.janelaFim,
+      blocks: [],
+    };
+  }
 
   const exception = findApplicableException(dateStr, salaFirestoreId);
 
-  if (exception) {
-    if (exception.fechado) {
-      return {
-        isClosed: true,
-        reason: `Data bloqueada pela Coordenação (${exception.titulo}${
-          exception.motivo ? `: ${exception.motivo}` : ''
-        }).`,
-        janelaInicio: config.janelaInicio,
-        janelaFim: config.janelaFim,
-        blocks: [],
-        exception,
-      };
-    }
-
-    const janelaInicio = exception.janelaInicio || config.janelaInicio;
-    const janelaFim = exception.janelaFim || config.janelaFim;
-    const customBlocks =
-      exception.blocosCustomizados && exception.blocosCustomizados.length > 0
-        ? exception.blocosCustomizados.filter((b) => b.ativo)
-        : baseBlocks.filter(
-            (b) => b.ativo && b.inicio >= janelaInicio && b.fim <= janelaFim
-          );
-
-    if (customBlocks.length === 0) {
-      return {
-        isClosed: true,
-        reason: 'O administrador não liberou blocos de horários ativos para esta sala nesta data.',
-        janelaInicio,
-        janelaFim,
-        blocks: [],
-        exception,
-      };
-    }
-
+  if (exception?.fechado) {
     return {
-      isClosed: false,
-      janelaInicio,
-      janelaFim,
-      blocks: customBlocks,
+      isClosed: true,
+      reason: `Data bloqueada pela Coordenação (${exception.titulo}${
+        exception.motivo ? `: ${exception.motivo}` : ''
+      }).`,
+      janelaInicio: config.janelaInicio,
+      janelaFim: config.janelaFim,
+      blocks: [],
       exception,
     };
   }
 
-  // Sem exceção específica: verifica feriados/domingo e dias da semana habilitados pelo ADM
-  if (isSundayOrHoliday(dateStr)) {
+  if (!exception && isSundayOrHoliday(dateStr)) {
     return {
       isClosed: true,
       reason: 'Não é permitido realizar reservas aos domingos ou feriados oficiais.',
@@ -188,10 +168,11 @@ export function getEffectiveWindowForDate(
 
   const dayName = getDayNameFromISO(dateStr);
   if (
-    dayName === 'Domingo' ||
-    (config.diasSemanaPermitidos &&
-      config.diasSemanaPermitidos.length > 0 &&
-      !config.diasSemanaPermitidos.includes(dayName))
+    !exception &&
+    (dayName === 'Domingo' ||
+      (config.diasSemanaPermitidos &&
+        config.diasSemanaPermitidos.length > 0 &&
+        !config.diasSemanaPermitidos.includes(dayName)))
   ) {
     return {
       isClosed: true,
@@ -202,25 +183,55 @@ export function getEffectiveWindowForDate(
     };
   }
 
-  const activeBlocks = baseBlocks.filter(
-    (b) => b.ativo && b.inicio >= config.janelaInicio && b.fim <= config.janelaFim
-  );
+  // Filtra estritamente registros explícitos de `available_slots` criados e liberados pelo ADM
+  const allAvailableSlots = useAvailableSlotsStore.getState().slots;
+  const releasedSlots = allAvailableSlots
+    .filter((slot) => {
+      if (slot.data !== dateStr) return false;
+      if (!isSlotActiveOrReleased(slot)) return false;
+      if (room) return matchesSlotRoom(slot, room);
+      if (salaFirestoreId) return slot.salaId === salaFirestoreId;
+      return true;
+    })
+    .sort((a, b) => a.inicio.localeCompare(b.inicio));
 
-  if (activeBlocks.length === 0) {
+  const baseJanelaInicio = exception?.janelaInicio || config.janelaInicio;
+  const baseJanelaFim = exception?.janelaFim || config.janelaFim;
+
+  if (releasedSlots.length === 0) {
     return {
       isClosed: true,
-      reason: 'O administrador ainda não liberou blocos de horários ativos para esta sala.',
-      janelaInicio: config.janelaInicio,
-      janelaFim: config.janelaFim,
+      reason: 'Indisponível - Aguardando liberação da coordenação para esta sala nesta data.',
+      janelaInicio: baseJanelaInicio,
+      janelaFim: baseJanelaFim,
       blocks: [],
+      exception,
     };
   }
 
+  const releasedBlocks: TimeBlock[] = releasedSlots.map((slot) => ({
+    id: slot.id,
+    label: slot.label || `Horário ${slot.inicio}–${slot.fim}`,
+    inicio: slot.inicio,
+    fim: slot.fim,
+    ativo: true,
+  }));
+
+  const minReleasedStart = releasedBlocks.reduce(
+    (min, b) => (b.inicio < min ? b.inicio : min),
+    baseJanelaInicio
+  );
+  const maxReleasedEnd = releasedBlocks.reduce(
+    (max, b) => (b.fim > max ? b.fim : max),
+    baseJanelaFim
+  );
+
   return {
     isClosed: false,
-    janelaInicio: config.janelaInicio,
-    janelaFim: config.janelaFim,
-    blocks: activeBlocks,
+    janelaInicio: minReleasedStart,
+    janelaFim: maxReleasedEnd,
+    blocks: releasedBlocks,
+    exception,
   };
 }
 

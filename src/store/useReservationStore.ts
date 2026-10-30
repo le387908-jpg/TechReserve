@@ -28,9 +28,11 @@ import {
   formatNoShowTag,
   getReleasedBlocksForRoomOnDate,
   isSpaceReleasedByAdmin,
+  verifyAvailableSlotFirestore,
   verifyWeeklyQuotaFirestore,
 } from '../services/reservationService';
 import { createSafeLocalDateTime, formatDataBR } from '../utils/dateUtils';
+import { hydrateUserDocument } from '../services/authService';
 import {
   notifyNoShowAutoCancelled,
   notifyReservationCancelled,
@@ -95,10 +97,14 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
 
   addReservation: async (resData) => {
     const { user } = useAuthStore.getState();
-    const isAdmin = user?.role === 'ADMIN';
+    if (!user) {
+      throw new Error('Autenticação necessária para realizar agendamentos.');
+    }
+    const isAdmin = user.role === 'ADMIN';
+    let verifiedAvailableSlotId: string | undefined = resData.availableSlotId;
 
     // Validações estritas de regras de negócio para usuários comuns antes de gravar no Firestore
-    if (user && !isAdmin) {
+    if (!isAdmin) {
       const room = useRoomStore
         .getState()
         .rooms.find(
@@ -107,7 +113,11 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
             r.id === resData.salaInstitutionalId
         );
 
-      // 1. Pré-requisito de liberação da sala e blocos ativos pelo ADM
+      if (!room) {
+        throw new Error('Sala não encontrada no inventário institucional.');
+      }
+
+      // 1. Pré-requisito de liberação da sala e registro explícito em `available_slots` pelo ADM
       const roomRelease = isSpaceReleasedByAdmin(room);
       if (!roomRelease.released) {
         throw new Error(
@@ -126,24 +136,36 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       if (!blockRelease.released) {
         throw new Error(
           blockRelease.reason ||
-            'Não há blocos de horários liberados pelo administrador para esta sala nesta data.'
+            'Indisponível - Aguardando liberação da coordenação para esta sala nesta data.'
         );
       }
 
-      const matchesBlock = blockRelease.blocks.some(
+      const matchedLocalSlot = blockRelease.blocks.find(
         (b) => b.ativo && b.inicio === resData.inicio && b.fim === resData.fim
       );
-      if (!matchesBlock) {
+      if (!matchedLocalSlot) {
         throw new Error(
-          'Selecione exclusivamente um bloco de horário liberado pelo administrador.'
+          'Indisponível - Aguardando liberação da coordenação. Selecione apenas um horário com status liberado.'
         );
       }
 
+      // Confirma diretamente no Firestore (`available_slots`) e obtém o `availableSlotId` exigido pelas Security Rules
+      const verifiedSlot = await verifyAvailableSlotFirestore(
+        room,
+        resData.data,
+        resData.inicio,
+        resData.fim
+      );
+      verifiedAvailableSlotId = verifiedSlot.id;
+
       // 2. Verificação de punição de No-Show (bloqueio exclusivo na data da falta)
-      const { punishments } = usePunishmentStore.getState();
+      const { punishments, activePunishment } = usePunishmentStore.getState();
+      const effectivePunishments = activePunishment
+        ? [...punishments, activePunishment]
+        : punishments;
       const noShowCheck = checkNoShowSuspensionForDate(
         user,
-        punishments,
+        effectivePunishments,
         resData.data
       );
       if (noShowCheck.blocked) {
@@ -154,7 +176,7 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
 
       // 3. Verificação em tempo real no Firestore da cota de 1 reserva por semana (Segunda a Domingo)
       const quotaCheck = await verifyWeeklyQuotaFirestore(
-        resData.usuarioId,
+        user.id,
         resData.data
       );
       if (!quotaCheck.allowed) {
@@ -164,8 +186,16 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
 
     try {
       const now = Date.now();
+      const effectiveResData = isAdmin
+        ? resData
+        : {
+            ...resData,
+            usuarioId: user.id,
+            availableSlotId: verifiedAvailableSlotId,
+            status: 'PENDENTE' as const,
+          };
       const cleanData: Record<string, unknown> = {};
-      Object.entries(resData).forEach(([key, val]) => {
+      Object.entries(effectiveResData).forEach(([key, val]) => {
         if (val !== undefined) cleanData[key] = val;
       });
 
@@ -173,7 +203,7 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         addDoc(collection(db, 'reservas'), {
           ...cleanData,
           ocultoParaUsuario: false,
-          whatsappConfirmacaoEnviada: true,
+          whatsappConfirmacaoEnviada: false,
           whatsappLembreteInicioEnviado: false,
           whatsappAlertaDesocupacaoEnviado: false,
           whatsappNoShowEnviado: false,
@@ -188,33 +218,76 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           usuarioId: user.id,
           usuarioNome: user.nome,
           entidade: 'RESERVAS',
-          detalhes: `Reserva agendada para "${resData.salaNome}" em ${resData.data} (${resData.inicio} às ${resData.fim}).`,
+          detalhes: `Reserva agendada para "${effectiveResData.salaNome}" em ${effectiveResData.data} (${effectiveResData.inicio} às ${effectiveResData.fim}).`,
         });
 
-        // Dispara mensagem de confirmação via API do WhatsApp (caso telefone válido e opt-in ativo)
-        let targetUser: User | null = user.id === resData.usuarioId ? user : null;
-        if (!targetUser) {
-          try {
-            const ownerSnap = await getDoc(doc(db, 'users', resData.usuarioId));
-            if (ownerSnap.exists()) {
-              targetUser = { id: ownerSnap.id, ...ownerSnap.data() } as User;
-            }
-          } catch {
-            // Prossegue silenciosamente
-          }
-        }
+        // Dispara mensagem de confirmação via Evolution API (`/message/sendText/{instance}`)
+        void (async () => {
+          let targetUser: User | null =
+            user.id === effectiveResData.usuarioId ? user : null;
 
-        if (targetUser) {
-          void notifyReservationConfirmed(targetUser, {
-            id: docRef.id,
-            salaNome: resData.salaNome,
-            salaInstitutionalId: resData.salaInstitutionalId,
-            data: resData.data,
-            inicio: resData.inicio,
-            fim: resData.fim,
-            status: resData.status,
+          // Busca o documento atualizado em `users/{uid}` se for outro usuário (ADM) ou se o telefone em memória estiver vazio
+          if (!targetUser || (!targetUser.phone && !targetUser.phoneFormatted)) {
+            try {
+              const ownerSnap = await getDoc(
+                doc(db, 'users', effectiveResData.usuarioId)
+              );
+              if (ownerSnap.exists()) {
+                targetUser = hydrateUserDocument(ownerSnap.data(), ownerSnap.id);
+              }
+            } catch (fetchErr) {
+              console.error(
+                '[Reservas][WhatsApp Confirmação] Erro ao carregar perfil do usuário para envio:',
+                fetchErr
+              );
+            }
+          }
+
+          if (!targetUser) {
+            console.warn(
+              '[Reservas][WhatsApp Confirmação] Perfil de destino não encontrado para reserva:',
+              docRef.id
+            );
+            return;
+          }
+
+          console.log('[Reservas][WhatsApp Confirmação] Iniciando disparo para reserva criada:', {
+            reservaId: docRef.id,
+            usuarioId: targetUser.id,
+            sala: effectiveResData.salaNome,
+            data: effectiveResData.data,
+            inicio: effectiveResData.inicio,
           });
-        }
+
+          const dispatchRes = await notifyReservationConfirmed(targetUser, {
+            id: docRef.id,
+            salaNome: effectiveResData.salaNome,
+            salaInstitutionalId: effectiveResData.salaInstitutionalId,
+            data: effectiveResData.data,
+            inicio: effectiveResData.inicio,
+            fim: effectiveResData.fim,
+            status: effectiveResData.status,
+          });
+
+          if (dispatchRes.delivered) {
+            try {
+              await updateDoc(doc(db, 'reservas', docRef.id), {
+                whatsappConfirmacaoEnviada: true,
+                updatedAt: Date.now(),
+              });
+            } catch {
+              // Ignora falha secundária de marcação
+            }
+            if (user.id === targetUser.id) {
+              toast.success('Confirmação enviada para o seu WhatsApp.');
+            }
+          } else if (!dispatchRes.skipped) {
+            console.error(
+              '[Reservas][WhatsApp Confirmação] Falha no envio da confirmação:',
+              dispatchRes
+            );
+          }
+        })();
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'reservas');
@@ -222,8 +295,32 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
   },
 
   updateReservation: async (id, data) => {
+    const { user } = useAuthStore.getState();
+    if (!user) {
+      throw new Error('Autenticação necessária.');
+    }
+    let target = get().reservations.find((r) => r.id === id);
+    if (!target) {
+      try {
+        const snap = await getDoc(doc(db, 'reservas', id));
+        if (snap.exists()) {
+          target = { id: snap.id, ...snap.data() } as Reservation;
+        }
+      } catch {
+        // Prossegue caso indisponível
+      }
+    }
+
+    if (user.role !== 'ADMIN') {
+      if (target && target.usuarioId !== user.id) {
+        throw new Error('Você só pode gerenciar suas próprias reservas.');
+      }
+      if (data.status === 'CONFIRMADA') {
+        throw new Error('A aprovação direta é exclusiva do perfil ADM. Utilize o check-in via QR Code.');
+      }
+    }
+
     try {
-      const target = get().reservations.find((r) => r.id === id);
       const resRef = doc(db, 'reservas', id);
       const cleanData: Record<string, unknown> = {};
       Object.entries(data).forEach(([key, val]) => {
@@ -237,8 +334,7 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         })
       );
 
-      const { user } = useAuthStore.getState();
-      if (user && data.status) {
+      if (data.status) {
         const actionMap: Record<string, string> = {
           CANCELADA: 'CANCELAR_RESERVA',
           CONFIRMADA: 'CONFIRMAR_RESERVA',
@@ -257,26 +353,80 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           } alterada para ${data.status}.`,
         });
 
-        // Dispara notificação de cancelamento via API do WhatsApp (pelo próprio usuário ou pelo ADM)
-        if (data.status === 'CANCELADA' && target) {
-          const cancelledBy: 'USUARIO' | 'ADMIN' =
-            user.role === 'ADMIN' && user.id !== target.usuarioId ? 'ADMIN' : 'USUARIO';
+        // Dispara notificações automáticas via Evolution API (cancelamento ou aprovação ADM)
+        if ((data.status === 'CANCELADA' || data.status === 'CONFIRMADA') && target) {
+          const snapshotTarget = target;
+          void (async () => {
+            let ownerProfile: User | null =
+              user.id === snapshotTarget.usuarioId ? user : null;
 
-          let ownerProfile: User | null = user.id === target.usuarioId ? user : null;
-          if (!ownerProfile && user.role === 'ADMIN') {
-            try {
-              const ownerSnap = await getDoc(doc(db, 'users', target.usuarioId));
-              if (ownerSnap.exists()) {
-                ownerProfile = { id: ownerSnap.id, ...ownerSnap.data() } as User;
+            if (!ownerProfile || (!ownerProfile.phone && !ownerProfile.phoneFormatted)) {
+              try {
+                const ownerSnap = await getDoc(doc(db, 'users', snapshotTarget.usuarioId));
+                if (ownerSnap.exists()) {
+                  ownerProfile = hydrateUserDocument(ownerSnap.data(), ownerSnap.id);
+                }
+              } catch (fetchErr) {
+                console.error(
+                  '[Reservas][WhatsApp Atualização] Erro ao carregar perfil do usuário:',
+                  fetchErr
+                );
               }
-            } catch {
-              // Ignora caso indisponível
             }
-          }
 
-          if (ownerProfile) {
-            void notifyReservationCancelled(ownerProfile, target, cancelledBy, data.observacoes);
-          }
+            if (!ownerProfile) return;
+
+            if (data.status === 'CANCELADA') {
+              const cancelledBy: 'USUARIO' | 'ADMIN' =
+                user.role === 'ADMIN' && user.id !== snapshotTarget.usuarioId
+                  ? 'ADMIN'
+                  : 'USUARIO';
+
+              console.log('[Reservas][WhatsApp Cancelamento] Disparando aviso de cancelamento:', {
+                reservaId: snapshotTarget.id,
+                usuarioId: ownerProfile.id,
+                cancelledBy,
+              });
+
+              const cancelRes = await notifyReservationCancelled(
+                ownerProfile,
+                snapshotTarget,
+                cancelledBy,
+                data.observacoes
+              );
+              if (!cancelRes.delivered && !cancelRes.skipped) {
+                console.error(
+                  '[Reservas][WhatsApp Cancelamento] Falha no envio do cancelamento:',
+                  cancelRes
+                );
+              }
+            } else if (
+              data.status === 'CONFIRMADA' &&
+              snapshotTarget.status === 'PENDENTE' &&
+              !snapshotTarget.whatsappConfirmacaoEnviada
+            ) {
+              console.log('[Reservas][WhatsApp Aprovação ADM] Disparando confirmação:', {
+                reservaId: snapshotTarget.id,
+                usuarioId: ownerProfile.id,
+              });
+
+              const confirmRes = await notifyReservationConfirmed(ownerProfile, {
+                ...snapshotTarget,
+                status: 'CONFIRMADA',
+              });
+              if (confirmRes.delivered) {
+                await updateDoc(doc(db, 'reservas', id), {
+                  whatsappConfirmacaoEnviada: true,
+                  updatedAt: Date.now(),
+                }).catch(() => {});
+              } else if (!confirmRes.skipped) {
+                console.error(
+                  '[Reservas][WhatsApp Aprovação ADM] Falha no envio da confirmação:',
+                  confirmRes
+                );
+              }
+            }
+          })();
         }
       }
     } catch (err) {
@@ -285,8 +435,16 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
   },
 
   checkIn: async (id) => {
+    const { user } = useAuthStore.getState();
+    if (!user) {
+      throw new Error('Autenticação necessária.');
+    }
+    const target = get().reservations.find((r) => r.id === id);
+    if (user.role !== 'ADMIN' && target && target.usuarioId !== user.id) {
+      throw new Error('Você só pode realizar check-in na sua própria reserva.');
+    }
+
     try {
-      const target = get().reservations.find((r) => r.id === id);
       const resRef = doc(db, 'reservas', id);
       await withRetry(() =>
         updateDoc(resRef, {
@@ -296,22 +454,25 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         })
       );
 
-      const { user } = useAuthStore.getState();
-      if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'CHECKIN_REALIZADO',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'RESERVAS',
-          detalhes: `Check-in presencial confirmado em "${target?.salaNome || id}".`,
-        });
-      }
+      await useLogStore.getState().addLog({
+        acao: 'CHECKIN_REALIZADO',
+        usuarioId: user.id,
+        usuarioNome: user.nome,
+        entidade: 'RESERVAS',
+        detalhes: `Check-in presencial confirmado em "${target?.salaNome || id}".`,
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `reservas/${id}`);
     }
   },
 
   hideForUser: async (id) => {
+    const { user } = useAuthStore.getState();
+    const target = get().reservations.find((r) => r.id === id);
+    if (!user || (user.role !== 'ADMIN' && target && target.usuarioId !== user.id)) {
+      throw new Error('Permissão insuficiente.');
+    }
+
     try {
       const resRef = doc(db, 'reservas', id);
       await updateDoc(resRef, {
@@ -324,23 +485,25 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
   },
 
   deleteReservation: async (id) => {
+    const { user } = useAuthStore.getState();
+    if (!user || user.role !== 'ADMIN') {
+      throw new Error('Apenas administradores podem excluir registros de reserva.');
+    }
+
     try {
       const target = get().reservations.find((r) => r.id === id);
       const resRef = doc(db, 'reservas', id);
       await deleteDoc(resRef);
 
-      const { user } = useAuthStore.getState();
-      if (user) {
-        await useLogStore.getState().addLog({
-          acao: 'EXCLUIR_RESERVA',
-          usuarioId: user.id,
-          usuarioNome: user.nome,
-          entidade: 'RESERVAS',
-          detalhes: `Registro de reserva ${
-            target?.salaNome ? `"${target.salaNome}" (${target.data})` : id
-          } removido pelo ADM.`,
-        });
-      }
+      await useLogStore.getState().addLog({
+        acao: 'EXCLUIR_RESERVA',
+        usuarioId: user.id,
+        usuarioNome: user.nome,
+        entidade: 'RESERVAS',
+        detalhes: `Registro de reserva ${
+          target?.salaNome ? `"${target.salaNome}" (${target.data})` : id
+        } removido pelo ADM.`,
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `reservas/${id}`);
     }
@@ -397,18 +560,18 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         const punicaoRef = doc(db, 'users', res.usuarioId);
         let targetUserName = currentUser.nome;
         let targetUserEmail = currentUser.email;
-        let targetUserPhone = currentUser.phone || '';
+        let targetUserPhone = currentUser.phone || currentUser.phoneFormatted || '';
         let targetWhatsappEnabled = currentUser.whatsappNotificationsEnabled !== false;
 
         const userSnap = await withRetry(() => getDoc(punicaoRef), { silent: true });
         if (userSnap.exists()) {
-          const uDoc = userSnap.data();
+          const uDoc = hydrateUserDocument(userSnap.data(), userSnap.id);
           if (uDoc.role === 'ADMIN') {
             continue;
           }
-          targetUserName = uDoc.nome || uDoc.name || targetUserName;
+          targetUserName = uDoc.nome || targetUserName;
           targetUserEmail = uDoc.email || targetUserEmail;
-          targetUserPhone = uDoc.phone || targetUserPhone;
+          targetUserPhone = uDoc.phone || uDoc.phoneFormatted || targetUserPhone;
           targetWhatsappEnabled = uDoc.whatsappNotificationsEnabled !== false;
         }
 
@@ -426,6 +589,34 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           })
         );
 
+        // Dispara aviso de No-Show via Evolution API (`/message/sendText/{instance}`) antes de concluir a marcação
+        let noShowDelivered = Boolean(res.whatsappNoShowEnviado);
+        if (!res.whatsappNoShowEnviado) {
+          console.log('[Reservas][WhatsApp No-Show] Disparando alerta de No-Show automático:', {
+            reservaId: res.id,
+            usuarioId: res.usuarioId,
+            sala: res.salaNome,
+            data: res.data,
+          });
+
+          const noShowResult = await notifyNoShowAutoCancelled(
+            {
+              id: res.usuarioId,
+              nome: targetUserName,
+              phone: targetUserPhone,
+              whatsappNotificationsEnabled: targetWhatsappEnabled,
+            },
+            res
+          );
+          noShowDelivered = Boolean(noShowResult.delivered);
+          if (!noShowResult.delivered && !noShowResult.skipped) {
+            console.error(
+              '[Reservas][WhatsApp No-Show] Falha ao enviar alerta de No-Show:',
+              noShowResult
+            );
+          }
+        }
+
         await withRetry(() =>
           updateDoc(doc(db, 'reservas', res.id), {
             status: 'PUNIDA',
@@ -435,22 +626,9 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
             observacoes: `Reserva cancelada automaticamente por No-Show. ${formatNoShowTag(
               blockedDate
             )} (cota semanal liberada para outras datas).`,
-            whatsappNoShowEnviado: true,
+            whatsappNoShowEnviado: noShowDelivered,
           })
         );
-
-        // Dispara aviso de No-Show via API do WhatsApp caso o usuário tenha telefone e opt-in ativo
-        if (!res.whatsappNoShowEnviado) {
-          void notifyNoShowAutoCancelled(
-            {
-              id: res.usuarioId,
-              nome: targetUserName,
-              phone: targetUserPhone,
-              whatsappNotificationsEnabled: targetWhatsappEnabled,
-            },
-            res
-          );
-        }
 
         try {
           await addDoc(collection(db, 'punishments'), {

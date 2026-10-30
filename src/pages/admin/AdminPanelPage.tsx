@@ -4,7 +4,7 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Navigate, useSearchParams } from 'react-router-dom';
 import {
   BarChart3,
   Clock,
@@ -14,12 +14,14 @@ import {
 } from 'lucide-react';
 import { collection, onSnapshot, query, orderBy } from 'firebase/firestore';
 import { db } from '../../services/firebase/config';
+import { useAuth } from '../../context/AuthContext';
 import { User } from '../../types';
 import { AdminAnalyticsTab } from './components/AdminAnalyticsTab';
 import { AdminSchedulesTab } from './components/AdminSchedulesTab';
 import { AdminSpacesTab } from './components/AdminSpacesTab';
 import { AdminModerationTab } from './components/AdminModerationTab';
 import { AdminUsersTab } from './components/AdminUsersTab';
+import { WhatsAppGatewayCard } from '../../components/admin/WhatsAppGatewayCard';
 import { cn } from '../../lib/utils';
 
 export type AdminTabKey = 'metricas' | 'horarios' | 'espacos' | 'moderacao' | 'usuarios';
@@ -42,6 +44,8 @@ const ADMIN_TABS: TabItem[] = [
  * Painel Central de Governança do Administrador (Perfil ADM) — TechReserve
  */
 export function AdminPanelPage() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'ADMIN';
   const [searchParams, setSearchParams] = useSearchParams();
   const initialTab = (searchParams.get('tab') as AdminTabKey) || 'metricas';
   const validTab = ADMIN_TABS.some((t) => t.id === initialTab) ? initialTab : 'metricas';
@@ -56,8 +60,9 @@ export function AdminPanelPage() {
     }
   }, [searchParams, activeTab]);
 
-  // Listener compartilhado da coleção `users` para as abas administrativas
+  // Listener compartilhado da coleção `users` estritamente para o perfil ADM
   useEffect(() => {
+    if (!isAdmin) return;
     const q = query(collection(db, 'users'), orderBy('nome', 'asc'));
     const unsub = onSnapshot(
       q,
@@ -69,7 +74,11 @@ export function AdminPanelPage() {
       }
     );
     return () => unsub();
-  }, []);
+  }, [isAdmin]);
+
+  if (!isAdmin) {
+    return <Navigate to="/salas" replace />;
+  }
 
   const handleSelectTab = (tabId: AdminTabKey) => {
     setActiveTab(tabId);
@@ -94,6 +103,9 @@ export function AdminPanelPage() {
           </p>
         </div>
       </div>
+
+      {/* STATUS E CONEXÃO QR DO GATEWAY WHATSAPP INSTITUCIONAL */}
+      <WhatsAppGatewayCard compact />
 
       {/* BARRA DE NAVEGAÇÃO INTERNA DAS 5 FRENTES DO PERFIL ADM */}
       <div className="bg-white border border-slate-200 rounded-2xl p-1.5 flex items-center gap-1 overflow-x-auto">

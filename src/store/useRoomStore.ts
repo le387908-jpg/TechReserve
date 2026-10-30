@@ -38,6 +38,13 @@ interface RoomState {
   resetRooms: () => Promise<void>;
 }
 
+function assertAdminRole(): void {
+  const currentUser = useAuthStore.getState().user;
+  if (!currentUser || currentUser.role !== 'ADMIN') {
+    throw new Error('Operação restrita exclusivamente ao perfil Administrador (ADM).');
+  }
+}
+
 export const useRoomStore = create<RoomState>((set, get) => ({
   rooms: [],
   loading: false,
@@ -102,6 +109,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   seedRooms: async () => {
+    assertAdminRole();
     const { rooms, addRoom } = get();
     if (rooms.length > 0) return;
 
@@ -111,6 +119,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   resetRooms: async () => {
+    assertAdminRole();
     const { rooms, deleteRoom, addRoom } = get();
     set({ loading: true });
     try {
@@ -126,6 +135,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   addRoom: async (roomData) => {
+    assertAdminRole();
     try {
       const now = Date.now();
       const cleanData: Record<string, unknown> = {};
@@ -159,6 +169,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   updateRoom: async (firestoreId, data) => {
+    assertAdminRole();
     try {
       const cleanData: Record<string, unknown> = {};
       Object.entries(data).forEach(([k, v]) => {
@@ -189,6 +200,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   setRoomRealtimeStatus: async (room, targetStatus) => {
+    assertAdminRole();
     const { user } = useAuthStore.getState();
     const now = Date.now();
 
@@ -221,6 +233,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   toggleMaintenanceOneClick: async (room) => {
+    assertAdminRole();
     const isCurrentlyMaintenance =
       room.status === 'MANUTENCAO' ||
       room.status === 'INATIVO' ||
@@ -232,6 +245,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   toggleRoomBookingRelease: async (room) => {
+    assertAdminRole();
     const { user } = useAuthStore.getState();
     const nextReleased = room.liberadaParaReserva === false;
     const now = Date.now();
@@ -261,6 +275,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   deleteRoom: async (firestoreId, roomName) => {
+    assertAdminRole();
     try {
       await withRetry(() => deleteDoc(doc(db, 'salas', firestoreId)));
 

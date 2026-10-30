@@ -21,6 +21,7 @@ import { PunishmentCategory, PunishmentRecord, User } from '../types';
 import { useAuthStore } from './useAuthStore';
 import { useLogStore } from './useLogStore';
 import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../utils/dateUtils';
+import { notifyManualPunishmentApplied } from '../services/whatsappService';
 
 export type Punishment = PunishmentRecord;
 
@@ -51,6 +52,12 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
   activePunishment: null,
 
   fetchPunishments: () => {
+    const currentUser = useAuthStore.getState().user;
+    if (!currentUser || currentUser.role !== 'ADMIN') {
+      set({ punishments: [], loading: false });
+      return () => {};
+    }
+
     set({ loading: true });
     const q = query(collection(db, 'punishments'), orderBy('dataInicio', 'desc'));
 
@@ -185,6 +192,9 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
           bloquearConta ? ' com bloqueio de conta' : ''
         }. Motivo: ${cleanReason}`,
       });
+
+      // 4. Notifica o usuário via WhatsApp sobre o bloqueio exclusivo na data informada
+      void notifyManualPunishmentApplied(targetUser, normalizedBlockedDate, cleanReason);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `users/${targetUser.id}`);
     }
@@ -247,13 +257,16 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
 
   deactivatePunishment: async (id) => {
     const admin = useAuthStore.getState().user;
+    if (!admin || admin.role !== 'ADMIN') {
+      throw new Error('Operação restrita a administradores.');
+    }
     try {
       const ref = doc(db, 'punishments', id);
       await withRetry(() =>
         updateDoc(ref, {
           ativa: false,
           revogadaEm: Date.now(),
-          revogadaPorNome: admin?.nome || 'Administrador',
+          revogadaPorNome: admin.nome || 'Administrador',
         })
       );
     } catch (err) {

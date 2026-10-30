@@ -71,6 +71,7 @@
         "data": { "type": "string", "maxLength": 16 },
         "inicio": { "type": "string", "maxLength": 8 },
         "fim": { "type": "string", "maxLength": 8 },
+        "availableSlotId": { "type": "string", "maxLength": 128, "description": "Explicit available_slots document ID released by ADM" },
         "status": { "type": "string", "enum": ["PENDENTE", "CONFIRMADA", "CANCELADA", "CONCLUIDA", "PUNIDA"] },
         "checkInExpiracao": { "type": "number" },
         "checkInRealizado": { "type": "boolean" },
@@ -154,6 +155,21 @@
       },
       "required": ["codeAuth", "allowAdminSignup", "updatedAt", "updatedBy", "updatedByName"]
     },
+    "WhatsAppIntegrationSettings": {
+      "title": "WhatsAppIntegrationSettings",
+      "description": "Persisted Evolution API / WhatsApp integration status and instance configuration",
+      "type": "object",
+      "properties": {
+        "whatsappConnected": { "type": "boolean" },
+        "isConfigured": { "type": "boolean" },
+        "instanceName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "provider": { "type": "string", "enum": ["EVOLUTION", "META_CLOUD", "WEBHOOK"] },
+        "updatedAt": { "type": "number" },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedByName": { "type": "string", "maxLength": 120 }
+      },
+      "required": ["whatsappConnected", "isConfigured", "instanceName", "provider", "updatedAt", "updatedBy", "updatedByName"]
+    },
     "Log": {
       "title": "Log",
       "description": "Immutable governance audit trail record",
@@ -167,15 +183,38 @@
         "createdAt": { "type": "number" }
       },
       "required": ["acao", "usuarioId", "usuarioNome", "entidade", "detalhes", "createdAt"]
+    },
+    "AvailableSlot": {
+      "title": "AvailableSlot",
+      "description": "Explicit time slot released by an Administrator for a specific room and date; required for standard user bookings",
+      "type": "object",
+      "properties": {
+        "salaId": { "type": "string", "maxLength": 128 },
+        "salaInstitutionalId": { "type": "string", "maxLength": 64 },
+        "salaNome": { "type": "string", "maxLength": 140 },
+        "data": { "type": "string", "maxLength": 16, "description": "ISO date YYYY-MM-DD" },
+        "inicio": { "type": "string", "maxLength": 8, "description": "Start time HH:mm" },
+        "fim": { "type": "string", "maxLength": 8, "description": "End time HH:mm" },
+        "label": { "type": "string", "maxLength": 120 },
+        "status": { "type": "string", "enum": ["liberado", "ativo", "bloqueado", "inativo"] },
+        "ativo": { "type": "boolean" },
+        "liberadoPorId": { "type": "string", "maxLength": 128 },
+        "liberadoPorNome": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["salaId", "salaNome", "data", "inicio", "fim", "status", "ativo", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
     "/users/{userId}": { "schema": "User", "description": "User profiles with academic enrollment, WhatsApp contact, and single-day no-show moderation status" },
     "/salas/{salaId}": { "schema": "Room", "description": "Academic spaces inventory (classrooms, laboratories, auditoriums) with ADM booking release controls" },
+    "/available_slots/{slotId}": { "schema": "AvailableSlot", "description": "Explicitly ADM-released room/date time slots enabling student/user bookings" },
     "/reservas/{reservaId}": { "schema": "Reservation", "description": "Space bookings, QR check-in deadlines, weekly quota tracking, and WhatsApp notification flags" },
     "/schedules/{scheduleId}": { "schema": "ScheduleDocument", "description": "Operational time windows, standard blocks, and date exceptions" },
     "/punishments/{punishmentId}": { "schema": "Punishment", "description": "Single-day No-Show suspensions and manual date restrictions" },
-    "/settings/{settingId}": { "schema": "AdminAuthSettings", "description": "Protected administrative authorization settings (code-auth)" },
+    "/settings/admin_auth": { "schema": "AdminAuthSettings", "description": "Protected administrative authorization settings (code-auth)" },
+    "/settings/whatsapp_integration": { "schema": "WhatsAppIntegrationSettings", "description": "Persisted Evolution API WhatsApp integration state and instance name" },
     "/logs/{logId}": { "schema": "Log", "description": "Auditable governance event logs" }
   }
 }

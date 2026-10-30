@@ -7,12 +7,12 @@ import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Mail, Lock, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
-import { useAuthStore } from '../../store/useAuthStore';
+import { useAuth } from '../../context/AuthContext';
 import { Logo } from '../../components/Logo';
 
 export function LoginPage() {
   const navigate = useNavigate();
-  const { signIn, loading, error, user } = useAuthStore();
+  const { signIn, resetPassword, clearError, loading, user } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -20,7 +20,7 @@ export function LoginPage() {
   const [isResetting, setIsResetting] = useState(false);
 
   React.useEffect(() => {
-    // Redireciona imediatamente se já estiver logado
+    // Redireciona imediatamente se já estiver logado nesta aba
     if (user) {
       navigate('/');
     }
@@ -28,8 +28,8 @@ export function LoginPage() {
 
   React.useEffect(() => {
     // Limpa erro anterior ao carregar a página de login
-    useAuthStore.setState({ error: null });
-  }, []);
+    clearError();
+  }, [clearError]);
 
   const handleForgotPassword = async () => {
     const cleanEmail = email.trim();
@@ -40,7 +40,7 @@ export function LoginPage() {
 
     setIsResetting(true);
     try {
-      await useAuthStore.getState().resetPassword(cleanEmail);
+      await resetPassword(cleanEmail);
       toast.success(`E-mail de redefinição enviado com sucesso para ${cleanEmail}! Verifique sua caixa de entrada e também a pasta de SPAM.`);
     } catch (err: any) {
       console.error('Password reset error:', err);

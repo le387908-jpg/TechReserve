@@ -111,6 +111,12 @@ export function EditProfileModal({ isOpen, onClose }: EditProfileModalProps) {
 
     setTestingAlert(true);
     try {
+      await updateProfile({
+        phone: sanitizedPhone,
+        phoneFormatted: formattedPhone,
+        whatsappNotificationsEnabled: true,
+      });
+
       const res = await sendTestWhatsAppAlert({
         id: user.id,
         nome: nome.trim() || user.nome,
@@ -118,15 +124,21 @@ export function EditProfileModal({ isOpen, onClose }: EditProfileModalProps) {
         whatsappNotificationsEnabled: true,
       });
 
-      if (res.success) {
+      if (res.delivered) {
+        toast.success(`Alerta de teste entregue no WhatsApp ${formattedPhone}!`);
+      } else if (res.success) {
         toast.success(
-          res.delivered
-            ? `Alerta de teste enviado para ${formattedPhone}.`
-            : `Alerta validado e registrado para ${formattedPhone} (modo homologação).`
+          `Alerta validado e registrado para ${formattedPhone} (modo homologação).`
         );
       } else {
-        toast.error(res.reason || 'Falha ao disparar teste de WhatsApp.');
+        console.error('[Perfil][Teste WhatsApp] Falha no disparo:', res);
+        toast.error(
+          res.reason || 'Falha ao disparar teste de WhatsApp via Evolution API.'
+        );
       }
+    } catch (err: any) {
+      console.error('[Perfil][Teste WhatsApp] Exceção:', err);
+      toast.error(err?.message || 'Erro ao validar alerta de WhatsApp.');
     } finally {
       setTestingAlert(false);
     }

@@ -40,6 +40,7 @@ import {
 } from '../../utils/formatters';
 import { sendTestWhatsAppAlert } from '../../services/whatsappService';
 import { EditProfileModal } from '../../components/profile/EditProfileModal';
+import { WhatsAppGatewayCard } from '../../components/admin/WhatsAppGatewayCard';
 
 const COURSES_DICT: Record<string, { sigla: string; nome: string }> = {
   GTI: { sigla: 'GTI', nome: 'Gestão da Tecnologia da Informação' },
@@ -190,16 +191,20 @@ export function ConfiguracoesPage() {
         whatsappNotificationsEnabled: true,
       });
 
-      if (result.success) {
+      if (result.delivered) {
+        toast.success(`Mensagem de validação entregue no WhatsApp ${formattedPhone}!`);
+      } else if (result.success) {
         toast.success(
-          result.delivered
-            ? `Mensagem de validação enviada para ${formattedPhone}.`
-            : `Número ${formattedPhone} salvo e alerta validado (modo homologação).`
+          `Número ${formattedPhone} salvo e alerta processado (modo homologação).`
         );
       } else {
-        toast.error(result.reason || 'Falha ao disparar mensagem de teste.');
+        console.error('[Configurações][Teste WhatsApp] Falha no disparo:', result);
+        toast.error(
+          result.reason || 'Falha ao enviar mensagem de teste via Evolution API. Verifique o console para detalhes.'
+        );
       }
     } catch (err: any) {
+      console.error('[Configurações][Teste WhatsApp] Exceção:', err);
       toast.error(err.message || 'Erro ao validar alerta WhatsApp.');
     } finally {
       setTestingWhatsApp(false);
@@ -513,6 +518,9 @@ export function ConfiguracoesPage() {
         </form>
       </div>
 
+      {/* GATEWAY INSTITUCIONAL WHATSAPP (EXCLUSIVO PERFIL ADM) */}
+      {isAdmin && <WhatsAppGatewayCard />}
+
       {/* PREFERÊNCIAS DE NOTIFICAÇÃO VIA WHATSAPP */}
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
         <div className="p-6 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -586,9 +594,9 @@ export function ConfiguracoesPage() {
               </p>
             </div>
             <div className="space-y-1">
-              <p className="font-semibold text-slate-900">Lembrete Prévio de Início</p>
+              <p className="font-semibold text-slate-900">Lembrete Prévio de Início (10 Minutos)</p>
               <p className="text-slate-500 leading-relaxed">
-                Aviso enviado 15 minutos antes do início orientando o check-in presencial via QR Code.
+                Aviso enviado 10 minutos antes do início destacando o horário limite de check-in presencial via QR Code (5 min de tolerância).
               </p>
             </div>
             <div className="space-y-1">

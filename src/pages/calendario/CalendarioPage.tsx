@@ -61,7 +61,13 @@ function getDayOfWeekFromDate(dateStr: string): DayOfWeek {
  * ensuring it drops off the calendar immediately and stays exclusively in the history.
  */
 function isReservationFinished(res: { data: string; fim: string; status: string }, nowMs: number): boolean {
-  if (res.status === 'CANCELADA' || res.status === 'FINALIZADA' || res.status === 'EXPIRADA') {
+  if (
+    res.status === 'CANCELADA' ||
+    res.status === 'FINALIZADA' ||
+    res.status === 'EXPIRADA' ||
+    res.status === 'PUNIDA' ||
+    res.status === 'CONCLUIDA'
+  ) {
     return true;
   }
   if (!res.data || !res.fim) return false;
@@ -295,11 +301,15 @@ export function CalendarioPage() {
     const gradeCount = filteredEvents.filter(e => e.tipo === 'AULA_GRADE').length;
     const reservaCount = filteredEvents.filter(e => e.tipo === 'RESERVA_USUARIO').length;
     const pendingCount = filteredEvents.filter(e => e.tipo === 'RESERVA_USUARIO' && e.status === 'Pendente').length;
-    return { gradeCount, reservaCount, pendingCount };
-  }, [filteredEvents]);
+    const myReservaCount = filteredEvents.filter(
+      e => e.tipo === 'RESERVA_USUARIO' && e.usuarioId === user?.id
+    ).length;
+    return { gradeCount, reservaCount, pendingCount, myReservaCount };
+  }, [filteredEvents, user?.id]);
 
   // Action handlers
   const handleApproveReservation = async (reservationId: string) => {
+    if (!isAdmin) return;
     await updateReservation(reservationId, { status: 'CONFIRMADA' });
   };
 
@@ -308,6 +318,7 @@ export function CalendarioPage() {
   };
 
   const handleDeleteReservation = async (reservationId: string) => {
+    if (!isAdmin) return;
     await deleteReservation(reservationId);
   };
 
@@ -421,10 +432,17 @@ export function CalendarioPage() {
           </p>
           <p className="text-lg font-black text-rose-950 mt-0.5">{stats.reservaCount} ativas</p>
         </div>
-        <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs">
-          <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Pendentes ADM</p>
-          <p className="text-lg font-black text-amber-600 mt-0.5">{stats.pendingCount} para avaliar</p>
-        </div>
+        {isAdmin ? (
+          <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs">
+            <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Pendentes ADM</p>
+            <p className="text-lg font-black text-amber-600 mt-0.5">{stats.pendingCount} para avaliar</p>
+          </div>
+        ) : (
+          <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-2xs">
+            <p className="text-[10px] font-black uppercase tracking-wider text-slate-400">Minhas Reservas</p>
+            <p className="text-lg font-black text-slate-900 mt-0.5">{stats.myReservaCount} agendadas</p>
+          </div>
+        )}
       </div>
 
       {/* CALENDAR VIEW: MONTH GRID (NORMAL CALENDAR) OR WEEKLY GRID OR SINGLE DAY */}
@@ -437,8 +455,10 @@ export function CalendarioPage() {
             selectedDateStr={selectedDate}
             onSelectDate={setSelectedDate}
             events={filteredEvents}
+            rooms={availableRooms}
+            selectedRoomId={selectedRoomId}
             onSelectEvent={setSelectedEvent}
-            onNewReservationOnDate={(dateStr, startTime) => {
+            onNewReservationOnDate={(dateStr, startTime, roomName) => {
               const windowCheck = isBookingWindowOpen(new Date(), isAdmin);
               if (!windowCheck.isOpen) {
                 toast.error(windowCheck.message);
@@ -455,7 +475,7 @@ export function CalendarioPage() {
               }
               setSelectedDate(dateStr);
               setBookingPrefill({
-                roomName: selectedRoomId !== 'TODAS' ? selectedRoomId : undefined,
+                roomName: roomName || (selectedRoomId !== 'TODAS' ? selectedRoomId : undefined),
                 startTime: startTime || '17:00'
               });
               setIsNewReservationOpen(true);
@@ -463,7 +483,7 @@ export function CalendarioPage() {
             selectedCourse={selectedCourse}
             selectedSemester={selectedSemester}
             isAdmin={isAdmin}
-            onApproveReservation={handleApproveReservation}
+            onApproveReservation={isAdmin ? handleApproveReservation : undefined}
             onCancelReservation={handleCancelReservation}
           />
         ) : viewMode === 'SEMANA' || selectedDay === 'TODOS' ? (
@@ -507,17 +527,21 @@ export function CalendarioPage() {
                     {dayEvents.length === 0 ? (
                       <div className="py-12 text-center text-slate-300 flex flex-col items-center justify-center">
                         <CalendarIcon className="h-6 w-6 stroke-[1.5] mb-1 opacity-50" />
-                        <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Sem atividades</p>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setBookingPrefill({});
-                            setIsNewReservationOpen(true);
-                          }}
-                          className="mt-2 text-[10px] font-bold text-fatec-red hover:underline"
-                        >
-                          + Reservar sala
-                        </button>
+                        <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                          Sem aulas na grade
+                        </p>
+                        {isAdmin && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setBookingPrefill({});
+                              setIsNewReservationOpen(true);
+                            }}
+                            className="mt-2 text-[10px] font-bold text-fatec-red hover:underline"
+                          >
+                            + Reservar sala
+                          </button>
+                        )}
                       </div>
                     ) : (
                       dayEvents.map((event) => {
@@ -592,26 +616,6 @@ export function CalendarioPage() {
                         );
                       })
                     )}
-
-                    {/* FREE TIME SLOTS IN WEEK COLUMN */}
-                    <div className="pt-2 border-t border-slate-100 mt-2">
-                      <div className="bg-sky-50/80 rounded-xl p-2 border border-sky-200/80 flex items-center justify-between gap-1">
-                        <div className="flex items-center gap-1 text-[10px] text-sky-950 font-bold">
-                          <Sparkles className="h-3 w-3 text-sky-600 shrink-0" />
-                          <span>{dia === 'Sábado' ? '11:40-13h livre' : '08h-19h livre'}</span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setBookingPrefill({ startTime: dia === 'Sábado' ? '11:40' : '14:00' });
-                            setIsNewReservationOpen(true);
-                          }}
-                          className="text-[9px] font-black text-sky-700 hover:text-sky-950 underline shrink-0"
-                        >
-                          + Reservar
-                        </button>
-                      </div>
-                    </div>
                   </div>
                 </div>
               );
@@ -765,9 +769,9 @@ export function CalendarioPage() {
         onClose={() => setSelectedEvent(null)}
         currentUser={user}
         roomDetails={rooms.find(r => selectedEvent && (r.nome.toLowerCase().includes(selectedEvent.sala.toLowerCase()) || selectedEvent.sala.toLowerCase().includes(r.nome.toLowerCase())))}
-        onApproveReservation={handleApproveReservation}
+        onApproveReservation={isAdmin ? handleApproveReservation : undefined}
         onCancelReservation={handleCancelReservation}
-        onDeleteReservation={handleDeleteReservation}
+        onDeleteReservation={isAdmin ? handleDeleteReservation : undefined}
         onRequestRoomBooking={handleRequestRoomBooking}
       />
 
@@ -796,7 +800,9 @@ export function CalendarioPage() {
                 </div>
                 <div>
                   <h3 className="text-base font-black text-slate-900">Alterar Minha Turma</h3>
-                  <p className="text-xs text-slate-500">Atualize seu curso e semestre matriculado</p>
+                  <p className="text-xs text-slate-500">
+                    {isAdmin ? 'Atualize curso e semestre da grade' : 'Atualize o seu semestre matriculado'}
+                  </p>
                 </div>
               </div>
               <button
@@ -813,14 +819,27 @@ export function CalendarioPage() {
                 <label className="text-xs font-black uppercase tracking-wider text-slate-700">
                   Curso Fatec:
                 </label>
-                <select
-                  value={editCourse}
-                  onChange={(e) => setEditCourse(e.target.value as CalendarCourse)}
-                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-medium text-slate-800 text-sm focus:ring-2 focus:ring-fatec-red outline-none"
-                >
-                  <option value="GTI">GTI - Gestão da Tecnologia da Informação</option>
-                  <option value="GEEE">GEEE - Gestão de Energia e Eficiência Energética</option>
-                </select>
+                {isAdmin ? (
+                  <select
+                    value={editCourse}
+                    onChange={(e) => setEditCourse(e.target.value as CalendarCourse)}
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-medium text-slate-800 text-sm focus:ring-2 focus:ring-fatec-red outline-none"
+                  >
+                    <option value="GTI">GTI - Gestão da Tecnologia da Informação</option>
+                    <option value="GEEE">GEEE - Gestão de Energia e Eficiência Energética</option>
+                  </select>
+                ) : (
+                  <div className="space-y-1">
+                    <div className="w-full p-3 bg-slate-100 border border-slate-200 rounded-xl font-semibold text-slate-600 text-sm">
+                      {(user?.curso || selectedCourse) === 'GEEE'
+                        ? 'GEEE - Gestão de Energia e Eficiência Energética'
+                        : 'GTI - Gestão da Tecnologia da Informação'}
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      O curso é fixado no cadastro e alterado exclusivamente pelo perfil ADM.
+                    </p>
+                  </div>
+                )}
               </div>
 
               <div className="space-y-1.5">
@@ -859,11 +878,15 @@ export function CalendarioPage() {
                 type="button"
                 onClick={async () => {
                   try {
-                    await updateProfile({ curso: editCourse, semestre: editSemester });
-                    setSelectedCourse(editCourse);
+                    if (isAdmin) {
+                      await updateProfile({ curso: editCourse, semestre: editSemester });
+                      setSelectedCourse(editCourse);
+                    } else {
+                      await updateProfile({ semestre: editSemester });
+                    }
                     setSelectedSemester(editSemester);
                     setIsEditEnrollmentOpen(false);
-                    toast.success('Turma e semestre atualizados com sucesso!');
+                    toast.success('Semestre atualizado com sucesso!');
                   } catch (err) {
                     toast.error('Erro ao atualizar matrícula.');
                   }

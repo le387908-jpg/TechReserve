@@ -20,12 +20,9 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Room, CalendarCourse, User as UserType, CalendarEvent } from '../../../types';
 import { useReservationStore } from '../../../store/useReservationStore';
 import { useScheduleStore } from '../../../store/useScheduleStore';
+import { useAvailableSlotsStore } from '../../../store/useAvailableSlotsStore';
 import { usePunishmentStore } from '../../../store/usePunishmentStore';
-import {
-  checkReservationConflict,
-  calculateDayTimeSlots,
-  getReservableFreeSlots,
-} from '../../../utils/calendarTimeSlots';
+import { checkReservationConflict } from '../../../utils/calendarTimeSlots';
 import {
   validateReservationRules,
   isBookingWindowOpen,
@@ -36,8 +33,10 @@ import {
   checkWeeklyQuotaLocal,
   formatNoShowTag,
   getReleasedBlocksForRoomOnDate,
+  getRoomScheduleSlotsForDate,
   isSpaceReleasedByAdmin,
 } from '../../../services/reservationService';
+import { RoomSlotSelector } from '../../../components/reservations/RoomSlotSelector';
 import { formatDataBR, createSafeLocalDateTime } from '../../../utils/dateUtils';
 import { cn } from '../../../lib/utils';
 import { toast } from 'sonner';
@@ -71,12 +70,13 @@ export function NewReservationModal({
   const reservations = useReservationStore((state) => state.reservations);
   const scheduleConfig = useScheduleStore((state) => state.config);
   const scheduleExceptions = useScheduleStore((state) => state.exceptions);
+  const availableSlots = useAvailableSlotsStore((state) => state.slots);
   const punishments = usePunishmentStore((state) => state.punishments);
   const activePunishment = usePunishmentStore((state) => state.activePunishment);
 
   const isAdmin = currentUser?.role === 'ADMIN';
 
-  // Usuários comuns SÓ visualizam e agendam salas liberadas explicitamente pelo ADM
+  // Usuários comuns SÓ visualizam salas liberadas explicitamente pelo ADM
   const availableRooms = React.useMemo(() => {
     if (isAdmin) return rooms;
     return rooms.filter((r) => isSpaceReleasedByAdmin(r).released);
@@ -94,10 +94,11 @@ export function NewReservationModal({
     initialRoomName || (availableRooms[0]?.nome ?? '')
   );
   const [date, setDate] = useState(initialDate || dateLimits.minDate);
-  const [startTime, setStartTime] = useState(
-    initialStartTime || scheduleConfig.janelaInicio || '17:00'
+  const [startTime, setStartTime] = useState('');
+  const [endTime, setEndTime] = useState('');
+  const [selectedAvailableSlotId, setSelectedAvailableSlotId] = useState<string | undefined>(
+    undefined
   );
-  const [endTime, setEndTime] = useState('18:40');
   const [curso, setCurso] = useState<CalendarCourse>(initialCourse);
   const [semestre, setSemestre] = useState<number>(initialSemester);
   const [motivo, setMotivo] = useState('Reunião de Projeto (TechReserve)');
@@ -114,9 +115,24 @@ export function NewReservationModal({
         selectedRoomObj,
         date,
         scheduleConfig,
-        scheduleExceptions
+        scheduleExceptions,
+        new Date(),
+        availableSlots
       ),
-    [selectedRoomObj, date, scheduleConfig, scheduleExceptions]
+    [selectedRoomObj, date, scheduleConfig, scheduleExceptions, availableSlots]
+  );
+
+  const slotScheduleView = React.useMemo(
+    () =>
+      getRoomScheduleSlotsForDate({
+        room: selectedRoomObj,
+        dateISO: date,
+        config: scheduleConfig,
+        exceptions: scheduleExceptions,
+        availableSlots,
+        reservations,
+      }),
+    [selectedRoomObj, date, scheduleConfig, scheduleExceptions, availableSlots, reservations]
   );
 
   const quotaCheck = React.useMemo(() => {
@@ -140,38 +156,62 @@ export function NewReservationModal({
           ? initialDate
           : limits.minDate;
       setDate(validInitial);
-      const rel = getReleasedBlocksForRoomOnDate(
-        chosenRoom,
-        validInitial,
-        scheduleConfig,
-        scheduleExceptions
-      );
-      const matchedBlock = initialStartTime
-        ? rel.blocks.find((b) => b.inicio === initialStartTime)
-        : rel.blocks[0];
-      setStartTime(matchedBlock?.inicio || (isAdmin ? initialStartTime || '17:00' : ''));
-      setEndTime(matchedBlock?.fim || (isAdmin ? '18:40' : ''));
+
+      const initialView = getRoomScheduleSlotsForDate({
+        room: chosenRoom,
+        dateISO: validInitial,
+        config: scheduleConfig,
+        exceptions: scheduleExceptions,
+        availableSlots,
+        reservations,
+      });
+      const reservable = initialView.slots.filter((s) => s.selectableForUser);
+      const matched = initialStartTime
+        ? reservable.find((s) => s.inicio === initialStartTime)
+        : reservable[0];
+
+      if (matched) {
+        setStartTime(matched.inicio);
+        setEndTime(matched.fim);
+        setSelectedAvailableSlotId(matched.availableSlotId);
+      } else if (isAdmin) {
+        setStartTime(initialStartTime || scheduleConfig.janelaInicio || '17:00');
+        setEndTime('17:50');
+        setSelectedAvailableSlotId(undefined);
+      } else {
+        setStartTime('');
+        setEndTime('');
+        setSelectedAvailableSlotId(undefined);
+      }
+
       if (initialCourse) setCurso(initialCourse);
       if (initialSemester) setSemestre(initialSemester);
     }
   }, [isOpen]);
 
-  // Ajusta o bloco automaticamente quando o usuário troca a sala ou a data
+  // Ajusta automaticamente o slot selecionado ao trocar sala, data ou quando o ADM altera `available_slots`
   React.useEffect(() => {
     if (!isOpen) return;
-    if (blockRelease.blocks.length > 0) {
-      const valid = blockRelease.blocks.some(
-        (b) => b.inicio === startTime && b.fim === endTime
+    const reservable = slotScheduleView.slots.filter((s) => s.selectableForUser);
+    if (reservable.length > 0) {
+      const stillValid = reservable.find(
+        (s) => s.inicio === startTime && s.fim === endTime
       );
-      if (!valid) {
-        setStartTime(blockRelease.blocks[0].inicio);
-        setEndTime(blockRelease.blocks[0].fim);
+      if (stillValid) {
+        if (selectedAvailableSlotId !== stillValid.availableSlotId) {
+          setSelectedAvailableSlotId(stillValid.availableSlotId);
+        }
+      } else if (!isAdmin || !startTime || !endTime) {
+        setStartTime(reservable[0].inicio);
+        setEndTime(reservable[0].fim);
+        setSelectedAvailableSlotId(reservable[0].availableSlotId);
       }
     } else if (!isAdmin) {
       setStartTime('');
       setEndTime('');
+      setSelectedAvailableSlotId(undefined);
     }
-  }, [date, selectedRoomObj?.firestoreId, blockRelease.blocks, isAdmin, isOpen]);
+  }, [date, selectedRoomObj?.firestoreId, slotScheduleView.slots, isAdmin, isOpen]);
 
   const conflictCheck = React.useMemo(() => {
     if (!existingEvents.length || !date || !startTime || !endTime || !selectedRoomName) {
@@ -180,37 +220,25 @@ export function NewReservationModal({
     return checkReservationConflict(existingEvents, date, selectedRoomName, startTime, endTime);
   }, [existingEvents, date, selectedRoomName, startTime, endTime]);
 
-  const roomSlots = React.useMemo(() => {
-    if (!existingEvents.length || !date || !selectedRoomName) {
-      return { occupiedSlots: [], freeSlots: [], allSlotsChronological: [] };
-    }
-    const daySlots = calculateDayTimeSlots(date, existingEvents, selectedRoomName);
-    const reservableFree = getReservableFreeSlots(
-      daySlots.freeSlots,
-      date,
-      selectedRoomObj?.firestoreId
-    );
-    return {
-      ...daySlots,
-      freeSlots: reservableFree,
-    };
-  }, [
-    existingEvents,
-    date,
-    selectedRoomName,
-    selectedRoomObj?.firestoreId,
-    scheduleConfig,
-    scheduleExceptions,
-  ]);
-
   if (!isOpen) return null;
 
-  const isUserBlockedOnSelection =
+  const isUserBlockedByQuotaOrNoShow =
     !isAdmin &&
     (availableRooms.length === 0 ||
-      !blockRelease.released ||
       noShowCheck.blocked ||
       Boolean(quotaCheck && !quotaCheck.allowed));
+
+  const isSubmitDisabled =
+    isSubmitting ||
+    conflictCheck.hasConflict ||
+    !windowStatus.isOpen ||
+    !startTime ||
+    !endTime ||
+    isUserBlockedByQuotaOrNoShow ||
+    (!isAdmin &&
+      (!blockRelease.released ||
+        slotScheduleView.reservableCount === 0 ||
+        !selectedAvailableSlotId));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -233,10 +261,10 @@ export function NewReservationModal({
         toast.error(quotaCheck.error);
         return;
       }
-      if (!blockRelease.released) {
+      if (!blockRelease.released || !selectedAvailableSlotId) {
         toast.error(
           blockRelease.reason ||
-            'Esta sala não possui horários liberados pelo ADM para esta data.'
+            'Indisponível - Aguardando liberação da coordenação para esta sala nesta data.'
         );
         return;
       }
@@ -279,6 +307,7 @@ export function NewReservationModal({
         data: date,
         inicio: startTime,
         fim: endTime,
+        availableSlotId: isAdmin ? undefined : selectedAvailableSlotId,
         status: isAdmin ? 'CONFIRMADA' : 'PENDENTE',
         checkInExpiracao: isAdmin ? null : startDateTime.getTime() + 5 * 60 * 1000,
         checkInRealizado: isAdmin,
@@ -323,7 +352,7 @@ export function NewReservationModal({
             <p className="text-xs font-semibold text-red-300 mb-1">Agendamento Acadêmico</p>
             <h3 className="text-xl font-bold text-white">Reservar Espaço / Laboratório</h3>
             <p className="text-xs text-slate-400 mt-1">
-              Sujeito às salas e blocos liberados pelo ADM e à cota de 1 reserva por semana.
+              Sujeito aos horários explicitamente liberados pela coordenação e à cota de 1 reserva por semana.
             </p>
           </div>
 
@@ -369,14 +398,6 @@ export function NewReservationModal({
                   </p>
                 </div>
               </div>
-            ) : !isAdmin && !blockRelease.released ? (
-              <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl flex items-start gap-2.5 text-xs text-rose-900">
-                <AlertCircle className="h-4 w-4 text-fatec-red shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-bold text-rose-950">Horários Indisponíveis</p>
-                  <p className="mt-0.5 text-rose-800">{blockRelease.reason}</p>
-                </div>
-              </div>
             ) : (
               <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-2xl space-y-1 text-xs text-slate-600">
                 <div className="flex items-center justify-between font-bold text-slate-800">
@@ -396,11 +417,7 @@ export function NewReservationModal({
                   </span>
                   <span aria-hidden="true">·</span>
                   <span>
-                    Janela: <strong>{blockRelease.janelaInicio}–{blockRelease.janelaFim}</strong>
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    Até: <strong>{formatDataBR(dateLimits.maxDate)}</strong>
+                    Antecedência até: <strong>{formatDataBR(dateLimits.maxDate)}</strong>
                   </span>
                 </div>
               </div>
@@ -410,7 +427,7 @@ export function NewReservationModal({
             <div>
               <label className="text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
                 <Building2 className="h-3.5 w-3.5 text-slate-400" />
-                Sala ou Laboratório Liberado
+                Sala ou Laboratório
               </label>
               <select
                 value={selectedRoomName}
@@ -428,11 +445,11 @@ export function NewReservationModal({
               </select>
             </div>
 
-            {/* SELEÇÃO RÁPIDA DE DATA (HOJE / AMANHÃ) */}
-            <div className="space-y-1.5">
+            {/* SELEÇÃO DE DATA (HOJE / AMANHÃ / CALENDÁRIO) */}
+            <div className="space-y-2">
               <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
                 <Calendar className="h-3.5 w-3.5 text-fatec-red" />
-                Dia do Agendamento
+                Data da Consulta / Agendamento
               </label>
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -464,109 +481,65 @@ export function NewReservationModal({
                   </span>
                 </button>
               </div>
+              <input
+                type="date"
+                value={date}
+                min={dateLimits.minDate}
+                max={isAdmin ? undefined : dateLimits.maxDate}
+                onChange={(e) => setDate(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-fatec-red"
+                required
+              />
             </div>
 
-            {/* DATA & HORÁRIOS */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label className="text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
-                  <Calendar className="h-3.5 w-3.5 text-slate-400" />
-                  Data
-                </label>
-                <input
-                  type="date"
-                  value={date}
-                  min={dateLimits.minDate}
-                  max={isAdmin ? undefined : dateLimits.maxDate}
-                  onChange={(e) => setDate(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-fatec-red"
-                  required
-                />
-              </div>
+            {/* SELETOR DE HORÁRIOS FILTRADO PELA COLEÇÃO `available_slots` */}
+            <RoomSlotSelector
+              room={selectedRoomObj}
+              date={date}
+              selectedStartTime={startTime}
+              selectedEndTime={endTime}
+              onSelectSlot={(slot) => {
+                setStartTime(slot.inicio);
+                setEndTime(slot.fim);
+                setSelectedAvailableSlotId(slot.availableSlotId);
+              }}
+              disabledByUserRule={isUserBlockedByQuotaOrNoShow}
+              isAdmin={isAdmin}
+            />
 
-              <div>
-                <label className="text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
-                  <Clock className="h-3.5 w-3.5 text-slate-400" />
-                  Início
-                </label>
-                <input
-                  type="time"
-                  value={startTime}
-                  readOnly={!isAdmin}
-                  min={isAdmin ? undefined : blockRelease.janelaInicio}
-                  max={isAdmin ? undefined : blockRelease.janelaFim}
-                  onChange={(e) => isAdmin && setStartTime(e.target.value)}
-                  className={cn(
-                    'w-full border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold focus:outline-none',
-                    isAdmin
-                      ? 'bg-slate-50 text-slate-800 focus:ring-2 focus:ring-fatec-red'
-                      : 'bg-slate-100 text-slate-700 cursor-default'
-                  )}
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
-                  <Clock className="h-3.5 w-3.5 text-slate-400" />
-                  Término
-                </label>
-                <input
-                  type="time"
-                  value={endTime}
-                  readOnly={!isAdmin}
-                  min={isAdmin ? undefined : blockRelease.janelaInicio}
-                  max={isAdmin ? undefined : blockRelease.janelaFim}
-                  onChange={(e) => isAdmin && setEndTime(e.target.value)}
-                  className={cn(
-                    'w-full border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold focus:outline-none',
-                    isAdmin
-                      ? 'bg-slate-50 text-slate-800 focus:ring-2 focus:ring-fatec-red'
-                      : 'bg-slate-100 text-slate-700 cursor-default'
-                  )}
-                  required
-                />
-              </div>
-            </div>
-
-            {/* BLOCOS PEDAGÓGICOS LIBERADOS PELO ADM */}
-            {blockRelease.blocks.length > 0 && (
-              <div className="space-y-1.5 bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-700">
-                    Blocos Liberados pelo ADM
-                  </span>
-                  <span className="text-[11px] text-slate-500">
-                    {isUserBlockedOnSelection ? 'Seleção bloqueada' : 'Clique para selecionar'}
-                  </span>
+            {/* HORÁRIOS MANUAIS EXCLUSIVOS PARA PERFIL ADM */}
+            {isAdmin && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
+                    <Clock className="h-3.5 w-3.5 text-slate-400" />
+                    Início (ADM)
+                  </label>
+                  <input
+                    type="time"
+                    value={startTime}
+                    onChange={(e) => setStartTime(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-fatec-red"
+                    required
+                  />
                 </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {blockRelease.blocks.map((blk) => (
-                    <button
-                      key={blk.id}
-                      type="button"
-                      disabled={isUserBlockedOnSelection}
-                      onClick={() => {
-                        setStartTime(blk.inicio);
-                        setEndTime(blk.fim);
-                      }}
-                      className={cn(
-                        'px-2.5 py-1.5 rounded-lg border text-[11px] font-mono tabular-nums font-semibold transition-colors',
-                        isUserBlockedOnSelection
-                          ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
-                          : startTime === blk.inicio && endTime === blk.fim
-                          ? 'bg-slate-900 border-slate-900 text-white cursor-pointer'
-                          : 'bg-white hover:bg-slate-100 border-slate-200 text-slate-800 cursor-pointer'
-                      )}
-                    >
-                      {blk.inicio}–{blk.fim}
-                    </button>
-                  ))}
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
+                    <Clock className="h-3.5 w-3.5 text-slate-400" />
+                    Término (ADM)
+                  </label>
+                  <input
+                    type="time"
+                    value={endTime}
+                    onChange={(e) => setEndTime(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono tabular-nums font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-fatec-red"
+                    required
+                  />
                 </div>
               </div>
             )}
 
-            {/* REAL-TIME CONFLICT ALERT / AVAILABILITY STATUS */}
+            {/* ALERTA DE CONFLITO OU CONFIRMAÇÃO DO HORÁRIO LIBERADO SELECIONADO */}
             {conflictCheck.hasConflict ? (
               <div className="p-3 bg-rose-50 border border-rose-200 rounded-2xl flex items-start gap-2.5 text-xs text-rose-900">
                 <AlertCircle className="h-4 w-4 text-fatec-red shrink-0 mt-0.5" />
@@ -577,38 +550,14 @@ export function NewReservationModal({
                   </p>
                 </div>
               </div>
-            ) : !isUserBlockedOnSelection && startTime && endTime && startTime < endTime ? (
+            ) : !isSubmitDisabled && startTime && endTime && startTime < endTime ? (
               <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-2 text-xs text-emerald-900 font-medium">
                 <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
                 <span>
-                  <strong>Horário Livre:</strong> Sala disponível das {startTime} às {endTime}.
+                  <strong>Horário Liberado Selecionado:</strong> {startTime} às {endTime}.
                 </span>
               </div>
             ) : null}
-
-            {/* AULAS E RESERVAS OCUPADAS NA DATA */}
-            {roomSlots.occupiedSlots.length > 0 && (
-              <div className="space-y-1.5 bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
-                <span className="text-xs font-semibold text-slate-600 block">
-                  Aulas e reservas já agendadas nesta sala na data:
-                </span>
-                <div className="space-y-1">
-                  {roomSlots.occupiedSlots.map((occ) => (
-                    <div
-                      key={occ.id}
-                      className="text-xs text-slate-700 flex items-center justify-between bg-white px-2.5 py-1.5 rounded-lg border border-slate-200/60"
-                    >
-                      <span className="font-semibold truncate max-w-[220px] text-[11px]">
-                        {occ.title}
-                      </span>
-                      <span className="font-mono tabular-nums font-bold text-slate-800 text-[11px] shrink-0">
-                        {occ.start} às {occ.end}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
 
             {/* CURSO & SEMESTRE VINCULADOS */}
             <div className="grid grid-cols-2 gap-3">
@@ -673,17 +622,10 @@ export function NewReservationModal({
               </button>
               <button
                 type="submit"
-                disabled={
-                  isSubmitting ||
-                  conflictCheck.hasConflict ||
-                  !windowStatus.isOpen ||
-                  isUserBlockedOnSelection
-                }
+                disabled={isSubmitDisabled}
                 className={cn(
                   'px-5 py-2.5 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 whitespace-nowrap shrink-0',
-                  conflictCheck.hasConflict ||
-                    !windowStatus.isOpen ||
-                    isUserBlockedOnSelection
+                  isSubmitDisabled
                     ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                     : 'bg-fatec-red hover:bg-red-800 text-white cursor-pointer'
                 )}

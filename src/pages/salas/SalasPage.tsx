@@ -28,6 +28,11 @@ import { useRoomStore } from '../../store/useRoomStore';
 import { useAuthStore } from '../../store/useAuthStore';
 import { useReservationStore } from '../../store/useReservationStore';
 import { useScheduleStore } from '../../store/useScheduleStore';
+import {
+  isSlotActiveOrReleased,
+  matchesSlotRoom,
+  useAvailableSlotsStore,
+} from '../../store/useAvailableSlotsStore';
 import { usePunishmentStore } from '../../store/usePunishmentStore';
 import { useLogStore } from '../../store/useLogStore';
 import {
@@ -46,13 +51,17 @@ import {
   getReservationDateLimits,
 } from '../../utils/reservationRules';
 import {
+  UNAVAILABLE_AWAITING_RELEASE_LABEL,
   checkNoShowSuspensionForDate,
   checkWeeklyQuotaLocal,
   formatNoShowTag,
+  getCurriculumClassesForRoomOnDate,
   getReleasedBlocksForRoomOnDate,
+  getRoomScheduleSlotsForDate,
   getUserNoShowBlockedDate,
   isSpaceReleasedByAdmin,
 } from '../../services/reservationService';
+import { RoomSlotSelector } from '../../components/reservations/RoomSlotSelector';
 import { formatDataBR, createSafeLocalDateTime } from '../../utils/dateUtils';
 
 const FLOORS = ['Térreo', '1º andar', '2º andar'];
@@ -88,9 +97,18 @@ export function SalasPage() {
   const activePunishment = usePunishmentStore((state) => state.activePunishment);
   const fetchUserPunishments = usePunishmentStore((state) => state.fetchUserPunishments);
 
-  // Subscribe to schedule config & exceptions so booking modal reacts immediately to ADM changes
+  // Subscribe to schedule config, exceptions & explicit `available_slots` so UI reacts immediately
   const scheduleConfig = useScheduleStore((state) => state.config);
   const scheduleExceptions = useScheduleStore((state) => state.exceptions);
+  const availableSlots = useAvailableSlotsStore((state) => state.slots);
+  const fetchAvailableSlots = useAvailableSlotsStore((state) => state.fetchAvailableSlots);
+  const setSlotReleaseStatus = useAvailableSlotsStore((state) => state.setSlotReleaseStatus);
+  const releaseMultipleSlotsForRoomAndDate = useAvailableSlotsStore(
+    (state) => state.releaseMultipleSlotsForRoomAndDate
+  );
+  const blockAllSlotsForRoomAndDate = useAvailableSlotsStore(
+    (state) => state.blockAllSlotsForRoomAndDate
+  );
 
   const isAdmin = user?.role === 'ADMIN';
   const effectivePunishments = React.useMemo(() => {
@@ -103,13 +121,22 @@ export function SalasPage() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingRoom, setEditingRoom] = useState<Room | null>(null);
   const [bookingRoom, setBookingRoom] = useState<Room | null>(null);
+  const [slotAdminRoom, setSlotAdminRoom] = useState<Room | null>(null);
+  const [slotAdminDate, setSlotAdminDate] = useState<string>('');
+  const [customSlotStart, setCustomSlotStart] = useState('14:00');
+  const [customSlotEnd, setCustomSlotEnd] = useState('14:50');
+  const [customSlotLabel, setCustomSlotLabel] = useState('');
+  const [isUpdatingSlotAdmin, setIsUpdatingSlotAdmin] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const dateLimits = getReservationDateLimits(now);
   const windowStatus = isBookingWindowOpen(now, isAdmin);
   const [selectedBookingDate, setSelectedBookingDate] = useState(dateLimits.minDate);
-  const [bookingStartTime, setBookingStartTime] = useState(scheduleConfig.janelaInicio || '17:00');
-  const [bookingEndTime, setBookingEndTime] = useState('18:40');
+  const [bookingStartTime, setBookingStartTime] = useState('');
+  const [bookingEndTime, setBookingEndTime] = useState('');
+  const [selectedAvailableSlotId, setSelectedAvailableSlotId] = useState<string | undefined>(
+    undefined
+  );
 
   // Cota semanal atual (Segunda a Domingo) e status de No-Show do usuário logado
   const currentWeekQuota = React.useMemo(() => {
@@ -147,24 +174,36 @@ export function SalasPage() {
     }
     const currentLimits = getReservationDateLimits(new Date());
     const initialDate =
-      !isAdmin && userBlockedDate === currentLimits.todayStr && currentLimits.tomorrowStr <= currentLimits.maxDate
+      !isAdmin &&
+      userBlockedDate === currentLimits.todayStr &&
+      currentLimits.tomorrowStr <= currentLimits.maxDate
         ? currentLimits.tomorrowStr
         : currentLimits.minDate;
 
-    const releaseInfo = getReleasedBlocksForRoomOnDate(
+    const slotView = getRoomScheduleSlotsForDate({
       room,
-      initialDate,
-      scheduleConfig,
-      scheduleExceptions,
-      new Date()
-    );
+      dateISO: initialDate,
+      config: scheduleConfig,
+      exceptions: scheduleExceptions,
+      availableSlots,
+      reservations,
+      now: new Date(),
+    });
+    const firstReservable = slotView.slots.find((s) => s.selectableForUser);
+
     setSelectedBookingDate(initialDate);
-    if (releaseInfo.blocks.length > 0) {
-      setBookingStartTime(releaseInfo.blocks[0].inicio);
-      setBookingEndTime(releaseInfo.blocks[0].fim);
+    if (firstReservable) {
+      setBookingStartTime(firstReservable.inicio);
+      setBookingEndTime(firstReservable.fim);
+      setSelectedAvailableSlotId(firstReservable.availableSlotId);
+    } else if (isAdmin) {
+      setBookingStartTime(scheduleConfig.janelaInicio || '17:00');
+      setBookingEndTime('17:50');
+      setSelectedAvailableSlotId(undefined);
     } else {
       setBookingStartTime('');
       setBookingEndTime('');
+      setSelectedAvailableSlotId(undefined);
     }
     setBookingRoom(room);
   };
@@ -176,9 +215,24 @@ export function SalasPage() {
         selectedBookingDate,
         scheduleConfig,
         scheduleExceptions,
-        now
+        now,
+        availableSlots
       ),
-    [bookingRoom, selectedBookingDate, scheduleConfig, scheduleExceptions, now]
+    [bookingRoom, selectedBookingDate, scheduleConfig, scheduleExceptions, now, availableSlots]
+  );
+
+  const bookingSlotView = React.useMemo(
+    () =>
+      getRoomScheduleSlotsForDate({
+        room: bookingRoom,
+        dateISO: selectedBookingDate,
+        config: scheduleConfig,
+        exceptions: scheduleExceptions,
+        availableSlots,
+        reservations,
+        now,
+      }),
+    [bookingRoom, selectedBookingDate, scheduleConfig, scheduleExceptions, availableSlots, reservations, now]
   );
 
   const selectedDateQuota = React.useMemo(() => {
@@ -191,51 +245,48 @@ export function SalasPage() {
     [user, effectivePunishments, selectedBookingDate]
   );
 
-  // Atualiza automaticamente o bloco selecionado quando o usuário troca a data no modal
+  // Atualiza automaticamente a seleção quando o usuário troca a data ou quando o ADM libera/bloqueia slots em tempo real
   useEffect(() => {
     if (!bookingRoom) return;
-    const rel = getReleasedBlocksForRoomOnDate(
-      bookingRoom,
-      selectedBookingDate,
-      scheduleConfig,
-      scheduleExceptions
-    );
-    if (rel.blocks.length > 0) {
-      const stillValid = rel.blocks.some(
-        (b) => b.inicio === bookingStartTime && b.fim === bookingEndTime
+    const reservableList = bookingSlotView.slots.filter((s) => s.selectableForUser);
+    if (reservableList.length > 0) {
+      const currentValid = reservableList.find(
+        (s) => s.inicio === bookingStartTime && s.fim === bookingEndTime
       );
-      if (!stillValid) {
-        setBookingStartTime(rel.blocks[0].inicio);
-        setBookingEndTime(rel.blocks[0].fim);
+      if (currentValid) {
+        if (selectedAvailableSlotId !== currentValid.availableSlotId) {
+          setSelectedAvailableSlotId(currentValid.availableSlotId);
+        }
+      } else if (!isAdmin || !bookingStartTime || !bookingEndTime) {
+        setBookingStartTime(reservableList[0].inicio);
+        setBookingEndTime(reservableList[0].fim);
+        setSelectedAvailableSlotId(reservableList[0].availableSlotId);
       }
     } else if (!isAdmin) {
       setBookingStartTime('');
       setBookingEndTime('');
+      setSelectedAvailableSlotId(undefined);
     }
-  }, [selectedBookingDate, bookingRoom, scheduleConfig, scheduleExceptions, isAdmin]);
-
-  const existingBookingsForSelectedDate = bookingRoom
-    ? reservations
-        .filter(
-          (r) =>
-            (r.salaId === bookingRoom.firestoreId || r.salaInstitutionalId === bookingRoom.id) &&
-            r.data === selectedBookingDate &&
-            (r.status === 'PENDENTE' || r.status === 'CONFIRMADA')
-        )
-        .sort((a, b) => a.inicio.localeCompare(b.inicio))
-    : [];
+  }, [
+    selectedBookingDate,
+    bookingRoom,
+    bookingSlotView.slots,
+    isAdmin,
+  ]);
 
   useEffect(() => {
     const unsubRooms = fetchRooms();
     const unsubReservations = fetchReservations();
+    const unsubAvailable = fetchAvailableSlots();
     const unsubUserPunishments =
       user && !isAdmin ? fetchUserPunishments(user.id) : () => {};
     return () => {
       unsubRooms();
       unsubReservations();
+      unsubAvailable();
       unsubUserPunishments();
     };
-  }, [fetchRooms, fetchReservations, fetchUserPunishments, user?.id, isAdmin]);
+  }, [fetchRooms, fetchReservations, fetchAvailableSlots, fetchUserPunishments, user?.id, isAdmin]);
 
   // Automatic standardization restricted strictly to ADMIN clients to respect Firestore write rules
   useEffect(() => {
@@ -342,6 +393,7 @@ export function SalasPage() {
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    if (!isAdmin) return;
     const formData = new FormData(e.currentTarget);
 
     const roomData: any = {
@@ -361,15 +413,13 @@ export function SalasPage() {
       imagem: (formData.get('imagem') as string) || DEFAULT_ROOM_COVER,
     };
 
-    if (isAdmin) {
-      roomData.liberadaParaReserva = formData.get('liberadaParaReserva') === 'on';
-      const blockDate = formData.get('bloqueadaAteDate') as string;
-      const blockTime = formData.get('bloqueadaAteTime') as string;
-      if (blockDate && blockTime) {
-        roomData.bloqueadaAte = new Date(`${blockDate}T${blockTime}`).getTime();
-      } else {
-        roomData.bloqueadaAte = null;
-      }
+    roomData.liberadaParaReserva = formData.get('liberadaParaReserva') === 'on';
+    const blockDate = formData.get('bloqueadaAteDate') as string;
+    const blockTime = formData.get('bloqueadaAteTime') as string;
+    if (blockDate && blockTime) {
+      roomData.bloqueadaAte = new Date(`${blockDate}T${blockTime}`).getTime();
+    } else {
+      roomData.bloqueadaAte = null;
     }
 
     try {
@@ -389,6 +439,7 @@ export function SalasPage() {
   };
 
   const handleConfirmDelete = async (room: Room) => {
+    if (!isAdmin) return;
     try {
       await deleteRoom(room.firestoreId, room.nome);
       setConfirmDeleteId(null);
@@ -501,6 +552,7 @@ export function SalasPage() {
         data: date,
         inicio: startTime,
         fim: endTime,
+        availableSlotId: isAdmin ? undefined : selectedAvailableSlotId,
         status: isAdmin ? 'CONFIRMADA' : 'PENDENTE',
         checkInExpiracao: isAdmin ? null : startDateTime.getTime() + 5 * 60 * 1000,
         checkInRealizado: isAdmin,
@@ -683,6 +735,24 @@ export function SalasPage() {
                     const rt = resolveRoomRealtimeStatus(room, reservations, now);
                     const isMaintenance = rt.status === 'MANUTENCAO';
 
+                    const todaySchedule = getRoomScheduleSlotsForDate({
+                      room,
+                      dateISO: dateLimits.todayStr,
+                      config: scheduleConfig,
+                      exceptions: scheduleExceptions,
+                      availableSlots,
+                      reservations,
+                      now,
+                    });
+
+                    const upcomingReleasedCount = availableSlots.filter(
+                      (slot) =>
+                        matchesSlotRoom(slot, room) &&
+                        slot.data >= dateLimits.todayStr &&
+                        (isAdmin || slot.data <= dateLimits.maxDate) &&
+                        isSlotActiveOrReleased(slot)
+                    ).length;
+
                     let countdownText = '';
                     if (rt.currentReservation) {
                       const endTimeObj = createSafeLocalDateTime(
@@ -722,20 +792,39 @@ export function SalasPage() {
                             </h4>
                           </div>
 
-                          <span
-                            className={cn(
-                              'text-xs font-semibold shrink-0',
-                              rt.status === 'DISPONIVEL'
-                                ? 'text-emerald-700'
-                                : rt.status === 'RESERVADO'
-                                ? 'text-amber-700'
-                                : rt.status === 'EM_USO'
-                                ? 'text-fatec-red'
-                                : 'text-slate-600'
-                            )}
-                          >
-                            {REALTIME_SPACE_STATUS_LABELS[rt.status]}
-                          </span>
+                          {isAdmin ? (
+                            <span
+                              className={cn(
+                                'text-xs font-semibold shrink-0',
+                                rt.status === 'DISPONIVEL'
+                                  ? 'text-emerald-700'
+                                  : rt.status === 'RESERVADO'
+                                  ? 'text-amber-700'
+                                  : rt.status === 'EM_USO'
+                                  ? 'text-fatec-red'
+                                  : 'text-slate-600'
+                              )}
+                            >
+                              {REALTIME_SPACE_STATUS_LABELS[rt.status]}
+                            </span>
+                          ) : isMaintenance ? (
+                            <span className="text-xs font-semibold shrink-0 text-slate-600">
+                              Em Manutenção
+                            </span>
+                          ) : rt.status === 'EM_USO' ? (
+                            <span className="text-xs font-semibold shrink-0 text-fatec-red">
+                              Em Uso
+                            </span>
+                          ) : todaySchedule.reservableCount > 0 || upcomingReleasedCount > 0 ? (
+                            <span className="text-xs font-semibold shrink-0 text-emerald-700">
+                              Horários Liberados
+                            </span>
+                          ) : (
+                            <span className="text-xs font-semibold shrink-0 text-slate-500 flex items-center gap-1">
+                              <Lock className="h-3 w-3" />
+                              Bloqueado
+                            </span>
+                          )}
                         </div>
 
                         <p className="text-xs text-slate-500 leading-relaxed line-clamp-2">
@@ -751,6 +840,31 @@ export function SalasPage() {
                           <Wifi className="h-3.5 w-3.5 text-slate-400" />
                           <span>Wi-Fi</span>
                         </div>
+
+                        {/* INDICADOR DE LIBERAÇÃO DE HORÁRIOS (`available_slots`) */}
+                        {!isMaintenance && !rt.currentReservation && (
+                          todaySchedule.reservableCount > 0 ? (
+                            <div className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 flex items-center justify-between gap-2">
+                              <span className="font-semibold">Liberados hoje:</span>
+                              <span className="font-mono tabular-nums font-bold">
+                                {todaySchedule.reservableCount}{' '}
+                                {todaySchedule.reservableCount === 1 ? 'horário' : 'horários'}
+                              </span>
+                            </div>
+                          ) : upcomingReleasedCount > 0 ? (
+                            <div className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 flex items-center justify-between gap-2">
+                              <span className="font-semibold">Próximas datas:</span>
+                              <span className="font-mono tabular-nums font-bold">
+                                {upcomingReleasedCount} liberado(s)
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-slate-600 bg-slate-100 border border-slate-200 rounded-xl px-3 py-2 flex items-center gap-1.5">
+                              <Lock className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                              <span className="truncate">{UNAVAILABLE_AWAITING_RELEASE_LABEL}</span>
+                            </div>
+                          )
+                        )}
 
                         {rt.currentReservation && countdownText && (
                           <div className="text-xs text-rose-800 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2 flex items-center justify-between">
@@ -774,9 +888,22 @@ export function SalasPage() {
                           </div>
                         )}
 
-                        {/* CONTROLES RÁPIDOS ADM (LIBERAÇÃO P/ USUÁRIOS + MANUTENÇÃO + EDITAR + EXCLUIR) */}
+                        {/* CONTROLES RÁPIDOS ADM (LIBERAR SLOTS + VISIBILIDADE + MANUTENÇÃO + EDITAR + EXCLUIR) */}
                         {isAdmin && (
                           <div className="pt-3 border-t border-slate-100 space-y-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSlotAdminRoom(room);
+                                setSlotAdminDate(dateLimits.todayStr);
+                              }}
+                              className="w-full px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white transition-colors cursor-pointer"
+                              title="Liberar ou bloquear horários específicos para esta sala no Firestore (available_slots)"
+                            >
+                              <Clock className="h-3.5 w-3.5 text-emerald-400" />
+                              Liberar Horários por Data
+                            </button>
+
                             <div className="flex items-center justify-between gap-2">
                               <button
                                 type="button"
@@ -785,8 +912,8 @@ export function SalasPage() {
                                     await toggleRoomBookingRelease(room);
                                     toast.success(
                                       room.liberadaParaReserva === false
-                                        ? `${room.nome} liberada para reservas de usuários.`
-                                        : `${room.nome} bloqueada para reservas de usuários.`
+                                        ? `${room.nome} liberada para visualização de usuários.`
+                                        : `${room.nome} ocultada para usuários.`
                                     );
                                   } catch {
                                     toast.error('Erro ao alterar liberação da sala.');
@@ -798,7 +925,7 @@ export function SalasPage() {
                                     ? 'bg-slate-100 text-slate-700 hover:bg-slate-200 border-slate-300'
                                     : 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100 border-emerald-200'
                                 )}
-                                title="Controla se usuários comuns podem visualizar e agendar esta sala"
+                                title="Controla se usuários comuns podem visualizar esta sala"
                               >
                                 {room.liberadaParaReserva === false ? (
                                   <>
@@ -808,7 +935,7 @@ export function SalasPage() {
                                 ) : (
                                   <>
                                     <Unlock className="h-3.5 w-3.5" />
-                                    Liberada p/ Reserva
+                                    Visível p/ Usuários
                                   </>
                                 )}
                               </button>
@@ -900,10 +1027,18 @@ export function SalasPage() {
                             'w-full py-3 rounded-xl font-semibold text-xs transition-colors whitespace-nowrap shrink-0',
                             isMaintenance
                               ? 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
+                              : !isAdmin && todaySchedule.reservableCount === 0 && upcomingReleasedCount === 0
+                              ? 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200 cursor-pointer'
                               : 'bg-slate-900 text-white hover:bg-fatec-red cursor-pointer'
                           )}
                         >
-                          {isMaintenance ? 'Em Manutenção / Suspenso' : 'Solicitar Reserva'}
+                          {isMaintenance
+                            ? 'Em Manutenção / Suspenso'
+                            : isAdmin
+                            ? 'Reservar (ADM)'
+                            : todaySchedule.reservableCount > 0 || upcomingReleasedCount > 0
+                            ? 'Selecionar Horário Liberado'
+                            : 'Consultar Grade e Horários'}
                         </button>
                       </div>
                     );
@@ -986,33 +1121,13 @@ export function SalasPage() {
                       </p>
                     </div>
                   </div>
-                ) : !blockRelease.released && !isAdmin ? (
-                  <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl flex items-start gap-2.5 text-xs text-rose-900">
-                    <AlertCircle className="h-4 w-4 text-fatec-red shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-bold text-rose-950">Horários Não Liberados pelo ADM</p>
-                      <p className="mt-0.5 text-rose-800">{blockRelease.reason}</p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600 space-y-1">
-                    <div className="flex items-center gap-1.5 font-semibold text-slate-900">
-                      <Clock className="h-3.5 w-3.5 text-fatec-red" />
-                      Janela Operacional Vigente
-                    </div>
-                    <p className="font-mono tabular-nums text-[11px]">
-                      Horários liberados das <strong>{blockRelease.janelaInicio}</strong> às{' '}
-                      <strong>{blockRelease.janelaFim}</strong> · Antecedência até{' '}
-                      <strong>{formatDataBR(dateLimits.maxDate)}</strong>.
-                    </p>
-                  </div>
-                )}
+                ) : null}
 
                 <div className="space-y-3">
                   <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
                       <Calendar className="h-3.5 w-3.5 text-slate-400" />
-                      Data da Reserva
+                      Data da Consulta / Reserva
                     </label>
 
                     <div className="grid grid-cols-2 gap-2">
@@ -1060,130 +1175,66 @@ export function SalasPage() {
                     />
                   </div>
 
-                  {/* BLOCOS DE HORÁRIOS LIBERADOS PELO ADM */}
-                  {blockRelease.blocks.length > 0 ? (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-semibold text-slate-700">
-                          Blocos Liberados pelo ADM
-                        </span>
-                        <span className="text-[11px] text-slate-400">
-                          {!isAdmin &&
-                          (selectedDateNoShow.blocked ||
-                            (selectedDateQuota && !selectedDateQuota.allowed))
-                            ? 'Seleção bloqueada'
-                            : 'Selecione um bloco'}
-                        </span>
+                  {/* SELETOR FILTRADO POR `available_slots` (BLOQUEIO PADRÃO + LIBERAÇÃO DO ADM) */}
+                  <RoomSlotSelector
+                    room={bookingRoom}
+                    date={selectedBookingDate}
+                    selectedStartTime={bookingStartTime}
+                    selectedEndTime={bookingEndTime}
+                    onSelectSlot={(slot) => {
+                      setBookingStartTime(slot.inicio);
+                      setBookingEndTime(slot.fim);
+                      setSelectedAvailableSlotId(slot.availableSlotId);
+                    }}
+                    disabledByUserRule={
+                      !isAdmin &&
+                      (selectedDateNoShow.blocked ||
+                        Boolean(selectedDateQuota && !selectedDateQuota.allowed))
+                    }
+                    isAdmin={isAdmin}
+                  />
+
+                  {/* CAMPOS MANUAIS DE HORÁRIO APENAS PARA ADM */}
+                  {isAdmin ? (
+                    <div className="grid grid-cols-2 gap-3 pt-1">
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-semibold text-slate-700">
+                          Início (ADM)
+                        </label>
+                        <input
+                          name="startTime"
+                          type="time"
+                          required
+                          value={bookingStartTime}
+                          onChange={(e) => setBookingStartTime(e.target.value)}
+                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-fatec-red font-mono tabular-nums text-xs font-semibold"
+                        />
                       </div>
-                      <div className="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
-                        {blockRelease.blocks.map((blk) => {
-                          const isTaken = existingBookingsForSelectedDate.some(
-                            (r) => blk.inicio < r.fim && blk.fim > r.inicio
-                          );
-                          const isBlockedByRule =
-                            !isAdmin &&
-                            (selectedDateNoShow.blocked ||
-                              Boolean(selectedDateQuota && !selectedDateQuota.allowed));
-                          const isDisabled = isTaken || isBlockedByRule;
-                          const isSelected =
-                            bookingStartTime === blk.inicio && bookingEndTime === blk.fim;
-                          return (
-                            <button
-                              key={blk.id}
-                              type="button"
-                              disabled={isDisabled}
-                              onClick={() => {
-                                setBookingStartTime(blk.inicio);
-                                setBookingEndTime(blk.fim);
-                              }}
-                              className={cn(
-                                'px-2.5 py-2 rounded-xl border text-left text-xs transition-colors',
-                                isTaken
-                                  ? 'bg-slate-100 border-slate-200 text-slate-400 line-through cursor-not-allowed'
-                                  : isBlockedByRule
-                                  ? 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
-                                  : isSelected
-                                  ? 'bg-slate-900 border-slate-900 text-white'
-                                  : 'bg-white border-slate-200 text-slate-800 hover:bg-slate-50 cursor-pointer'
-                              )}
-                            >
-                              <span className="block font-semibold truncate text-[11px]">
-                                {blk.label}
-                              </span>
-                              <span className="font-mono tabular-nums text-[11px] opacity-85">
-                                {blk.inicio} – {blk.fim}
-                              </span>
-                            </button>
-                          );
-                        })}
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-semibold text-slate-700">
+                          Término (ADM)
+                        </label>
+                        <input
+                          name="endTime"
+                          type="time"
+                          required
+                          value={bookingEndTime}
+                          onChange={(e) => setBookingEndTime(e.target.value)}
+                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-fatec-red font-mono tabular-nums text-xs font-semibold"
+                        />
                       </div>
                     </div>
                   ) : (
-                    !isAdmin && (
-                      <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600">
-                        Nenhum bloco de horário ativo foi liberado pelo ADM para esta sala na data selecionada.
+                    bookingStartTime &&
+                    bookingEndTime && (
+                      <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between text-xs text-emerald-950">
+                        <span className="font-semibold">Horário selecionado:</span>
+                        <span className="font-mono tabular-nums font-bold">
+                          {bookingStartTime} às {bookingEndTime}
+                        </span>
                       </div>
                     )
                   )}
-
-                  {existingBookingsForSelectedDate.length > 0 && (
-                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-1.5">
-                      <p className="text-xs font-semibold text-slate-700">
-                        Horários já reservados nesta data:
-                      </p>
-                      <div className="flex flex-wrap gap-1.5 font-mono tabular-nums text-xs text-slate-700">
-                        {existingBookingsForSelectedDate.map((res) => (
-                          <span
-                            key={res.id}
-                            className="bg-white border border-slate-200 px-2.5 py-1 rounded-lg"
-                          >
-                            {res.inicio} – {res.fim}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold text-slate-700">Início</label>
-                      <input
-                        name="startTime"
-                        type="time"
-                        required
-                        readOnly={!isAdmin}
-                        value={bookingStartTime}
-                        min={isAdmin ? undefined : blockRelease.janelaInicio}
-                        max={isAdmin ? undefined : blockRelease.janelaFim}
-                        onChange={(e) => isAdmin && setBookingStartTime(e.target.value)}
-                        className={cn(
-                          'w-full px-3.5 py-2.5 border border-slate-200 rounded-xl outline-none font-mono tabular-nums text-xs font-semibold',
-                          isAdmin
-                            ? 'bg-slate-50 focus:ring-2 focus:ring-fatec-red'
-                            : 'bg-slate-100 text-slate-700 cursor-default'
-                        )}
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold text-slate-700">Término</label>
-                      <input
-                        name="endTime"
-                        type="time"
-                        required
-                        readOnly={!isAdmin}
-                        value={bookingEndTime}
-                        min={isAdmin ? undefined : blockRelease.janelaInicio}
-                        max={isAdmin ? undefined : blockRelease.janelaFim}
-                        onChange={(e) => isAdmin && setBookingEndTime(e.target.value)}
-                        className={cn(
-                          'w-full px-3.5 py-2.5 border border-slate-200 rounded-xl outline-none font-mono tabular-nums text-xs font-semibold',
-                          isAdmin
-                            ? 'bg-slate-50 focus:ring-2 focus:ring-fatec-red'
-                            : 'bg-slate-100 text-slate-700 cursor-default'
-                        )}
-                      />
-                    </div>
-                  </div>
                 </div>
 
                 {!isAdmin && (
@@ -1207,16 +1258,24 @@ export function SalasPage() {
                     type="submit"
                     disabled={
                       !windowStatus.isOpen ||
+                      !bookingStartTime ||
+                      !bookingEndTime ||
                       (!isAdmin &&
                         (!blockRelease.released ||
+                          bookingSlotView.reservableCount === 0 ||
+                          !selectedAvailableSlotId ||
                           selectedDateNoShow.blocked ||
                           Boolean(selectedDateQuota && !selectedDateQuota.allowed)))
                     }
                     className={cn(
                       'px-5 py-2.5 rounded-xl font-semibold text-xs transition-colors whitespace-nowrap shrink-0',
                       !windowStatus.isOpen ||
+                        !bookingStartTime ||
+                        !bookingEndTime ||
                         (!isAdmin &&
                           (!blockRelease.released ||
+                            bookingSlotView.reservableCount === 0 ||
+                            !selectedAvailableSlotId ||
                             selectedDateNoShow.blocked ||
                             Boolean(selectedDateQuota && !selectedDateQuota.allowed)))
                         ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
@@ -1232,9 +1291,348 @@ export function SalasPage() {
         )}
       </AnimatePresence>
 
-      {/* MODAL CRUD DE AMBIENTE */}
+      {/* MODAL RÁPIDO ADM: LIBERAÇÃO DE HORÁRIOS (`available_slots`) POR SALA E DATA */}
       <AnimatePresence>
-        {isModalOpen && (
+        {slotAdminRoom && isAdmin && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+          >
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setSlotAdminRoom(null)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-xs"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="relative w-full max-w-lg bg-white rounded-2xl border border-slate-200 shadow-2xl overflow-hidden p-6 max-h-[90vh] overflow-y-auto custom-scrollbar space-y-5"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-fatec-red">
+                    Liberação de Horários (available_slots)
+                  </span>
+                  <h3 className="text-lg font-bold text-slate-900 mt-0.5">
+                    {slotAdminRoom.nome}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Por padrão, todos os horários ficam bloqueados para alunos até serem liberados aqui para a data escolhida.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSlotAdminRoom(null)}
+                  className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              {/* SELETOR DE DATA ADM */}
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-700 block">
+                  Data para Liberação / Bloqueio
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSlotAdminDate(dateLimits.todayStr)}
+                    className={cn(
+                      'py-2 px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer',
+                      slotAdminDate === dateLimits.todayStr
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                    )}
+                  >
+                    Hoje ({formatDataBR(dateLimits.todayStr).slice(0, 5)})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSlotAdminDate(dateLimits.tomorrowStr)}
+                    className={cn(
+                      'py-2 px-3 rounded-xl text-xs font-semibold border transition-colors cursor-pointer',
+                      slotAdminDate === dateLimits.tomorrowStr
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                    )}
+                  >
+                    Amanhã ({formatDataBR(dateLimits.tomorrowStr).slice(0, 5)})
+                  </button>
+                  <input
+                    type="date"
+                    value={slotAdminDate}
+                    min={dateLimits.todayStr}
+                    onChange={(e) => setSlotAdminDate(e.target.value)}
+                    className="px-2.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono tabular-nums font-semibold outline-none focus:ring-2 focus:ring-fatec-red"
+                  />
+                </div>
+              </div>
+
+              {(() => {
+                const adminView = getRoomScheduleSlotsForDate({
+                  room: slotAdminRoom,
+                  dateISO: slotAdminDate,
+                  config: scheduleConfig,
+                  exceptions: scheduleExceptions,
+                  availableSlots,
+                  reservations,
+                  now,
+                });
+                const classesOnDate = getCurriculumClassesForRoomOnDate(
+                  slotAdminRoom,
+                  slotAdminDate
+                );
+
+                return (
+                  <div className="space-y-4">
+                    {/* AÇÕES EM LOTE */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                      <span className="text-xs font-semibold text-slate-700">
+                        {formatDataBR(slotAdminDate)}: {adminView.reservableCount} liberado(s)
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isUpdatingSlotAdmin}
+                          onClick={async () => {
+                            const freeCandidates = adminView.slots
+                              .filter(
+                                (s) =>
+                                  s.state !== 'OCUPADO_AULA' && s.state !== 'OCUPADO_RESERVA'
+                              )
+                              .map((s) => ({
+                                inicio: s.inicio,
+                                fim: s.fim,
+                                label: s.label,
+                              }));
+                            if (freeCandidates.length === 0) {
+                              toast.error('Não há faixas livres de aula para liberar nesta data.');
+                              return;
+                            }
+                            setIsUpdatingSlotAdmin(true);
+                            try {
+                              const count = await releaseMultipleSlotsForRoomAndDate({
+                                room: slotAdminRoom,
+                                data: slotAdminDate,
+                                blocks: freeCandidates,
+                              });
+                              toast.success(
+                                `${count} horário(s) liberado(s) para ${slotAdminRoom.nome} em ${formatDataBR(
+                                  slotAdminDate
+                                )}.`
+                              );
+                            } catch {
+                              toast.error('Erro ao liberar horários em lote.');
+                            } finally {
+                              setIsUpdatingSlotAdmin(false);
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+                        >
+                          Liberar Todos s/ Aula
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isUpdatingSlotAdmin}
+                          onClick={async () => {
+                            setIsUpdatingSlotAdmin(true);
+                            try {
+                              await blockAllSlotsForRoomAndDate({
+                                room: slotAdminRoom,
+                                data: slotAdminDate,
+                              });
+                              toast.success(
+                                `Horários bloqueados para ${slotAdminRoom.nome} em ${formatDataBR(
+                                  slotAdminDate
+                                )}.`
+                              );
+                            } catch {
+                              toast.error('Erro ao bloquear horários.');
+                            } finally {
+                              setIsUpdatingSlotAdmin(false);
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-semibold cursor-pointer disabled:opacity-50"
+                        >
+                          Bloquear Todos
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* LISTA DE FAIXAS HORÁRIAS */}
+                    <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1 custom-scrollbar">
+                      {adminView.slots.map((slot) => {
+                        const isReleased =
+                          slot.rawAvailableSlot &&
+                          isSlotActiveOrReleased(slot.rawAvailableSlot);
+                        const isClass = slot.state === 'OCUPADO_AULA';
+                        const isBooked = slot.state === 'OCUPADO_RESERVA';
+
+                        return (
+                          <div
+                            key={slot.key}
+                            className={cn(
+                              'px-3 py-2.5 rounded-xl border flex items-center justify-between gap-3 text-xs',
+                              isClass
+                                ? 'bg-emerald-50/50 border-emerald-200 text-emerald-950'
+                                : isBooked
+                                ? 'bg-rose-50/60 border-rose-200 text-rose-950'
+                                : isReleased
+                                ? 'bg-emerald-50 border-emerald-300 text-slate-900'
+                                : 'bg-white border-slate-200 text-slate-700'
+                            )}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono tabular-nums font-bold">
+                                  {slot.inicio} – {slot.fim}
+                                </span>
+                                <span className="text-[11px] opacity-80 truncate">
+                                  {slot.label}
+                                </span>
+                              </div>
+                              <p className="text-[11px] opacity-75 truncate mt-0.5">
+                                {isClass
+                                  ? slot.statusDetail
+                                  : isBooked
+                                  ? 'Já possui reserva ativa nesta data'
+                                  : isReleased
+                                  ? 'Status: Liberado para agendamento de alunos'
+                                  : 'Status: Bloqueado (padrão)'}
+                              </p>
+                            </div>
+
+                            {!isClass && (
+                              <button
+                                type="button"
+                                disabled={isUpdatingSlotAdmin}
+                                onClick={async () => {
+                                  setIsUpdatingSlotAdmin(true);
+                                  try {
+                                    await setSlotReleaseStatus({
+                                      room: slotAdminRoom,
+                                      data: slotAdminDate,
+                                      inicio: slot.inicio,
+                                      fim: slot.fim,
+                                      label: slot.label,
+                                      release: !isReleased,
+                                    });
+                                    toast.success(
+                                      !isReleased
+                                        ? `Horário ${slot.inicio}–${slot.fim} liberado!`
+                                        : `Horário ${slot.inicio}–${slot.fim} bloqueado.`
+                                    );
+                                  } catch {
+                                    toast.error('Falha ao atualizar horário.');
+                                  } finally {
+                                    setIsUpdatingSlotAdmin(false);
+                                  }
+                                }}
+                                className={cn(
+                                  'px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 transition-colors cursor-pointer disabled:opacity-50',
+                                  isReleased
+                                    ? 'bg-amber-100 hover:bg-amber-200 text-amber-900'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                )}
+                              >
+                                {isReleased ? 'Bloquear' : 'Liberar'}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* ADICIONAR E LIBERAR HORÁRIO PERSONALIZADO */}
+                    <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5">
+                      <p className="text-xs font-bold text-slate-800">
+                        Liberar Horário Específico / Extra
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <input
+                          type="time"
+                          value={customSlotStart}
+                          onChange={(e) => setCustomSlotStart(e.target.value)}
+                          className="px-2.5 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono tabular-nums font-semibold"
+                        />
+                        <input
+                          type="time"
+                          value={customSlotEnd}
+                          onChange={(e) => setCustomSlotEnd(e.target.value)}
+                          className="px-2.5 py-2 bg-white border border-slate-200 rounded-lg text-xs font-mono tabular-nums font-semibold"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Rótulo opcional"
+                          value={customSlotLabel}
+                          onChange={(e) => setCustomSlotLabel(e.target.value)}
+                          className="px-2.5 py-2 bg-white border border-slate-200 rounded-lg text-xs"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isUpdatingSlotAdmin}
+                        onClick={async () => {
+                          if (!customSlotStart || !customSlotEnd || customSlotStart >= customSlotEnd) {
+                            toast.error('Informe um intervalo de início e término válido.');
+                            return;
+                          }
+                          const hasClass = classesOnDate.find(
+                            (aula) =>
+                              customSlotStart < aula.horarioFim &&
+                              customSlotEnd > aula.horarioInicio
+                          );
+                          if (hasClass) {
+                            toast.error(
+                              `Conflito com aula regular (${hasClass.materia}: ${hasClass.horarioInicio}–${hasClass.horarioFim}).`
+                            );
+                            return;
+                          }
+                          setIsUpdatingSlotAdmin(true);
+                          try {
+                            await setSlotReleaseStatus({
+                              room: slotAdminRoom,
+                              data: slotAdminDate,
+                              inicio: customSlotStart,
+                              fim: customSlotEnd,
+                              label:
+                                customSlotLabel.trim() ||
+                                `Horário Extra ${customSlotStart}–${customSlotEnd}`,
+                              release: true,
+                            });
+                            setCustomSlotLabel('');
+                            toast.success(
+                              `Horário ${customSlotStart}–${customSlotEnd} liberado em ${formatDataBR(
+                                slotAdminDate
+                              )}.`
+                            );
+                          } catch {
+                            toast.error('Erro ao liberar horário personalizado.');
+                          } finally {
+                            setIsUpdatingSlotAdmin(false);
+                          }
+                        }}
+                        className="w-full py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+                      >
+                        + Criar e Liberar Horário nesta Data
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL CRUD DE AMBIENTE (EXCLUSIVO PERFIL ADM) */}
+      <AnimatePresence>
+        {isModalOpen && isAdmin && (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center p-4"
             role="dialog"

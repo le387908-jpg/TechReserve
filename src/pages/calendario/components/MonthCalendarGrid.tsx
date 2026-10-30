@@ -4,27 +4,30 @@
  */
 
 import React from 'react';
-import { 
-  ChevronLeft, 
-  ChevronRight, 
-  Calendar as CalendarIcon, 
-  Clock, 
-  Building2, 
-  Plus, 
-  CheckCircle2, 
-  GraduationCap, 
+import {
+  ChevronLeft,
+  ChevronRight,
+  Calendar as CalendarIcon,
+  Clock,
+  Building2,
+  Plus,
+  CheckCircle2,
+  GraduationCap,
   User,
-  Sparkles,
-  Layers,
-  ArrowRight,
-  Sun,
-  Sunset,
-  Moon,
-  AlertCircle
+  Lock,
+  Unlock,
 } from 'lucide-react';
-import { CalendarEvent, DayOfWeek, CalendarCourse } from '../../../types';
+import { CalendarEvent, DayOfWeek, CalendarCourse, Room } from '../../../types';
 import { cn } from '../../../lib/utils';
-import { calculateDayTimeSlots, DayTimeSlot } from '../../../utils/calendarTimeSlots';
+import { calculateDayTimeSlots, timeToMinutes } from '../../../utils/calendarTimeSlots';
+import { useAvailableSlotsStore } from '../../../store/useAvailableSlotsStore';
+import { useReservationStore } from '../../../store/useReservationStore';
+import { useScheduleStore } from '../../../store/useScheduleStore';
+import {
+  getRoomScheduleSlotsForDate,
+  RoomScheduleSlotView,
+  UNAVAILABLE_AWAITING_RELEASE_LABEL,
+} from '../../../services/reservationService';
 
 interface MonthCalendarGridProps {
   currentDate: Date;
@@ -32,8 +35,10 @@ interface MonthCalendarGridProps {
   selectedDateStr: string; // YYYY-MM-DD
   onSelectDate: (dateStr: string) => void;
   events: CalendarEvent[];
+  rooms: Room[];
+  selectedRoomId: string;
   onSelectEvent: (event: CalendarEvent) => void;
-  onNewReservationOnDate: (dateStr: string, startTime?: string) => void;
+  onNewReservationOnDate: (dateStr: string, startTime?: string, roomName?: string) => void;
   selectedCourse: CalendarCourse;
   selectedSemester: number;
   isAdmin: boolean;
@@ -67,14 +72,20 @@ export function MonthCalendarGrid({
   selectedDateStr,
   onSelectDate,
   events,
+  rooms,
+  selectedRoomId,
   onSelectEvent,
   onNewReservationOnDate,
   selectedCourse,
   selectedSemester,
   isAdmin,
   onApproveReservation,
-  onCancelReservation,
 }: MonthCalendarGridProps) {
+  const availableSlots = useAvailableSlotsStore((state) => state.slots);
+  const reservations = useReservationStore((state) => state.reservations);
+  const scheduleConfig = useScheduleStore((state) => state.config);
+  const scheduleExceptions = useScheduleStore((state) => state.exceptions);
+
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
 
@@ -151,12 +162,10 @@ export function MonthCalendarGrid({
 
   // Map events to dateStrings
   const eventsForDate = (dateString: string, dayOfWeek: DayOfWeek | null) => {
-    return events.filter(evt => {
-      // If it's a reservation, it must match the exact date
+    return events.filter((evt) => {
       if (evt.tipo === 'RESERVA_USUARIO') {
         return evt.data === dateString;
       }
-      // If it's a fixed curriculum class, it occurs on this day of week
       if (evt.tipo === 'AULA_GRADE' && dayOfWeek) {
         return evt.diaSemana === dayOfWeek;
       }
@@ -174,7 +183,7 @@ export function MonthCalendarGrid({
 
   const selectedDateEvents = React.useMemo(() => {
     if (!selectedDateStr) return [];
-    return eventsForDate(selectedDateStr, selectedDayOfWeek).sort((a, b) => 
+    return eventsForDate(selectedDateStr, selectedDayOfWeek).sort((a, b) =>
       a.horarioInicio.localeCompare(b.horarioInicio)
     );
   }, [selectedDateStr, selectedDayOfWeek, events]);
@@ -183,8 +192,61 @@ export function MonthCalendarGrid({
     if (!selectedDateStr) {
       return { occupiedSlots: [], freeSlots: [], allSlotsChronological: [] };
     }
-    return calculateDayTimeSlots(selectedDateStr, events);
-  }, [selectedDateStr, events]);
+    return calculateDayTimeSlots(
+      selectedDateStr,
+      events,
+      selectedRoomId !== 'TODAS' ? selectedRoomId : undefined
+    );
+  }, [selectedDateStr, events, selectedRoomId]);
+
+  // Calcula estritamente os horários liberados pelo ADM em `available_slots` para a data selecionada
+  const releasedSlotsForSelectedDate = React.useMemo(() => {
+    if (!selectedDateStr || selectedDateStr < todayStr) return [];
+
+    const scopedRooms =
+      selectedRoomId !== 'TODAS'
+        ? rooms.filter((r) => {
+            const cleanFilter = selectedRoomId.toLowerCase().trim();
+            const cleanName = r.nome.toLowerCase().trim();
+            return cleanName.includes(cleanFilter) || cleanFilter.includes(cleanName);
+          })
+        : rooms;
+
+    const results: { room: Room; slot: RoomScheduleSlotView }[] = [];
+
+    for (const room of scopedRooms) {
+      const scheduleView = getRoomScheduleSlotsForDate({
+        room,
+        dateISO: selectedDateStr,
+        config: scheduleConfig,
+        exceptions: scheduleExceptions,
+        availableSlots,
+        reservations,
+      });
+
+      for (const slot of scheduleView.slots) {
+        if (slot.selectableForUser) {
+          results.push({ room, slot });
+        }
+      }
+    }
+
+    return results.sort((a, b) => {
+      if (a.slot.inicio !== b.slot.inicio) {
+        return a.slot.inicio.localeCompare(b.slot.inicio);
+      }
+      return a.room.nome.localeCompare(b.room.nome);
+    });
+  }, [
+    selectedDateStr,
+    todayStr,
+    rooms,
+    selectedRoomId,
+    scheduleConfig,
+    scheduleExceptions,
+    availableSlots,
+    reservations,
+  ]);
 
   return (
     <div className="space-y-4">
@@ -204,7 +266,7 @@ export function MonthCalendarGrid({
               </span>
             </div>
             <p className="text-xs text-slate-500 font-medium">
-              Calendário acadêmico e reservas de salas em tempo real
+              Grade acadêmica regular e ocupação de espaços em tempo real
             </p>
           </div>
         </div>
@@ -239,16 +301,16 @@ export function MonthCalendarGrid({
         </div>
       </div>
 
-      {/* 7-COLUMN MONTH GRID (Formato de Calendário Tradicional) */}
+      {/* 7-COLUMN MONTH GRID */}
       <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
         {/* WEEKDAYS HEADER */}
         <div className="grid grid-cols-7 border-b border-slate-200 bg-slate-50/80 text-center">
           {WEEKDAYS.map((day, idx) => (
-            <div 
-              key={day} 
+            <div
+              key={day}
               className={cn(
-                "py-3 text-xs font-black tracking-wider uppercase",
-                idx === 0 ? "text-slate-400" : "text-slate-700"
+                'py-3 text-xs font-black tracking-wider uppercase',
+                idx === 0 ? 'text-slate-400' : 'text-slate-700'
               )}
             >
               {day}
@@ -263,50 +325,52 @@ export function MonthCalendarGrid({
             const isSelected = cell.dateString === selectedDateStr;
             const isSunday = cell.dayOfWeek === null;
 
-            // Separate classes and reservations
-            const gradeClasses = dayEvents.filter(e => e.tipo === 'AULA_GRADE');
-            const userReservations = dayEvents.filter(e => e.tipo === 'RESERVA_USUARIO');
+            const gradeClasses = dayEvents.filter((e) => e.tipo === 'AULA_GRADE');
+            const userReservations = dayEvents.filter((e) => e.tipo === 'RESERVA_USUARIO');
 
             return (
               <div
                 key={cell.dateString + index}
                 onClick={() => onSelectDate(cell.dateString)}
                 className={cn(
-                  "min-h-[105px] md:min-h-[120px] p-2 md:p-2.5 transition-all relative flex flex-col justify-between group cursor-pointer",
-                  cell.isCurrentMonth ? "bg-white hover:bg-slate-50/80" : "bg-slate-50/40 opacity-40 hover:opacity-75",
-                  isSelected && "ring-2 ring-inset ring-fatec-red bg-rose-50/20",
-                  cell.isToday && "bg-amber-50/30"
+                  'min-h-[105px] md:min-h-[120px] p-2 md:p-2.5 transition-all relative flex flex-col justify-between group cursor-pointer',
+                  cell.isCurrentMonth
+                    ? 'bg-white hover:bg-slate-50/80'
+                    : 'bg-slate-50/40 opacity-40 hover:opacity-75',
+                  isSelected && 'ring-2 ring-inset ring-fatec-red bg-rose-50/20',
+                  cell.isToday && 'bg-amber-50/30'
                 )}
               >
-                {/* CELL TOP: DATE NUMBER & BADGES */}
+                {/* CELL TOP: DATE NUMBER & ADM QUICK ACTION */}
                 <div className="flex items-center justify-between mb-1.5">
                   <span
                     className={cn(
-                      "text-xs font-bold h-6 w-6 rounded-full flex items-center justify-center transition-all",
+                      'text-xs font-bold h-6 w-6 rounded-full flex items-center justify-center transition-all tabular-nums',
                       cell.isToday
-                        ? "bg-fatec-red text-white font-black shadow-xs"
+                        ? 'bg-fatec-red text-white font-black shadow-xs'
                         : isSelected
-                        ? "bg-slate-900 text-white font-black"
+                        ? 'bg-slate-900 text-white font-black'
                         : cell.isCurrentMonth
-                        ? "text-slate-800"
-                        : "text-slate-400"
+                        ? 'text-slate-800'
+                        : 'text-slate-400'
                     )}
                   >
                     {cell.dayNum}
                   </span>
 
-                  {/* QUICK RESERVATION BUTTON ON CELL HOVER */}
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onNewReservationOnDate(cell.dateString);
-                    }}
-                    className="opacity-0 group-hover:opacity-100 p-1 rounded-md bg-slate-100 hover:bg-fatec-red hover:text-white text-slate-500 transition-all"
-                    title={`Reservar sala em ${cell.dateString}`}
-                  >
-                    <Plus className="h-3 w-3" />
-                  </button>
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onNewReservationOnDate(cell.dateString);
+                      }}
+                      className="opacity-0 group-hover:opacity-100 p-1 rounded-md bg-slate-100 hover:bg-fatec-red hover:text-white text-slate-500 transition-all"
+                      title={`Reservar sala em ${cell.dateString}`}
+                    >
+                      <Plus className="h-3 w-3" />
+                    </button>
+                  )}
                 </div>
 
                 {/* EVENTS PREVIEWS (CHIPS) */}
@@ -323,29 +387,34 @@ export function MonthCalendarGrid({
                       title={`${res.materia} (${res.horarioInicio} às ${res.horarioFim}) - ${res.sala}`}
                     >
                       <span className="h-1.5 w-1.5 rounded-full bg-fatec-red shrink-0" />
-                      <span className="font-mono text-[8.5px] font-black text-rose-800 shrink-0">{res.horarioInicio}-{res.horarioFim}</span>
+                      <span className="font-mono text-[8.5px] font-black text-rose-800 shrink-0 tabular-nums">
+                        {res.horarioInicio}-{res.horarioFim}
+                      </span>
                       <span className="truncate">{res.materia}</span>
                     </div>
                   ))}
 
                   {/* Curriculum classes (GREEN) */}
-                  {gradeClasses.slice(0, 2 - Math.min(userReservations.length, 2)).map((aula) => (
-                    <div
-                      key={aula.id}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectEvent(aula);
-                      }}
-                      className="bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/90 text-emerald-950 px-1.5 py-0.5 rounded text-[10px] font-bold truncate flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
-                      title={`${aula.materia} (${aula.horarioInicio} às ${aula.horarioFim}) - Prof. ${aula.professor}`}
-                    >
-                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 shrink-0" />
-                      <span className="font-mono text-[8.5px] font-black text-emerald-700 shrink-0">{aula.horarioInicio}-{aula.horarioFim}</span>
-                      <span className="truncate">{aula.materia}</span>
-                    </div>
-                  ))}
+                  {gradeClasses
+                    .slice(0, 2 - Math.min(userReservations.length, 2))
+                    .map((aula) => (
+                      <div
+                        key={aula.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectEvent(aula);
+                        }}
+                        className="bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/90 text-emerald-950 px-1.5 py-0.5 rounded text-[10px] font-bold truncate flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                        title={`${aula.materia} (${aula.horarioInicio} às ${aula.horarioFim}) - Prof. ${aula.professor}`}
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 shrink-0" />
+                        <span className="font-mono text-[8.5px] font-black text-emerald-700 shrink-0 tabular-nums">
+                          {aula.horarioInicio}-{aula.horarioFim}
+                        </span>
+                        <span className="truncate">{aula.materia}</span>
+                      </div>
+                    ))}
 
-                  {/* More events indicator if count > 2 */}
                   {dayEvents.length > 2 && (
                     <p className="text-[9px] font-black text-slate-500 hover:text-slate-900 pt-0.5 px-0.5">
                       +{dayEvents.length - 2} mais
@@ -353,7 +422,6 @@ export function MonthCalendarGrid({
                   )}
                 </div>
 
-                {/* BOTTOM ACCENT: EMPTY OR SUNDAY INDICATOR */}
                 {isSunday && dayEvents.length === 0 && (
                   <span className="text-[9px] text-slate-300 text-center font-medium block">
                     Sem aulas
@@ -365,7 +433,7 @@ export function MonthCalendarGrid({
         </div>
       </div>
 
-      {/* SELECTED DAY DETAILED PANEL (HORÁRIOS OCUPADOS & HORÁRIOS LIVRES) */}
+      {/* SELECTED DAY DETAILED PANEL (GRADE DE AULAS + SLOTS LIBERADOS PELO ADM) */}
       {selectedDateStr && (
         <div className="bg-white rounded-3xl border border-slate-200 p-5 md:p-6 shadow-sm space-y-6">
           {/* HEADER DO DIA SELECIONADO */}
@@ -373,7 +441,7 @@ export function MonthCalendarGrid({
             <div>
               <div className="flex items-center gap-2 mb-1">
                 <span className="text-xs font-black uppercase tracking-wider text-fatec-red">
-                  Visão Diária de Horários:
+                  Ocupação da Grade Acadêmica:
                 </span>
                 <span className="text-xs font-bold text-slate-500">
                   {selectedDayOfWeek ? `${selectedDayOfWeek}-feira` : 'Domingo (Sem expediente)'}
@@ -383,89 +451,108 @@ export function MonthCalendarGrid({
                 </span>
               </div>
               <h4 className="text-lg md:text-xl font-black text-slate-900 tracking-tight capitalize">
-                {new Date(selectedDateStr + 'T12:00:00').toLocaleDateString('pt-BR', { 
-                  weekday: 'long', 
-                  day: 'numeric', 
-                  month: 'long', 
-                  year: 'numeric' 
+                {new Date(selectedDateStr + 'T12:00:00').toLocaleDateString('pt-BR', {
+                  weekday: 'long',
+                  day: 'numeric',
+                  month: 'long',
+                  year: 'numeric',
                 })}
               </h4>
               <p className="text-xs text-slate-500 mt-0.5">
-                Consulte os horários ocupados por aulas e as janelas livres para agendamento seguro de salas.
+                Visualize a grade regular de aulas e confira os horários explicitamente liberados pela coordenação para reserva.
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={() => onNewReservationOnDate(selectedDateStr)}
-              className="px-4 py-2 rounded-2xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto"
-            >
-              <Plus className="h-4 w-4 text-fatec-red" />
-              Nova Reserva neste Dia
-            </button>
+            {isAdmin ? (
+              <button
+                type="button"
+                onClick={() => onNewReservationOnDate(selectedDateStr)}
+                className="px-4 py-2 rounded-2xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Plus className="h-4 w-4 text-fatec-red" />
+                Nova Reserva neste Dia
+              </button>
+            ) : releasedSlotsForSelectedDate.length > 0 ? (
+              <button
+                type="button"
+                onClick={() =>
+                  onNewReservationOnDate(
+                    selectedDateStr,
+                    releasedSlotsForSelectedDate[0].slot.inicio,
+                    releasedSlotsForSelectedDate[0].room.nome
+                  )
+                }
+                className="px-4 py-2 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Unlock className="h-4 w-4" />
+                Reservar Horário Liberado ({releasedSlotsForSelectedDate.length})
+              </button>
+            ) : (
+              <div className="px-3.5 py-2 rounded-2xl bg-slate-100 border border-slate-200 text-slate-500 text-xs font-semibold flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0">
+                <Lock className="h-3.5 w-3.5 text-slate-400" />
+                <span>Aguardando liberação da coordenação</span>
+              </div>
+            )}
           </div>
 
-          {/* 1. RÉGUA / BARRA VISUAL DA LINHA DO TEMPO (08:00 ÀS 22:30) */}
-          {selectedDayOfWeek !== null && (
+          {/* 1. RÉGUA DE OCUPAÇÃO DA GRADE ACADÊMICA (SOMENTE AULAS E RESERVAS ATIVAS) */}
+          {selectedDayOfWeek !== null && timeSlotsInfo.occupiedSlots.length > 0 && (
             <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200/80 space-y-2.5">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <Clock className="h-4 w-4 text-slate-600" />
                   <span className="text-xs font-black uppercase tracking-wider text-slate-800">
-                    Ocupação do Dia (08:00 às {selectedDayOfWeek === 'Sábado' ? '13:00' : '22:30'})
+                    Ocupação da Grade no Dia (08:00 às{' '}
+                    {selectedDayOfWeek === 'Sábado' ? '13:00' : '22:30'})
                   </span>
                 </div>
                 <div className="flex items-center gap-3 text-[10px] font-bold text-slate-600">
                   <span className="flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-emerald-500" />
+                    <span className="h-2.5 w-2.5 rounded-sm bg-emerald-600" />
                     Aula da Grade
                   </span>
                   <span className="flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-rose-500" />
+                    <span className="h-2.5 w-2.5 rounded-sm bg-rose-600" />
                     Reserva Ativa
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-sky-400" />
-                    Horário Livre
                   </span>
                 </div>
               </div>
 
-              {/* TIMELINE PROGRESSION BAR */}
-              <div className="h-6 w-full bg-slate-200 rounded-lg overflow-hidden flex shadow-inner">
-                {timeSlotsInfo.allSlotsChronological.map((slot) => {
-                  const totalMinutes = selectedDayOfWeek === 'Sábado' ? (13 - 8) * 60 : (22.5 - 8) * 60;
-                  const widthPercent = Math.max(4, (slot.durationMinutes / totalMinutes) * 100);
-                  const isFree = slot.type === 'LIVRE';
+              {/* TIMELINE PROGRESSION BAR (ONLY OCCUPIED BLOCKS ON NEUTRAL TRACK) */}
+              <div className="h-6 w-full bg-slate-200/80 rounded-lg overflow-hidden relative">
+                {timeSlotsInfo.occupiedSlots.map((slot) => {
+                  const minStart = 7 * 60 + 40;
+                  const maxEnd = selectedDayOfWeek === 'Sábado' ? 13 * 60 + 30 : 22 * 60 + 30;
+                  const spanMinutes = maxEnd - minStart;
+                  const sMin = Math.max(minStart, timeToMinutes(slot.start));
+                  const eMin = Math.min(maxEnd, timeToMinutes(slot.end));
+                  const leftPct = ((sMin - minStart) / spanMinutes) * 100;
+                  const widthPct = Math.max(3, ((eMin - sMin) / spanMinutes) * 100);
                   const isGrade = slot.type === 'AULA_GRADE';
 
                   return (
                     <div
                       key={slot.id}
-                      style={{ width: `${widthPercent}%` }}
+                      style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
                       className={cn(
-                        "h-full transition-all flex items-center justify-center text-[9px] font-mono font-bold px-1 truncate cursor-pointer",
-                        isFree 
-                          ? "bg-sky-400 hover:bg-sky-500 text-white" 
-                          : isGrade 
-                          ? "bg-emerald-600 hover:bg-emerald-700 text-white" 
-                          : "bg-rose-600 hover:bg-rose-700 text-white"
+                        'absolute top-0 bottom-0 transition-opacity hover:opacity-90 flex items-center justify-center text-[9px] font-mono tabular-nums font-bold px-1 truncate cursor-pointer border-r border-white/30',
+                        isGrade ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'
                       )}
-                      title={`${slot.start} às ${slot.end}: ${slot.title} (${isFree ? 'Livre' : 'Ocupado'})`}
+                      title={`${slot.start} às ${slot.end}: ${slot.title} (${slot.room || ''})`}
                       onClick={() => {
-                        if (isFree) {
-                          onNewReservationOnDate(selectedDateStr, slot.start);
-                        } else if (slot.event) {
+                        if (slot.event) {
                           onSelectEvent(slot.event);
                         }
                       }}
                     >
-                      <span className="truncate">{slot.start} - {slot.end}</span>
+                      <span className="truncate">
+                        {slot.start}-{slot.end}
+                      </span>
                     </div>
                   );
                 })}
               </div>
-              <div className="flex justify-between text-[10px] font-mono text-slate-400 px-0.5">
+              <div className="flex justify-between text-[10px] font-mono tabular-nums text-slate-400 px-0.5">
                 <span>08:00</span>
                 <span>12:00</span>
                 {selectedDayOfWeek !== 'Sábado' && (
@@ -480,101 +567,118 @@ export function MonthCalendarGrid({
             </div>
           )}
 
-          {/* 2. HORÁRIOS LIVRES SEM AULA (DISPONÍVEIS PARA RESERVA) */}
+          {/* 2. HORÁRIOS LIBERADOS PELA COORDENAÇÃO (`available_slots`) */}
           <div className="space-y-3">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <span className="h-6 w-6 rounded-lg bg-sky-100 text-sky-700 flex items-center justify-center font-bold">
-                  <Sparkles className="h-3.5 w-3.5" />
+                <span
+                  className={cn(
+                    'h-6 w-6 rounded-lg flex items-center justify-center font-bold',
+                    releasedSlotsForSelectedDate.length > 0
+                      ? 'bg-emerald-100 text-emerald-700'
+                      : 'bg-slate-100 text-slate-500'
+                  )}
+                >
+                  {releasedSlotsForSelectedDate.length > 0 ? (
+                    <Unlock className="h-3.5 w-3.5" />
+                  ) : (
+                    <Lock className="h-3.5 w-3.5" />
+                  )}
                 </span>
                 <div>
                   <h5 className="text-xs font-black uppercase tracking-wider text-slate-900">
-                    Horários Livres sem Aula (Disponíveis para Reserva)
+                    Horários Liberados pela Coordenação para Agendamento
                   </h5>
                   <p className="text-[11px] text-slate-500">
-                    Janelas de tempo sem aulas regulares da grade nem reservas cadastradas
+                    Apenas slots explicitamente liberados pelo Administrador para esta sala e data ficam disponíveis
                   </p>
                 </div>
               </div>
-              <span className="text-[10px] font-black px-2 py-0.5 rounded-md bg-sky-50 text-sky-700 border border-sky-200">
-                {timeSlotsInfo.freeSlots.length} {timeSlotsInfo.freeSlots.length === 1 ? 'intervalo livre' : 'intervalos livres'}
+              <span className="text-[11px] font-mono tabular-nums font-semibold text-slate-600">
+                {releasedSlotsForSelectedDate.length}{' '}
+                {releasedSlotsForSelectedDate.length === 1 ? 'horário liberado' : 'horários liberados'}
               </span>
             </div>
 
-            {timeSlotsInfo.freeSlots.length === 0 ? (
-              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 text-center text-slate-500 text-xs">
-                {selectedDayOfWeek === null 
-                  ? 'A instituição não possui expediente acadêmico regular aos domingos.'
-                  : 'Todos os períodos deste dia estão ocupados por aulas ou reservas ativas.'}
+            {releasedSlotsForSelectedDate.length === 0 ? (
+              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex items-start gap-3">
+                <Lock className="h-4 w-4 text-slate-400 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <p className="text-xs font-bold text-slate-700">
+                    {UNAVAILABLE_AWAITING_RELEASE_LABEL}
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    Por padrão, nenhum horário é exibido como livre. O agendamento somente é habilitado quando a coordenação libera explicitamente o horário e a sala para esta data.
+                  </p>
+                </div>
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {timeSlotsInfo.freeSlots.map((slot) => {
-                  const isMorning = slot.start < '12:00';
-                  const isAfternoon = slot.start >= '12:00' && slot.start < '18:00';
-                  const Icon = isMorning ? Sun : isAfternoon ? Sunset : Moon;
-
-                  return (
-                    <div
-                      key={slot.id}
-                      className="p-3.5 rounded-2xl border border-sky-200/90 bg-sky-50/50 hover:bg-sky-50 hover:border-sky-300 transition-all flex flex-col justify-between gap-3 shadow-2xs group"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md bg-sky-200/80 text-sky-900 flex items-center gap-1 w-fit mb-1.5">
-                            <Icon className="h-3 w-3 text-sky-700" />
-                            {slot.title}
-                          </span>
-                          <div className="text-base font-black text-slate-900 font-mono tracking-tight flex items-center gap-1.5">
-                            <Clock className="h-4 w-4 text-sky-600" />
-                            {slot.start} às {slot.end}
-                          </div>
-                          <p className="text-[11px] text-slate-600 font-medium mt-0.5">
-                            {slot.subtitle} ({Math.floor(slot.durationMinutes / 60)}h{slot.durationMinutes % 60 ? `${slot.durationMinutes % 60}m` : ''} de duração)
-                          </p>
-                        </div>
+                {releasedSlotsForSelectedDate.map(({ room, slot }) => (
+                  <div
+                    key={`${room.firestoreId}_${slot.key}`}
+                    className="p-3.5 rounded-2xl border border-emerald-200 bg-emerald-50/40 hover:bg-emerald-50/80 transition-colors flex flex-col justify-between gap-3"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-2 text-xs text-emerald-800">
+                        <span className="font-semibold truncate">{room.nome}</span>
+                        <span className="font-semibold shrink-0">{slot.statusBadge}</span>
                       </div>
-
-                      <button
-                        type="button"
-                        onClick={() => onNewReservationOnDate(selectedDateStr, slot.start)}
-                        className="w-full py-2 px-3 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold transition-all shadow-xs flex items-center justify-center gap-1.5"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        Reservar este Horário ({slot.start})
-                      </button>
+                      <div className="text-base font-black text-slate-900 font-mono tabular-nums tracking-tight flex items-center gap-1.5">
+                        <Clock className="h-4 w-4 text-emerald-600" />
+                        {slot.inicio} às {slot.fim}
+                      </div>
+                      <p className="text-[11px] text-slate-600 truncate">
+                        {slot.label} · {room.andar}
+                      </p>
                     </div>
-                  );
-                })}
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onNewReservationOnDate(selectedDateStr, slot.inicio, room.nome)
+                      }
+                      className="w-full py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      Reservar este Horário
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
           </div>
 
-          {/* 3. HORÁRIOS OCUPADOS (AULAS DA GRADE & RESERVAS REGISTRADAS) */}
+          {/* 3. OCUPAÇÃO DA GRADE ACADÊMICA & RESERVAS ATIVAS */}
           <div className="space-y-3 pt-4 border-t border-slate-100">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="h-6 w-6 rounded-lg bg-rose-100 text-rose-700 flex items-center justify-center font-bold">
-                  <Building2 className="h-3.5 w-3.5" />
+                <span className="h-6 w-6 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold">
+                  <GraduationCap className="h-3.5 w-3.5" />
                 </span>
                 <div>
                   <h5 className="text-xs font-black uppercase tracking-wider text-slate-900">
-                    Horários Ocupados no Dia (Aulas e Reservas)
+                    Grade de Aulas Regulares & Reservas Registradas
                   </h5>
                   <p className="text-[11px] text-slate-500">
-                    Horários em que as salas estão indisponíveis por aula regular ou reserva prévia
+                    Indicação informativa de ocupação acadêmica e reservas confirmadas/pendentes
                   </p>
                 </div>
               </div>
-              <span className="text-[10px] font-black px-2 py-0.5 rounded-md bg-slate-100 text-slate-700">
-                {selectedDateEvents.length} {selectedDateEvents.length === 1 ? 'atividade' : 'atividades'}
+              <span className="text-[11px] font-mono tabular-nums font-semibold text-slate-600">
+                {selectedDateEvents.length}{' '}
+                {selectedDateEvents.length === 1 ? 'atividade' : 'atividades'}
               </span>
             </div>
 
             {selectedDateEvents.length === 0 ? (
-              <div className="py-6 text-center text-slate-400 bg-slate-50/50 rounded-2xl border border-slate-100">
-                <p className="text-xs font-bold text-slate-600">Nenhuma aula da grade ou reserva agendada para esta data.</p>
-                <p className="text-[11px] text-slate-400 mt-0.5">Todas as salas e laboratórios estão 100% livres para agendamento.</p>
+              <div className="py-6 px-4 text-center text-slate-500 bg-slate-50/60 rounded-2xl border border-slate-100">
+                <p className="text-xs font-bold text-slate-700">
+                  Nenhuma aula regular da grade ou reserva ativa para o filtro selecionado nesta data.
+                </p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Os espaços permanecem bloqueados por padrão até liberação explícita pela coordenação.
+                </p>
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
@@ -585,20 +689,24 @@ export function MonthCalendarGrid({
                       key={evt.id}
                       onClick={() => onSelectEvent(evt)}
                       className={cn(
-                        "p-4 rounded-2xl border text-left cursor-pointer transition-all duration-200 relative group hover:shadow-md",
+                        'p-4 rounded-2xl border text-left cursor-pointer transition-all duration-150 relative group hover:shadow-md',
                         isGrade
-                          ? "bg-emerald-50/70 border-emerald-200/90 hover:border-emerald-400 text-emerald-950"
-                          : "bg-rose-50/80 border-rose-200/90 hover:border-rose-400 text-rose-950"
+                          ? 'bg-emerald-50/70 border-emerald-200/90 hover:border-emerald-400 text-emerald-950'
+                          : 'bg-rose-50/80 border-rose-200/90 hover:border-rose-400 text-rose-950'
                       )}
                     >
                       <div className="flex items-center justify-between gap-1 mb-2">
-                        <span className={cn(
-                          "text-[9px] font-black px-2 py-0.5 rounded-md uppercase tracking-wider",
-                          isGrade ? "bg-emerald-200/80 text-emerald-900" : "bg-rose-200 text-rose-900"
-                        )}>
-                          {isGrade ? '🟩 Grade Oficial' : '🟥 Reserva Ativa'}
+                        <span
+                          className={cn(
+                            'text-[9px] font-black px-2 py-0.5 rounded-md uppercase tracking-wider',
+                            isGrade
+                              ? 'bg-emerald-200/80 text-emerald-900'
+                              : 'bg-rose-200 text-rose-900'
+                          )}
+                        >
+                          {isGrade ? 'Grade Oficial' : 'Reserva Ativa'}
                         </span>
-                        <span className="text-xs font-mono font-black text-slate-800 flex items-center gap-1">
+                        <span className="text-xs font-mono tabular-nums font-black text-slate-800 flex items-center gap-1">
                           <Clock className="h-3 w-3 text-slate-400" />
                           {evt.horarioInicio} às {evt.horarioFim}
                         </span>
@@ -623,10 +731,11 @@ export function MonthCalendarGrid({
                         </p>
                       </div>
 
-                      {/* ADMIN ACTIONS ON CARD */}
                       {isAdmin && !isGrade && evt.status === 'Pendente' && onApproveReservation && (
                         <div className="mt-3 pt-2.5 border-t border-rose-200/80 flex items-center justify-between">
-                          <span className="text-[9px] font-black text-amber-700 uppercase">Pendente</span>
+                          <span className="text-[9px] font-black text-amber-700 uppercase">
+                            Pendente
+                          </span>
                           <button
                             type="button"
                             onClick={(e) => {

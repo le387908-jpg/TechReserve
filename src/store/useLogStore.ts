@@ -15,6 +15,7 @@ import {
 import { db } from '../services/firebase/config';
 import { Log } from '../types';
 import { OperationType, handleFirestoreError } from '../services/firebase/utils';
+import { useAuthStore } from './useAuthStore';
 
 interface LogState {
   logs: Log[];
@@ -29,6 +30,12 @@ export const useLogStore = create<LogState>((set) => ({
   loading: false,
 
   fetchLogs: () => {
+    const currentUser = useAuthStore.getState().user;
+    if (!currentUser || currentUser.role !== 'ADMIN') {
+      set({ logs: [], loading: false });
+      return () => {};
+    }
+
     set({ loading: true });
     const q = query(collection(db, 'logs'), orderBy('createdAt', 'desc'), limit(100));
     

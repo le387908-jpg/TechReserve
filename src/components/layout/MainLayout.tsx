@@ -22,10 +22,13 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { useAuthStore } from '../../store/useAuthStore';
+import { useAuth } from '../../context/AuthContext';
 import { useReservationStore } from '../../store/useReservationStore';
 import { useRoomStore } from '../../store/useRoomStore';
 import { useScheduleStore } from '../../store/useScheduleStore';
+import { useAvailableSlotsStore } from '../../store/useAvailableSlotsStore';
+import { usePunishmentStore } from '../../store/usePunishmentStore';
+import { useAdminSettingsStore } from '../../store/useAdminSettingsStore';
 import { useWhatsAppReservationAlerts } from '../../hooks/useWhatsAppReservationAlerts';
 import { Logo } from '../Logo';
 import { GlobalAlert } from '../GlobalAlert';
@@ -78,7 +81,7 @@ function formatPunishmentDuration(millis: number): string {
 }
 
 export function MainLayout({ children }: { children: React.ReactNode }) {
-  const { user, signOut } = useAuthStore();
+  const { user, signOut } = useAuth();
   const [isOnline, setIsOnline] = React.useState(navigator.onLine);
   const [now, setNow] = useState(Date.now());
   const [isEditProfileOpen, setIsEditProfileOpen] = useState(false);
@@ -98,19 +101,42 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const fetchReservations = useReservationStore((state) => state.fetchReservations);
   const fetchRooms = useRoomStore((state) => state.fetchRooms);
   const fetchSchedules = useScheduleStore((state) => state.fetchSchedules);
+  const fetchAvailableSlots = useAvailableSlotsStore((state) => state.fetchAvailableSlots);
+  const fetchPunishments = usePunishmentStore((state) => state.fetchPunishments);
+  const fetchUserPunishments = usePunishmentStore((state) => state.fetchUserPunishments);
+  const fetchWhatsAppIntegration = useAdminSettingsStore(
+    (state) => state.fetchWhatsAppIntegration
+  );
 
   React.useEffect(() => {
-    if (user) {
+    if (user?.id) {
       const unsubRes = fetchReservations();
       const unsubRooms = fetchRooms();
       const unsubSchedules = fetchSchedules();
+      const unsubAvailableSlots = fetchAvailableSlots();
+      const unsubWhatsApp = fetchWhatsAppIntegration();
+      const unsubPunishments =
+        user.role === 'ADMIN' ? fetchPunishments() : fetchUserPunishments(user.id);
       return () => {
         unsubRes();
         unsubRooms();
         unsubSchedules();
+        unsubAvailableSlots();
+        unsubWhatsApp();
+        unsubPunishments();
       };
     }
-  }, [user, fetchReservations, fetchRooms, fetchSchedules]);
+  }, [
+    user?.id,
+    user?.role,
+    fetchReservations,
+    fetchRooms,
+    fetchSchedules,
+    fetchAvailableSlots,
+    fetchWhatsAppIntegration,
+    fetchPunishments,
+    fetchUserPunishments,
+  ]);
 
   React.useEffect(() => {
     const handleOnline = () => setIsOnline(true);

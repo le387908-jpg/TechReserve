@@ -4,10 +4,11 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, Navigate } from 'react-router-dom';
 import { Users, ShieldAlert, LayoutDashboard } from 'lucide-react';
 import { collection, onSnapshot, query, orderBy } from 'firebase/firestore';
 import { db } from '../../services/firebase/config';
+import { useAuth } from '../../context/AuthContext';
 import { User } from '../../types';
 import { AdminUsersTab } from '../admin/components/AdminUsersTab';
 import { AdminModerationTab } from '../admin/components/AdminModerationTab';
@@ -21,10 +22,13 @@ type UsersViewTab = 'base' | 'moderacao';
  * inativação com 1 clique e histórico individual) e do Painel de Moderação & Suspensões.
  */
 export function UsuariosPage() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'ADMIN';
   const [activeView, setActiveView] = useState<UsersViewTab>('base');
   const [users, setUsers] = useState<User[]>([]);
 
   useEffect(() => {
+    if (!isAdmin) return;
     const q = query(collection(db, 'users'), orderBy('nome', 'asc'));
     const unsub = onSnapshot(
       q,
@@ -36,7 +40,11 @@ export function UsuariosPage() {
       }
     );
     return () => unsub();
-  }, []);
+  }, [isAdmin]);
+
+  if (!isAdmin) {
+    return <Navigate to="/salas" replace />;
+  }
 
   return (
     <div className="space-y-6 pb-12">

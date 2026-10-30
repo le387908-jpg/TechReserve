@@ -47,16 +47,32 @@ export function formatPhoneMask(rawValue: string | undefined | null): string {
 }
 
 /**
- * Formata o número sanitizado para envio em APIs HTTP / Webhooks do WhatsApp (padrão DDI + DDD + 9 dígitos).
- * Exemplo: "(11) 91234-5678" -> "5511912345678"
+ * Formata o número sanitizado para envio na Evolution API / WhatsApp (padrão DDI + DDD + número, apenas dígitos).
+ * Remove parênteses, traços, espaços e sinais '+' garantindo o formato exato `55119XXXXXXXX`.
  */
 export function toWhatsAppApiPhone(
   rawValue: string | undefined | null,
   defaultCountryCode = '55'
 ): string {
-  const nationalDigits = sanitizePhone(rawValue);
-  if (nationalDigits.length !== 11) return '';
-  return `${defaultCountryCode}${nationalDigits}`;
+  let digits = String(rawValue ?? '').replace(/\D/g, '');
+  if (!digits) return '';
+
+  // Remove prefixo nacional '0' eventual antes do DDD (ex.: 011999999999 -> 11999999999)
+  if ((digits.length === 11 || digits.length === 12) && digits.startsWith('0')) {
+    digits = digits.slice(1);
+  }
+
+  // Já possui DDI 55 + DDD + 8 ou 9 dígitos (12 ou 13 dígitos)
+  if ((digits.length === 12 || digits.length === 13) && digits.startsWith(defaultCountryCode)) {
+    return digits;
+  }
+
+  // Possui DDD + 8 ou 9 dígitos nacionais (10 ou 11 dígitos) -> prefixa DDI 55
+  if (digits.length === 10 || digits.length === 11) {
+    return `${defaultCountryCode}${digits}`;
+  }
+
+  return '';
 }
 
 /**

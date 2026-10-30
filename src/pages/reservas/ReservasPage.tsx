@@ -189,6 +189,12 @@ export function ReservasPage() {
   const [confirmingCancelId, setConfirmingCancelId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!isAdmin && scope !== 'MINHAS') {
+      setScope('MINHAS');
+    }
+  }, [isAdmin, scope]);
+
   // Users cache for showing requester name in admin mode
   const [usersMap, setUsersMap] = useState<Record<string, { nome: string; email: string }>>({});
 
@@ -284,6 +290,7 @@ export function ReservasPage() {
   };
 
   const handleDelete = async (id: string) => {
+    if (!isAdmin) return;
     try {
       await deleteReservation(id);
       setConfirmingDeleteId(null);

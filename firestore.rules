@@ -49,8 +49,26 @@ service cloud.firestore {
               (roomData.bloqueadaAte is number && roomData.bloqueadaAte <= request.time.toMillis()));
     }
 
+    // Regra de Liberação Explícita de Slot (`available_slots`):
+    // Usuário comum só consegue criar reserva se existir um slot explicitamente liberado pelo ADM
+    // para aquela sala, data e horário exatos.
+    function isSlotReleasedForReservation(slotData, resData) {
+      return (
+               slotData.get('status', '') in ['liberado', 'ativo', 'LIBERADO', 'ATIVO'] ||
+               (!('status' in slotData) && slotData.get('ativo', false) == true)
+             ) &&
+             (!('ativo' in slotData) || slotData.ativo == true) &&
+             (slotData.get('salaId', '') == resData.get('salaId', '') ||
+              ('salaInstitutionalId' in slotData && 'salaInstitutionalId' in resData &&
+               slotData.salaInstitutionalId == resData.salaInstitutionalId)) &&
+             slotData.get('data', '') == resData.get('data', '') &&
+             slotData.get('inicio', '') == resData.get('inicio', '') &&
+             slotData.get('fim', '') == resData.get('fim', '');
+    }
+
     function isBootstrapAdmin() {
       return isSignedIn() &&
+             request.auth.token.get('email_verified', false) == true &&
              request.auth.token.get('email', '') is string &&
              request.auth.token.get('email', '').size() <= 120 &&
              request.auth.token.get('email', '').lower() in [
@@ -60,12 +78,14 @@ service cloud.firestore {
              ];
     }
 
+    // Se o documento /users/{uid} existir, respeita estritamente o papel `role` salvo nele
+    // (garantindo que um perfil criado como USUARIO jamais receba privilégios ADM).
     function isAdmin() {
       return isSignedIn() && (
-        isBootstrapAdmin() ||
-        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'USUARIO') == 'ADMIN' &&
-         isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data))
+        exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          ? (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'USUARIO') == 'ADMIN' &&
+             isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data))
+          : isBootstrapAdmin()
       );
     }
 
@@ -113,7 +133,11 @@ service cloud.firestore {
                     isActiveUserDoc(incoming()) &&
                     incoming().get('createdAt', 0) is number &&
                     (
-                      incoming().get('role', 'USUARIO') == 'USUARIO' ||
+                      (
+                        incoming().get('role', 'USUARIO') == 'USUARIO' &&
+                        incoming().get('tipoVinculo', 'ALUNO') in ['ALUNO', 'SERVIDOR'] &&
+                        !('authCodeSubmitted' in incoming())
+                      ) ||
                       (
                         incoming().get('role', 'USUARIO') == 'ADMIN' && (
                           isBootstrapAdmin() ||
@@ -141,6 +165,11 @@ service cloud.firestore {
          incoming().get('email', '') == existing().get('email', '') &&
          incoming().get('role', 'USUARIO') == existing().get('role', 'USUARIO') &&
          incoming().get('aprovado', true) == existing().get('aprovado', true) &&
+         (existing().get('role', 'USUARIO') == 'ADMIN' || (
+           incoming().get('tipoVinculo', 'ALUNO') in ['ALUNO', 'SERVIDOR'] &&
+           incoming().get('curso', '') == existing().get('curso', '') &&
+           incoming().get('course', '') == existing().get('course', '')
+         )) &&
          incoming().diff(existing()).affectedKeys().hasOnly([
            'nome', 'name', 'phone', 'phoneFormatted', 'whatsappNotificationsEnabled',
            'ra', 'tipoVinculo', 'updatedAt', 'avatarUrl',
@@ -186,6 +215,42 @@ service cloud.firestore {
       allow delete: if isAdmin() && isValidId(salaId);
     }
 
+    // 3.1 AVAILABLE SLOTS (/available_slots/{slotId}) — Liberação explícita de horários pelo ADM
+    match /available_slots/{slotId} {
+      function isValidAvailableSlot(data) {
+        return data.keys().hasAll(['salaId', 'salaNome', 'data', 'inicio', 'fim', 'status', 'ativo', 'createdAt', 'updatedAt']) &&
+               data.keys().hasOnly([
+                 'id', 'salaId', 'salaInstitutionalId', 'salaNome',
+                 'data', 'inicio', 'fim', 'label',
+                 'status', 'ativo', 'liberadoPorId', 'liberadoPorNome',
+                 'createdAt', 'updatedAt'
+               ]) &&
+               (!('id' in data) || (data.id is string && data.id.size() >= 1 && data.id.size() <= 128)) &&
+               data.salaId is string && data.salaId.size() >= 1 && data.salaId.size() <= 128 &&
+               (!('salaInstitutionalId' in data) || data.salaInstitutionalId == null || (data.salaInstitutionalId is string && data.salaInstitutionalId.size() <= 64)) &&
+               data.salaNome is string && data.salaNome.size() >= 1 && data.salaNome.size() <= 140 &&
+               data.data is string && data.data.size() >= 8 && data.data.size() <= 16 &&
+               data.inicio is string && data.inicio.size() >= 4 && data.inicio.size() <= 8 &&
+               data.fim is string && data.fim.size() >= 4 && data.fim.size() <= 8 &&
+               (!('label' in data) || data.label == null || (data.label is string && data.label.size() <= 120)) &&
+               data.status is string && data.status in ['liberado', 'ativo', 'bloqueado', 'inativo', 'LIBERADO', 'ATIVO', 'BLOQUEADO', 'INATIVO'] &&
+               data.ativo is bool &&
+               (!('liberadoPorId' in data) || data.liberadoPorId == null || (data.liberadoPorId is string && data.liberadoPorId.size() <= 128)) &&
+               (!('liberadoPorNome' in data) || data.liberadoPorNome == null || (data.liberadoPorNome is string && data.liberadoPorNome.size() <= 120)) &&
+               data.createdAt is number &&
+               data.updatedAt is number;
+      }
+
+      allow get: if isSignedIn() && isValidId(slotId);
+      allow list: if isSignedIn();
+      allow create: if isAdmin() && isValidId(slotId) && isValidAvailableSlot(incoming()) &&
+                    exists(/databases/$(database)/documents/salas/$(incoming().salaId));
+      allow update: if isAdmin() && isValidId(slotId) && isValidAvailableSlot(incoming()) &&
+                    incoming().salaId == existing().salaId &&
+                    incoming().data == existing().data;
+      allow delete: if isAdmin() && isValidId(slotId);
+    }
+
     // 4. RESERVAS (/reservas/{reservaId})
     match /reservas/{reservaId} {
       function isValidReservation(data) {
@@ -198,6 +263,7 @@ service cloud.firestore {
                data.get('data', '') is string && data.get('data', '').size() >= 8 && data.get('data', '').size() <= 16 &&
                data.get('inicio', '') is string && data.get('inicio', '').size() >= 4 && data.get('inicio', '').size() <= 8 &&
                data.get('fim', '') is string && data.get('fim', '').size() >= 4 && data.get('fim', '').size() <= 8 &&
+               (!('availableSlotId' in data) || data.availableSlotId == null || (data.availableSlotId is string && data.availableSlotId.size() <= 128)) &&
                (!('observacoes' in data) || data.observacoes == null || (data.observacoes is string && data.observacoes.size() <= 600)) &&
                (!('blockedDate' in data) || data.blockedDate == null || (data.blockedDate is string && data.blockedDate.size() <= 16)) &&
                (!('punicaoMotivo' in data) || data.punicaoMotivo == null || (data.punicaoMotivo is string && data.punicaoMotivo.size() <= 500)) &&
@@ -220,10 +286,17 @@ service cloud.firestore {
                     exists(/databases/$(database)/documents/salas/$(incoming().salaId)) && (
                       (isAdmin() && incoming().status in ['PENDENTE', 'CONFIRMADA']) ||
                       (isOwner(incoming().usuarioId) &&
+                       'availableSlotId' in incoming() &&
+                       isValidId(incoming().availableSlotId) &&
                        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
                        isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
                        isNotBlockedOnDate(get(/databases/$(database)/documents/users/$(request.auth.uid)).data, incoming().data) &&
                        isRoomReleasedForUser(get(/databases/$(database)/documents/salas/$(incoming().salaId)).data) &&
+                       exists(/databases/$(database)/documents/available_slots/$(incoming().availableSlotId)) &&
+                       isSlotReleasedForReservation(
+                         get(/databases/$(database)/documents/available_slots/$(incoming().availableSlotId)).data,
+                         incoming()
+                       ) &&
                        incoming().status == 'PENDENTE')
                     );
 
@@ -337,19 +410,37 @@ service cloud.firestore {
       allow delete: if isAdmin() && isValidId(punishmentId);
     }
 
-    // 7. ADMIN SETTINGS (/settings/{settingId}) - Protects code-auth strictly for ADMIN
+    // 7. ADMIN & INTEGRATION SETTINGS (/settings/{settingId})
     match /settings/{settingId} {
-      function isValidSetting(data) {
+      function isValidAdminAuthSetting(data) {
         return data.get('codeAuth', '') is string && data.get('codeAuth', '').size() >= 4 && data.get('codeAuth', '').size() <= 64 &&
                data.get('allowAdminSignup', true) is bool &&
                data.get('updatedAt', 0) is number &&
-               data.get('updatedBy', '') is string && data.get('updatedBy', '').size() <= 128 &&
-               data.get('updatedByName', '') is string && data.get('updatedByName', '').size() <= 120;
+               data.get('updatedBy', '') is string && data.get('updatedBy', '').size() >= 1 && data.get('updatedBy', '').size() <= 128 &&
+               data.get('updatedByName', '') is string && data.get('updatedByName', '').size() >= 1 && data.get('updatedByName', '').size() <= 120;
       }
 
-      allow get: if isAdmin() && isValidId(settingId);
+      function isValidWhatsAppSetting(data) {
+        return data.keys().hasAll(['whatsappConnected', 'isConfigured', 'instanceName', 'provider', 'updatedAt', 'updatedBy', 'updatedByName']) &&
+               data.keys().hasOnly(['whatsappConnected', 'isConfigured', 'instanceName', 'provider', 'updatedAt', 'updatedBy', 'updatedByName']) &&
+               data.whatsappConnected is bool &&
+               data.isConfigured is bool &&
+               data.instanceName is string && data.instanceName.size() >= 1 && data.instanceName.size() <= 80 &&
+               data.provider is string && data.provider in ['EVOLUTION', 'META_CLOUD', 'WEBHOOK'] &&
+               data.updatedAt is number &&
+               data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 128 &&
+               data.updatedByName is string && data.updatedByName.size() >= 1 && data.updatedByName.size() <= 120;
+      }
+
+      allow get: if isValidId(settingId) && (
+        (settingId == 'admin_auth' && isAdmin()) ||
+        (settingId == 'whatsapp_integration' && isSignedIn())
+      );
       allow list: if isAdmin();
-      allow create, update: if isAdmin() && isValidId(settingId) && isValidSetting(incoming());
+      allow create, update: if isAdmin() && isValidId(settingId) && (
+        (settingId == 'admin_auth' && isValidAdminAuthSetting(incoming())) ||
+        (settingId == 'whatsapp_integration' && isValidWhatsAppSetting(incoming()))
+      );
       allow delete: if false;
     }
 
@@ -358,7 +449,7 @@ service cloud.firestore {
       function isValidLog(data) {
         return data.get('acao', '') is string && data.get('acao', '').size() >= 1 && data.get('acao', '').size() <= 100 &&
                data.get('usuarioId', '') is string && data.get('usuarioId', '').size() >= 1 && data.get('usuarioId', '').size() <= 128 &&
-               data.get('usuarioNome', '') is string && data.get('usuarioNome', '').size() >= 1 && data.get('usuarioNome', '').size() <= 120 &&
+               data.get('usuarioNome', '') is string && data.get('usuarioNome', '').size() <= 120 &&
                data.get('entidade', '') is string &&
                data.get('entidade', '') in ['USERS', 'SALAS', 'RESERVAS', 'PUNIDAS', 'HORARIOS', 'SISTEMA', 'CHAMADOS', 'WHATSAPP'] &&
                data.get('detalhes', '') is string && data.get('detalhes', '').size() <= 1000 &&

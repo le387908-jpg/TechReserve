@@ -278,8 +278,13 @@ export function EventDetailModal({
                 </div>
               ) : (
                 <>
-                  {/* Regular user actions */}
-                  {isGrade && onRequestRoomBooking && canUserBookRoom && (
+                  {/* Regular curriculum class occupancy indicator for standard users; quick override only for ADM */}
+                  {isGrade && !isAdmin && (
+                    <span className="text-xs font-medium text-slate-500 mr-auto">
+                      Horário ocupado pela grade curricular regular
+                    </span>
+                  )}
+                  {isGrade && isAdmin && onRequestRoomBooking && canUserBookRoom && (
                     <button
                       type="button"
                       onClick={() => {

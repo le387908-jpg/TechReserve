@@ -9,9 +9,12 @@
  * (total de 13 dígitos iniciando com "55"), normaliza para os 11 dígitos nacionais.
  */
 export function extractPhoneDigits(value: string | null | undefined): string {
-  const digits = String(value ?? '').replace(/\D/g, '');
-  if (digits.length === 13 && digits.startsWith('55')) {
-    return digits.slice(2);
+  let digits = String(value ?? '').replace(/\D/g, '');
+  if ((digits.length === 12 || digits.length === 13) && digits.startsWith('55')) {
+    digits = digits.slice(2);
+  }
+  if (digits.length === 12 && digits.startsWith('0')) {
+    digits = digits.slice(1);
   }
   return digits;
 }

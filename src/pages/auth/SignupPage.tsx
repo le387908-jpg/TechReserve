@@ -24,7 +24,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { useAuthStore } from '../../store/useAuthStore';
+import { useAuth } from '../../context/AuthContext';
 import { Logo } from '../../components/Logo';
 import { CalendarCourse, UserVinculo } from '../../types';
 import { normalizeDateToISO } from '../../utils/dateUtils';
@@ -43,7 +43,7 @@ const COURSES: { id: CalendarCourse; label: string; name: string }[] = [
 
 export function SignupPage() {
   const navigate = useNavigate();
-  const { signUp, loading, user } = useAuthStore();
+  const { signUp, loading, user } = useAuth();
 
   const [nome, setNome] = useState('');
   const [phone, setPhone] = useState('');
@@ -85,19 +85,26 @@ export function SignupPage() {
       return;
     }
 
+    const selectedRole: 'USUARIO' | 'ADMIN' = role === 'ADMIN' ? 'ADMIN' : 'USUARIO';
+
     try {
-      await signUp({
+      const createdUser = await signUp({
         email: email.trim(),
         pass: password,
         nome: nome.trim(),
         phone: sanitizePhone(phone),
         whatsappNotificationsEnabled,
         ra: ra.trim(),
-        tipoVinculo: role === 'ADMIN' ? 'COORDENACAO' : tipoVinculo,
+        tipoVinculo:
+          selectedRole === 'ADMIN'
+            ? 'COORDENACAO'
+            : tipoVinculo === 'SERVIDOR'
+            ? 'SERVIDOR'
+            : 'ALUNO',
         dataNascimento: normalizeDateToISO(dataNascimento) || '2000-01-01',
-        role,
-        code: adminCode,
-        ...(role === 'USUARIO'
+        role: selectedRole,
+        ...(selectedRole === 'ADMIN' ? { code: adminCode.trim() } : {}),
+        ...(selectedRole === 'USUARIO'
           ? {
               curso,
               ...(tipoVinculo === 'ALUNO' ? { semestre } : {}),
@@ -105,7 +112,7 @@ export function SignupPage() {
           : {}),
       });
       toast.success('Cadastro realizado com sucesso! Bem-vindo ao TechReserve.');
-      navigate(role === 'ADMIN' ? '/admin' : '/salas');
+      navigate(createdUser.role === 'ADMIN' ? '/admin' : '/salas', { replace: true });
     } catch (err: any) {
       toast.error(err.message || 'Erro ao realizar cadastro.');
     }
@@ -294,7 +301,10 @@ export function SignupPage() {
               <div className="grid grid-cols-2 gap-2.5 p-1 bg-slate-100 rounded-xl border border-slate-200">
                 <button
                   type="button"
-                  onClick={() => setRole('USUARIO')}
+                  onClick={() => {
+                    setRole('USUARIO');
+                    setAdminCode('');
+                  }}
                   className={`py-2.5 px-3 rounded-lg transition-colors font-semibold text-xs cursor-pointer ${
                     role === 'USUARIO'
                       ? 'bg-white text-slate-900 shadow-2xs'

@@ -8,32 +8,63 @@ import {
   User,
   WhatsAppDispatchResult,
   WhatsAppEventType,
+  WhatsAppGatewayConnectResult,
+  WhatsAppGatewayStatus,
   WhatsAppSendPayload,
 } from '../types';
 import { formatDataBR } from '../utils/dateUtils';
-import { formatPhoneMask, toWhatsAppApiPhone, validatePhoneNumber } from '../utils/phoneUtils';
+import { formatPhoneMask, toWhatsAppApiPhone } from '../utils/phoneUtils';
 import { useLogStore } from '../store/useLogStore';
+import { useAdminSettingsStore } from '../store/useAdminSettingsStore';
+import {
+  calculateCheckInDeadline,
+  CHECKIN_TOLERANCE_MINUTES,
+  WHATSAPP_TEMPLATES,
+} from './whatsappTemplates';
+
+export { calculateCheckInDeadline, CHECKIN_TOLERANCE_MINUTES, WHATSAPP_TEMPLATES };
+export type {
+  CancellationTemplateVars,
+  ConfirmationTemplateVars,
+  ManualBlockTemplateVars,
+  NoShowTemplateVars,
+  ReminderTemplateVars,
+  TestAlertTemplateVars,
+  VacateWarningTemplateVars,
+} from './whatsappTemplates';
 
 /**
- * Configuração da integração WhatsApp carregada a partir das variáveis de ambiente (`.env`).
+ * Configuração da integração WhatsApp (Evolution API / Meta Cloud / Webhook).
  *
- * Arquitetura de segurança:
- * - Por padrão, as requisições `POST` são enviadas para `/api/whatsapp/send` (rota proxy no backend Express),
- *   que lê `WHATSAPP_API_URL`, `WHATSAPP_API_TOKEN` e `WHATSAPP_PROVIDER` do `.env` no servidor sem expor credenciais no navegador.
- * - Caso a aplicação rode em hospedagem puramente estática e `VITE_WHATSAPP_API_URL` esteja definida no `.env`,
- *   o serviço utiliza essa URL como endpoint HTTP/Webhook direto via `fetch` (`POST`).
+ * Arquitetura:
+ * - As requisições `POST` são enviadas para `/api/whatsapp/send` (rota server-side Express / Vercel),
+ *   que encaminha para `/message/sendText/{instance}` na Evolution API mantendo `WHATSAPP_API_TOKEN` protegido no servidor.
+ * - Caso o ambiente seja estático sem `/api/whatsapp/send` e `VITE_WHATSAPP_API_URL` esteja preenchida,
+ *   realiza fallback direto para `${VITE_WHATSAPP_API_URL}/message/sendText/${instance}`.
  */
 const viteEnv =
   (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env || {};
 
-const ENV_DIRECT_API_URL = String(viteEnv.VITE_WHATSAPP_API_URL || '').trim();
+function sanitizeClientUrl(raw: string | undefined): string {
+  if (!raw) return '';
+  const trimmed = String(raw).trim().replace(/^['"`]+|['"`]+$/g, '');
+  const match = trimmed.match(/https?:\/\/[^\s\]"')]+/i);
+  return (match ? match[0] : trimmed).replace(/\/+$/, '');
+}
+
+const ENV_DIRECT_API_URL = sanitizeClientUrl(viteEnv.VITE_WHATSAPP_API_URL);
 const ENV_PROXY_ENDPOINT = String(
   viteEnv.VITE_WHATSAPP_PROXY_URL || '/api/whatsapp/send'
 ).trim();
-const ENV_PROVIDER = String(viteEnv.VITE_WHATSAPP_PROVIDER || 'WEBHOOK')
+const ENV_PROVIDER = String(viteEnv.VITE_WHATSAPP_PROVIDER || 'EVOLUTION')
   .trim()
   .toUpperCase();
-const REQUEST_TIMEOUT_MS = 10000;
+const ENV_DEFAULT_INSTANCE = String(viteEnv.VITE_WHATSAPP_INSTANCE || 'techreserve')
+  .trim()
+  .replace(/[^a-zA-Z0-9_-]/g, '') || 'techreserve';
+
+// Tolerância de 50s para absorver eventual cold-start do provedor externo (ex.: Render)
+const REQUEST_TIMEOUT_MS = 50000;
 
 export interface DirectReservationAlertInput {
   phone: string;
@@ -45,6 +76,21 @@ export interface DirectReservationAlertInput {
   endTime: string; // HH:mm
   reservationId?: string;
   isAdmin?: boolean;
+}
+
+/**
+ * Obtém o nome da instância Evolution API salva no Firestore (`settings/whatsapp_integration`)
+ * ou definida nas variáveis de ambiente.
+ */
+function getConfiguredInstanceName(explicitInstance?: string): string {
+  if (explicitInstance && explicitInstance.trim()) {
+    return explicitInstance.trim().replace(/[^a-zA-Z0-9_-]/g, '') || ENV_DEFAULT_INSTANCE;
+  }
+  const storeInstance = useAdminSettingsStore.getState().whatsappIntegration?.instanceName;
+  if (storeInstance && storeInstance.trim()) {
+    return storeInstance.trim().replace(/[^a-zA-Z0-9_-]/g, '') || ENV_DEFAULT_INSTANCE;
+  }
+  return ENV_DEFAULT_INSTANCE;
 }
 
 /**
@@ -72,7 +118,14 @@ function buildDirectProviderBody(
   if (ENV_PROVIDER === 'EVOLUTION') {
     return {
       number: apiPhone,
-      text: message,
+      options: {
+        delay: 300,
+        presence: 'composing',
+        linkPreview: false,
+      },
+      textMessage: {
+        text: message,
+      },
     };
   }
 
@@ -87,16 +140,147 @@ function buildDirectProviderBody(
 }
 
 /**
- * Verifica se o usuário possui número válido cadastrado e optou por receber alertas via WhatsApp.
+ * Consulta o status operacional do Gateway WhatsApp no backend (`/api/whatsapp/status`).
+ */
+export async function getWhatsAppGatewayStatus(
+  instanceName?: string
+): Promise<WhatsAppGatewayStatus> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const resolvedInstance = getConfiguredInstanceName(instanceName);
+
+  try {
+    const query = resolvedInstance ? `?instance=${encodeURIComponent(resolvedInstance)}` : '';
+    const res = await fetch(`/api/whatsapp/status${query}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) {
+      return {
+        configured: Boolean(ENV_DIRECT_API_URL),
+        provider: 'EVOLUTION',
+        connected: false,
+        state: ENV_DIRECT_API_URL ? 'ready' : 'unconfigured',
+        instanceName: resolvedInstance,
+        message: 'Serviço de status WhatsApp indisponível.',
+      };
+    }
+
+    return (await res.json()) as WhatsAppGatewayStatus;
+  } catch {
+    return {
+      configured: Boolean(ENV_DIRECT_API_URL),
+      provider: 'EVOLUTION',
+      connected: false,
+      state: 'close',
+      instanceName: resolvedInstance,
+      message: 'Não foi possível verificar o status do Gateway WhatsApp no momento.',
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Solicita a conexão da instância WhatsApp institucional e geração de QR Code / Código de Pareamento (`/api/whatsapp/connect`).
+ */
+export async function connectWhatsAppGateway(options?: {
+  phone?: string;
+  forceRecreate?: boolean;
+  instanceName?: string;
+}): Promise<WhatsAppGatewayConnectResult> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const resolvedInstance = getConfiguredInstanceName(options?.instanceName);
+
+  try {
+    const res = await fetch('/api/whatsapp/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        ...(options || {}),
+        instanceName: resolvedInstance,
+      }),
+      signal: controller.signal,
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      return {
+        success: false,
+        connected: false,
+        state: 'close',
+        instanceName: resolvedInstance,
+        error: 'Rota /api/whatsapp/connect indisponível neste ambiente.',
+      };
+    }
+
+    return (await res.json()) as WhatsAppGatewayConnectResult;
+  } catch (err) {
+    return {
+      success: false,
+      connected: false,
+      state: 'close',
+      instanceName: resolvedInstance,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Tempo limite ou erro de rede ao gerar QR Code do WhatsApp.',
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Desconecta a sessão atual do WhatsApp institucional (`/api/whatsapp/disconnect`).
+ */
+export async function disconnectWhatsAppGateway(
+  instanceName?: string
+): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  const resolvedInstance = getConfiguredInstanceName(instanceName);
+  try {
+    const res = await fetch('/api/whatsapp/disconnect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ instanceName: resolvedInstance }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return {
+      success: Boolean(res.ok && data?.success !== false),
+      message: data?.message || 'Sessão desconectada.',
+    };
+  } catch {
+    return {
+      success: false,
+      message: 'Não foi possível desconectar a sessão no momento.',
+    };
+  }
+}
+
+/**
+ * Verifica se o usuário possui número válido cadastrado e optou por receber alertas via WhatsApp,
+ * formatando o número estritamente como `55 + DDD + Número` sem caracteres especiais.
  */
 export function canReceiveWhatsAppAlerts(
-  user: Pick<User, 'phone' | 'whatsappNotificationsEnabled'> | null | undefined
+  user:
+    | Pick<User, 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled'>
+    | null
+    | undefined
 ): { allowed: boolean; apiNumber: string; reason?: string } {
   if (!user) {
+    console.warn('[WhatsApp] Envio ignorado: usuário de destino não identificado.');
     return { allowed: false, apiNumber: '', reason: 'Usuário não identificado.' };
   }
 
   if (user.whatsappNotificationsEnabled === false) {
+    console.log('[WhatsApp] Envio ignorado: notificações desativadas nas preferências do usuário.');
     return {
       allowed: false,
       apiNumber: '',
@@ -104,28 +288,31 @@ export function canReceiveWhatsAppAlerts(
     };
   }
 
-  const validation = validatePhoneNumber(user.phone);
-  if (!validation.isValid) {
+  const candidatePhone = user.phone || user.phoneFormatted || '';
+  const apiNumber = toWhatsAppApiPhone(candidatePhone);
+
+  if (!apiNumber || apiNumber.length < 12) {
+    console.warn('[WhatsApp] Envio ignorado: telefone ausente ou inválido no perfil do usuário.', {
+      rawPhone: candidatePhone,
+      formattedAttempt: apiNumber,
+    });
     return {
       allowed: false,
       apiNumber: '',
-      reason: validation.error || 'Número de WhatsApp ausente ou inválido no perfil.',
+      reason: 'Número de WhatsApp ausente ou inválido no perfil do usuário.',
     };
   }
 
   return {
     allowed: true,
-    apiNumber: validation.apiNumber,
+    apiNumber,
   };
 }
 
 /**
- * Envia mensagem de WhatsApp via HTTP `POST` utilizando `fetch`.
- *
- * 1. Sanitiza o telefone para padrão internacional sem máscara (`5511912345678`).
- * 2. Realiza `fetch` (`POST`) para o proxy `/api/whatsapp/send` (que consome `WHATSAPP_API_URL` e `WHATSAPP_API_TOKEN` do `.env`).
- * 3. Se o proxy não estiver disponível (ex.: deploy estático, HTTP 404) e `VITE_WHATSAPP_API_URL` estiver configurada no `.env`,
- *    dispara diretamente via `fetch` (`POST`) para a URL configurada.
+ * Envia mensagem de WhatsApp via Evolution API (`/message/sendText/{instance}`) através da rota `/api/whatsapp/send`
+ * (ou diretamente via `VITE_WHATSAPP_API_URL` caso em hospedagem estática).
+ * Garante formatação DDI + DDD sem caracteres especiais (ex.: `55119XXXXXXXX`) e registra logs detalhados no console.
  */
 export async function sendWhatsAppMessage(
   payload: WhatsAppSendPayload,
@@ -133,12 +320,18 @@ export async function sendWhatsAppMessage(
 ): Promise<WhatsAppDispatchResult> {
   const timestamp = Date.now();
   const apiPhone = toWhatsAppApiPhone(payload.phone);
+  const instanceName = getConfiguredInstanceName(payload.instanceName);
 
-  if (!apiPhone || apiPhone.length < 12) {
+  if (!apiPhone || apiPhone.length < 12 || /\D/.test(apiPhone)) {
+    console.error('[WhatsApp][Erro de Formatação] Número de destino inválido para envio:', {
+      eventType: payload.eventType,
+      rawPhone: payload.phone,
+      sanitizedApiPhone: apiPhone,
+    });
     return {
       success: false,
       skipped: true,
-      reason: 'Número de telefone inválido para envio.',
+      reason: 'Número de telefone inválido para envio (esperado DDI+DDD+Número apenas com dígitos).',
       eventType: payload.eventType,
       timestamp,
     };
@@ -148,29 +341,54 @@ export async function sendWhatsAppMessage(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
+  console.log('[WhatsApp][Envio Iniciado]', {
+    eventType: payload.eventType,
+    to: apiPhone,
+    instance: instanceName,
+    proxyEndpoint: targetEndpoint,
+    evolutionTargetPath: `/message/sendText/${instanceName}`,
+  });
+
   try {
     const response = await fetch(targetEndpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        Accept: 'application/json',
       },
       body: JSON.stringify({
         to: apiPhone,
         message: payload.message,
         eventType: payload.eventType,
+        instanceName,
         metadata: payload.metadata || {},
       }),
       signal: controller.signal,
     });
 
-    // Fallback para `VITE_WHATSAPP_API_URL` caso o backend proxy retorne 404 em ambiente estático
-    if (response.status === 404 && !customEndpoint && ENV_DIRECT_API_URL) {
+    const contentType = response.headers.get('content-type') || '';
+    const isHtmlFallback = !contentType.includes('application/json');
+
+    // Fallback direto para `${VITE_WHATSAPP_API_URL}/message/sendText/${instanceName}` em hospedagem puramente estática
+    if ((response.status === 404 || isHtmlFallback) && !customEndpoint && ENV_DIRECT_API_URL) {
       clearTimeout(timeoutId);
       const directController = new AbortController();
       const directTimeout = setTimeout(() => directController.abort(), REQUEST_TIMEOUT_MS);
 
       try {
-        const directResponse = await fetch(ENV_DIRECT_API_URL, {
+        const cleanBase = ENV_DIRECT_API_URL.replace(/\/(manager|docs|swagger)\/?$/i, '');
+        const directEndpoint =
+          ENV_PROVIDER === 'EVOLUTION' && !/\/message\/sendText\//i.test(cleanBase)
+            ? `${cleanBase}/message/sendText/${encodeURIComponent(instanceName)}`
+            : cleanBase;
+
+        console.log('[WhatsApp][Fallback Direto Evolution API]', {
+          eventType: payload.eventType,
+          to: apiPhone,
+          endpoint: directEndpoint,
+        });
+
+        const directResponse = await fetch(directEndpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -181,24 +399,44 @@ export async function sendWhatsAppMessage(
           signal: directController.signal,
         });
 
+        const directText = await directResponse.text().catch(() => '');
         clearTimeout(directTimeout);
 
         if (!directResponse.ok) {
+          console.error('[WhatsApp][Erro Fallback Direto Evolution API]', {
+            eventType: payload.eventType,
+            to: apiPhone,
+            endpoint: directEndpoint,
+            httpStatus: directResponse.status,
+            responseBody: directText.slice(0, 400),
+          });
           return {
             success: false,
             delivered: false,
-            reason: `Falha HTTP ${directResponse.status} ao enviar mensagem para a API WhatsApp.`,
+            upstreamStatus: directResponse.status,
+            endpoint: directEndpoint,
+            details: directText.slice(0, 400),
+            reason: `Falha HTTP ${directResponse.status} ao enviar mensagem para a Evolution API.`,
             to: apiPhone,
+            instanceName,
             eventType: payload.eventType,
             timestamp,
           };
         }
 
+        console.log('[WhatsApp][Envio Concluído via Endpoint Direto]', {
+          eventType: payload.eventType,
+          to: apiPhone,
+          endpoint: directEndpoint,
+        });
+
         return {
           success: true,
           delivered: true,
           mode: 'DIRECT_ENV_URL',
+          endpoint: directEndpoint,
           to: apiPhone,
+          instanceName,
           eventType: payload.eventType,
           timestamp,
         };
@@ -207,38 +445,95 @@ export async function sendWhatsAppMessage(
       }
     }
 
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok || data?.success === false) {
+    if (isHtmlFallback) {
+      console.error('[WhatsApp][Erro de Rota] /api/whatsapp/send retornou HTML em vez de JSON:', {
+        httpStatus: response.status,
+        targetEndpoint,
+      });
       return {
         success: false,
         delivered: false,
-        reason: data?.error || `Falha HTTP ${response.status} ao comunicar com serviço WhatsApp.`,
+        reason: 'Serviço de envio WhatsApp (/api/whatsapp/send) indisponível neste ambiente.',
+        to: apiPhone,
+        instanceName,
+        eventType: payload.eventType,
+        timestamp,
+      };
+    }
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok || data?.success === false) {
+      const errorReason =
+        data?.error || `Falha HTTP ${response.status} ao comunicar com a Evolution API.`;
+
+      console.error('[WhatsApp][Erro na Resposta da API]', {
+        eventType: payload.eventType,
+        to: apiPhone,
+        instance: data?.instanceName || instanceName,
+        proxyHttpStatus: response.status,
+        evolutionHttpStatus: data?.status,
+        evolutionEndpoint: data?.endpoint || `/message/sendText/${instanceName}`,
+        error: errorReason,
+        details: data?.details || null,
+      });
+
+      return {
+        success: false,
+        delivered: false,
+        needsQrConnection: Boolean(data?.needsQrConnection),
+        upstreamStatus: typeof data?.status === 'number' ? data.status : response.status,
+        endpoint: data?.endpoint,
+        details: data?.details,
+        instanceName: data?.instanceName || instanceName,
+        reason: errorReason,
         to: apiPhone,
         eventType: payload.eventType,
         timestamp,
       };
     }
 
+    console.log('[WhatsApp][Envio Concluído]', {
+      eventType: payload.eventType,
+      to: data?.to || apiPhone,
+      instance: data?.instanceName || instanceName,
+      delivered: Boolean(data?.delivered),
+      mode: data?.mode || 'LIVE_EVOLUTION',
+      endpoint: data?.endpoint || `/message/sendText/${instanceName}`,
+    });
+
     return {
       success: true,
       delivered: Boolean(data?.delivered),
-      mode: data?.mode || 'WEBHOOK',
-      to: apiPhone,
+      mode: data?.mode || 'LIVE_EVOLUTION',
+      endpoint: data?.endpoint,
+      instanceName: data?.instanceName || instanceName,
+      to: data?.to || apiPhone,
       eventType: payload.eventType,
       timestamp,
     };
   } catch (error) {
     const isAbort = error instanceof DOMException && error.name === 'AbortError';
+    const reason = isAbort
+      ? 'O servidor de WhatsApp demorou para responder (iniciando instância). Aguarde alguns segundos e tente novamente.'
+      : error instanceof Error
+      ? error.message
+      : 'Falha de rede no envio WhatsApp.';
+
+    console.error('[WhatsApp][Exceção no Envio]', {
+      eventType: payload.eventType,
+      to: apiPhone,
+      instance: instanceName,
+      targetEndpoint,
+      error: reason,
+    });
+
     return {
       success: false,
       delivered: false,
-      reason: isAbort
-        ? 'Tempo limite excedido ao comunicar com a API do WhatsApp.'
-        : error instanceof Error
-        ? error.message
-        : 'Falha de rede no envio WhatsApp.',
+      reason,
       to: apiPhone,
+      instanceName,
       eventType: payload.eventType,
       timestamp,
     };
@@ -248,28 +543,33 @@ export async function sendWhatsAppMessage(
 }
 
 /**
+ * Alias semântico de disparo de notificação WhatsApp para uso direto em fluxos de reserva.
+ */
+export const triggerNotification = sendWhatsAppMessage;
+
+/**
  * Registra trilha auditável do disparo WhatsApp na coleção `logs` do Firestore.
  */
 async function registerWhatsAppLog(
-  user: Pick<User, 'id' | 'nome' | 'phone'>,
+  user: Pick<User, 'id' | 'nome' | 'phone' | 'phoneFormatted'>,
   eventType: WhatsAppEventType,
   summary: string,
   result: WhatsAppDispatchResult
 ): Promise<void> {
   try {
-    const maskedPhone = formatPhoneMask(user.phone) || 'Sem número';
+    const maskedPhone = formatPhoneMask(user.phone || user.phoneFormatted) || 'Sem número';
     await useLogStore.getState().addLog({
       acao: `WHATSAPP_${eventType}`,
       usuarioId: user.id,
       usuarioNome: user.nome || 'Usuário',
       entidade: 'WHATSAPP',
-      detalhes: `${summary} · Destino: ${maskedPhone} · Status: ${
+      detalhes: `${summary} · Destino: ${maskedPhone} (${result.to || 'N/A'}) · Status: ${
         result.delivered
-          ? 'Entregue via API'
+          ? `Entregue (${result.instanceName || 'Evolution API'})`
           : result.success
           ? 'Registrado (Homologação)'
           : `Falha (${result.reason || 'erro'})`
-      }`,
+      }`.slice(0, 800),
     });
   } catch {
     // Falha secundária de auditoria não interrompe o fluxo principal da reserva
@@ -280,28 +580,24 @@ async function registerWhatsAppLog(
  * 1. CONFIRMAÇÃO DE RESERVA
  * ========================================================================== */
 
-/**
- * Envia confirmação de agendamento via `POST` contendo resumo da sala, data e bloco de horário.
- */
 export async function sendReservationConfirmation(
   input: DirectReservationAlertInput
 ): Promise<WhatsAppDispatchResult> {
   const formattedDate = input.date.includes('-') ? formatDataBR(input.date) : input.date;
-  const roomLabel = input.roomCode ? `${input.roomName} (${input.roomCode})` : input.roomName;
-  const checkInInstruction = input.isAdmin
-    ? 'Reserva administrativa confirmada automaticamente.'
-    : 'Importante: realize o check-in presencial via QR Code na porta do ambiente em até 5 minutos após o início para evitar cancelamento por No-Show.';
+  const timeSlot = `${input.startTime} às ${input.endTime}`;
+  const checkInDeadline = calculateCheckInDeadline(input.startTime);
 
-  const message = [
-    `*TechReserve — Confirmação de Agendamento*`,
-    `Olá, *${input.userName}*! Sua solicitação de reserva foi registrada.`,
-    ``,
-    `• *Ambiente:* ${roomLabel}`,
-    `• *Data:* ${formattedDate}`,
-    `• *Bloco de Horário:* ${input.startTime} às ${input.endTime}`,
-    ``,
-    checkInInstruction,
-  ].join('\n');
+  const message = WHATSAPP_TEMPLATES.RESERVATION_CONFIRMED({
+    userName: input.userName,
+    roomName: input.roomName,
+    roomCode: input.roomCode,
+    date: formattedDate,
+    timeSlot,
+    startTime: input.startTime,
+    endTime: input.endTime,
+    checkInDeadline,
+    isAdmin: input.isAdmin,
+  });
 
   return sendWhatsAppMessage({
     phone: input.phone,
@@ -309,19 +605,23 @@ export async function sendReservationConfirmation(
     eventType: 'RESERVATION_CONFIRMED',
     metadata: {
       reservationId: input.reservationId || null,
+      userName: input.userName,
+      roomName: input.roomName,
       room: input.roomCode || input.roomName,
-      date: input.date,
+      date: formattedDate,
+      timeSlot,
       start: input.startTime,
       end: input.endTime,
+      checkInDeadline,
     },
   });
 }
 
-/**
- * Dispara confirmação de agendamento validando preferências do usuário (`whatsappNotificationsEnabled`) e registrando log.
- */
 export async function notifyReservationConfirmed(
-  user: Pick<User, 'id' | 'nome' | 'phone' | 'whatsappNotificationsEnabled' | 'role'>,
+  user: Pick<
+    User,
+    'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled' | 'role'
+  >,
   reservation: Pick<
     Reservation,
     'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim' | 'status'
@@ -361,31 +661,29 @@ export async function notifyReservationConfirmed(
 }
 
 /* ============================================================================
- * 2. LEMBRETES DE RESERVA (PRÉ-INÍCIO E DESOCUPAÇÃO FALTANDO 10 MINUTOS)
+ * 2. LEMBRETES DE RESERVA (10 MIN ANTES DO INÍCIO E DESOCUPAÇÃO 10 MIN ANTES DO FIM)
  * ========================================================================== */
 
-/**
- * Envia lembrete prévio de início da reserva via `POST`.
- */
 export async function sendReservationReminder(
   input: DirectReservationAlertInput & { minutesBefore?: number }
 ): Promise<WhatsAppDispatchResult> {
-  const minutesBefore = input.minutesBefore ?? 15;
+  const minutesBefore = input.minutesBefore ?? 10;
   const formattedDate = input.date.includes('-') ? formatDataBR(input.date) : input.date;
-  const roomLabel = input.roomCode ? `${input.roomName} (${input.roomCode})` : input.roomName;
+  const timeSlot = `${input.startTime} às ${input.endTime}`;
+  const checkInDeadline = calculateCheckInDeadline(input.startTime);
 
-  const message = [
-    `*TechReserve — Lembrete de Início de Reserva*`,
-    `Olá, *${input.userName}*! Sua reserva começará em aproximadamente *${minutesBefore} minutos*.`,
-    ``,
-    `• *Ambiente:* ${roomLabel}`,
-    `• *Data:* ${formattedDate}`,
-    `• *Início:* ${input.startTime} (Término: ${input.endTime})`,
-    ``,
-    input.isAdmin
-      ? `Seu acesso administrativo já está liberado.`
-      : `Lembre-se de escanear o *QR Code* do ambiente em até *5 minutos* após ${input.startTime} para confirmar sua presença.`,
-  ].join('\n');
+  const message = WHATSAPP_TEMPLATES.RESERVATION_REMINDER({
+    userName: input.userName,
+    roomName: input.roomName,
+    roomCode: input.roomCode,
+    date: formattedDate,
+    timeSlot,
+    startTime: input.startTime,
+    endTime: input.endTime,
+    checkInDeadline,
+    minutesBefore,
+    isAdmin: input.isAdmin,
+  });
 
   return sendWhatsAppMessage({
     phone: input.phone,
@@ -393,18 +691,26 @@ export async function sendReservationReminder(
     eventType: 'RESERVATION_REMINDER_START',
     metadata: {
       reservationId: input.reservationId || null,
+      userName: input.userName,
+      roomName: input.roomName,
+      date: formattedDate,
+      timeSlot,
+      checkInDeadline,
       minutesBefore,
     },
   });
 }
 
-/**
- * Dispara lembrete prévio de início respeitando opt-in do usuário e registrando auditoria.
- */
 export async function notifyUpcomingReservationReminder(
-  user: Pick<User, 'id' | 'nome' | 'phone' | 'whatsappNotificationsEnabled' | 'role'>,
-  reservation: Pick<Reservation, 'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'>,
-  minutesBefore = 15
+  user: Pick<
+    User,
+    'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled' | 'role'
+  >,
+  reservation: Pick<
+    Reservation,
+    'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'
+  >,
+  minutesBefore = 10
 ): Promise<WhatsAppDispatchResult> {
   const eligibility = canReceiveWhatsAppAlerts(user);
   if (!eligibility.allowed) {
@@ -433,20 +739,19 @@ export async function notifyUpcomingReservationReminder(
   await registerWhatsAppLog(
     user,
     'RESERVATION_REMINDER_START',
-    `Lembrete prévio enviado para ${reservation.salaNome} (${reservation.inicio})`,
+    `Lembrete prévio (${minutesBefore} min) enviado para ${reservation.salaNome} (${reservation.inicio})`,
     result
   );
 
   return result;
 }
 
-/**
- * Alerta de Desocupação (faltando 10 minutos para o término do bloco de 50 minutos),
- * orientando a organização dos equipamentos e liberação pontual do espaço.
- */
 export async function notifyVacateWarning10Min(
-  user: Pick<User, 'id' | 'nome' | 'phone' | 'whatsappNotificationsEnabled'>,
-  reservation: Pick<Reservation, 'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'>
+  user: Pick<User, 'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled'>,
+  reservation: Pick<
+    Reservation,
+    'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'
+  >
 ): Promise<WhatsAppDispatchResult> {
   const eligibility = canReceiveWhatsAppAlerts(user);
   if (!eligibility.allowed) {
@@ -459,15 +764,17 @@ export async function notifyVacateWarning10Min(
     };
   }
 
-  const message = [
-    `*TechReserve — Alerta de Desocupação (10 Minutos Restantes)*`,
-    `Olá, *${user.nome}*. Faltam *10 minutos* para o encerramento oficial do seu bloco de uso às *${reservation.fim}*.`,
-    ``,
-    `• *Ambiente:* ${reservation.salaNome} (${reservation.salaInstitutionalId})`,
-    `• *Encerramento do Bloco:* ${reservation.fim}`,
-    ``,
-    `Por gentileza, inicie a organização das bancadas/equipamentos, desligue projetores ou computadores utilizados e libere o espaço pontualmente para a próxima turma.`,
-  ].join('\n');
+  const formattedDate = formatDataBR(reservation.data);
+  const timeSlot = `${reservation.inicio} às ${reservation.fim}`;
+
+  const message = WHATSAPP_TEMPLATES.VACATE_WARNING_10MIN({
+    userName: user.nome,
+    roomName: reservation.salaNome,
+    roomCode: reservation.salaInstitutionalId,
+    date: formattedDate,
+    timeSlot,
+    endTime: reservation.fim,
+  });
 
   const result = await sendWhatsAppMessage({
     phone: eligibility.apiNumber,
@@ -475,7 +782,11 @@ export async function notifyVacateWarning10Min(
     eventType: 'RESERVATION_VACATE_10MIN',
     metadata: {
       reservationId: reservation.id,
+      userName: user.nome,
+      roomName: reservation.salaNome,
       room: reservation.salaInstitutionalId,
+      date: formattedDate,
+      timeSlot,
       endTime: reservation.fim,
     },
   });
@@ -491,28 +802,26 @@ export async function notifyVacateWarning10Min(
 }
 
 /* ============================================================================
- * 3. ALERTA DE NO-SHOW (AUSÊNCIA DE CHECK-IN EM 5 MINUTOS)
+ * 3. ALERTA DE NO-SHOW E RESTRIÇÃO DISCIPLINAR DE DIA ÚNICO
  * ========================================================================== */
 
-/**
- * Envia alerta de No-Show via `POST` quando a reserva expira após 5 minutos sem check-in via QR Code.
- */
 export async function sendNoShowAlert(
   input: DirectReservationAlertInput
 ): Promise<WhatsAppDispatchResult> {
   const formattedDate = input.date.includes('-') ? formatDataBR(input.date) : input.date;
-  const roomLabel = input.roomCode ? `${input.roomName} (${input.roomCode})` : input.roomName;
+  const timeSlot = `${input.startTime} às ${input.endTime}`;
+  const checkInDeadline = calculateCheckInDeadline(input.startTime);
 
-  const message = [
-    `*TechReserve — Aviso de No-Show (Ausência de Check-in)*`,
-    `Olá, *${input.userName}*. Sua reserva foi cancelada automaticamente por exceder o limite de *5 minutos* sem check-in presencial via QR Code.`,
-    ``,
-    `• *Ambiente Liberado:* ${roomLabel}`,
-    `• *Data / Bloco:* ${formattedDate} (${input.startTime} às ${input.endTime})`,
-    `• *Status:* Punição de No-Show: Bloqueado apenas em ${formattedDate}`,
-    ``,
-    `Você está impossibilitado de realizar novas reservas exclusivamente no restante do dia *${formattedDate}*. Sua cota semanal de 1 reserva permanece liberada para agendar em outras datas.`,
-  ].join('\n');
+  const message = WHATSAPP_TEMPLATES.RESERVATION_NO_SHOW({
+    userName: input.userName,
+    roomName: input.roomName,
+    roomCode: input.roomCode,
+    date: formattedDate,
+    timeSlot,
+    startTime: input.startTime,
+    endTime: input.endTime,
+    checkInDeadline,
+  });
 
   return sendWhatsAppMessage({
     phone: input.phone,
@@ -520,19 +829,23 @@ export async function sendNoShowAlert(
     eventType: 'RESERVATION_NO_SHOW',
     metadata: {
       reservationId: input.reservationId || null,
+      userName: input.userName,
+      roomName: input.roomName,
       room: input.roomCode || input.roomName,
-      date: input.date,
+      date: formattedDate,
+      timeSlot,
       start: input.startTime,
+      checkInDeadline,
     },
   });
 }
 
-/**
- * Dispara aviso de No-Show validando preferências do usuário e registrando auditoria no Firestore.
- */
 export async function notifyNoShowAutoCancelled(
-  user: Pick<User, 'id' | 'nome' | 'phone' | 'whatsappNotificationsEnabled'>,
-  reservation: Pick<Reservation, 'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'>
+  user: Pick<User, 'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled'>,
+  reservation: Pick<
+    Reservation,
+    'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'
+  >
 ): Promise<WhatsAppDispatchResult> {
   const eligibility = canReceiveWhatsAppAlerts(user);
   if (!eligibility.allowed) {
@@ -566,16 +879,60 @@ export async function notifyNoShowAutoCancelled(
   return result;
 }
 
+export async function notifyManualPunishmentApplied(
+  user: Pick<User, 'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled'>,
+  blockedDateISO: string,
+  reason: string
+): Promise<WhatsAppDispatchResult> {
+  const eligibility = canReceiveWhatsAppAlerts(user);
+  if (!eligibility.allowed) {
+    return {
+      success: false,
+      skipped: true,
+      reason: eligibility.reason,
+      eventType: 'PUNISHMENT_APPLIED',
+      timestamp: Date.now(),
+    };
+  }
+
+  const formattedDate = formatDataBR(blockedDateISO);
+  const message = WHATSAPP_TEMPLATES.PUNISHMENT_APPLIED({
+    userName: user.nome,
+    blockedDate: formattedDate,
+    reason,
+  });
+
+  const result = await sendWhatsAppMessage({
+    phone: eligibility.apiNumber,
+    message,
+    eventType: 'PUNISHMENT_APPLIED',
+    metadata: {
+      userId: user.id,
+      userName: user.nome,
+      blockedDate: formattedDate,
+    },
+  });
+
+  await registerWhatsAppLog(
+    user,
+    'PUNISHMENT_APPLIED',
+    `Aviso de restrição pontual para ${formattedDate}`,
+    result
+  );
+
+  return result;
+}
+
 /* ============================================================================
  * 4. CANCELAMENTO E VALIDAÇÃO DE CONEXÃO
  * ========================================================================== */
 
-/**
- * Notifica cancelamento de reserva (solicitado pelo próprio usuário ou pela administração).
- */
 export async function notifyReservationCancelled(
-  user: Pick<User, 'id' | 'nome' | 'phone' | 'whatsappNotificationsEnabled'>,
-  reservation: Pick<Reservation, 'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'>,
+  user: Pick<User, 'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled'>,
+  reservation: Pick<
+    Reservation,
+    'id' | 'salaNome' | 'salaInstitutionalId' | 'data' | 'inicio' | 'fim'
+  >,
   cancelledBy: 'USUARIO' | 'ADMIN',
   reason?: string
 ): Promise<WhatsAppDispatchResult> {
@@ -591,22 +948,17 @@ export async function notifyReservationCancelled(
   }
 
   const dataBR = formatDataBR(reservation.data);
-  const originLabel =
-    cancelledBy === 'ADMIN'
-      ? 'pela Coordenação / Administração'
-      : 'por solicitação no seu perfil';
+  const timeSlot = `${reservation.inicio} às ${reservation.fim}`;
 
-  const message = [
-    `*TechReserve — Reserva Cancelada*`,
-    `Olá, *${user.nome}*. Informamos que sua reserva foi cancelada ${originLabel}.`,
-    ``,
-    `• *Ambiente:* ${reservation.salaNome} (${reservation.salaInstitutionalId})`,
-    `• *Data:* ${dataBR}`,
-    `• *Horário:* ${reservation.inicio} às ${reservation.fim}`,
-    ...(reason ? [`• *Observação:* ${reason}`] : []),
-    ``,
-    `O espaço já se encontra liberado para outros agendamentos acadêmicos.`,
-  ].join('\n');
+  const message = WHATSAPP_TEMPLATES.RESERVATION_CANCELLED({
+    userName: user.nome,
+    roomName: reservation.salaNome,
+    roomCode: reservation.salaInstitutionalId,
+    date: dataBR,
+    timeSlot,
+    cancelledBy,
+    reason,
+  });
 
   const result = await sendWhatsAppMessage({
     phone: eligibility.apiNumber,
@@ -614,6 +966,10 @@ export async function notifyReservationCancelled(
     eventType: 'RESERVATION_CANCELLED',
     metadata: {
       reservationId: reservation.id,
+      userName: user.nome,
+      roomName: reservation.salaNome,
+      date: dataBR,
+      timeSlot,
       cancelledBy,
       reason: reason || null,
     },
@@ -629,11 +985,8 @@ export async function notifyReservationCancelled(
   return result;
 }
 
-/**
- * Envia um alerta de validação imediata a pedido do usuário na tela de Configurações / Edição de Perfil.
- */
 export async function sendTestWhatsAppAlert(
-  user: Pick<User, 'id' | 'nome' | 'phone' | 'whatsappNotificationsEnabled'>
+  user: Pick<User, 'id' | 'nome' | 'phone' | 'phoneFormatted' | 'whatsappNotificationsEnabled'>
 ): Promise<WhatsAppDispatchResult> {
   const eligibility = canReceiveWhatsAppAlerts(user);
   if (!eligibility.allowed) {
@@ -646,20 +999,18 @@ export async function sendTestWhatsAppAlert(
     };
   }
 
-  const message = [
-    `*TechReserve — Validação de Alertas WhatsApp*`,
-    `Olá, *${user.nome}*! Seu número *${formatPhoneMask(user.phone)}* está configurado e apto a receber:`,
-    `• Confirmações e cancelamentos de reservas;`,
-    `• Lembretes prévios de início de aula/uso;`,
-    `• Alertas de desocupação faltando 10 minutos;`,
-    `• Avisos de expiração de check-in (No-Show).`,
-  ].join('\n');
+  const displayPhone = formatPhoneMask(user.phone || user.phoneFormatted);
+
+  const message = WHATSAPP_TEMPLATES.WHATSAPP_TEST_ALERT({
+    userName: user.nome,
+    displayPhone,
+  });
 
   const result = await sendWhatsAppMessage({
     phone: eligibility.apiNumber,
     message,
     eventType: 'WHATSAPP_TEST_ALERT',
-    metadata: { userId: user.id },
+    metadata: { userId: user.id, userName: user.nome },
   });
 
   await registerWhatsAppLog(

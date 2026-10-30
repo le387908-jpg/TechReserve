@@ -60,12 +60,14 @@ export type WhatsAppEventType =
   | 'RESERVATION_REMINDER_START'
   | 'RESERVATION_VACATE_10MIN'
   | 'RESERVATION_NO_SHOW'
+  | 'PUNISHMENT_APPLIED'
   | 'WHATSAPP_TEST_ALERT';
 
 export interface WhatsAppSendPayload {
   phone: string;
   message: string;
   eventType: WhatsAppEventType;
+  instanceName?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -74,10 +76,39 @@ export interface WhatsAppDispatchResult {
   skipped?: boolean;
   reason?: string;
   delivered?: boolean;
+  needsQrConnection?: boolean;
   mode?: string;
   to?: string;
+  instanceName?: string;
+  upstreamStatus?: number;
+  endpoint?: string;
+  details?: string;
   eventType: WhatsAppEventType;
   timestamp: number;
+}
+
+export interface WhatsAppGatewayStatus {
+  configured: boolean;
+  hasApiToken?: boolean;
+  provider: 'EVOLUTION' | 'META_CLOUD' | 'WEBHOOK';
+  connected: boolean;
+  state: 'open' | 'connecting' | 'close' | 'missing' | 'unconfigured' | 'ready';
+  instanceName: string;
+  profileName?: string;
+  ownerNumber?: string;
+  message?: string;
+}
+
+export interface WhatsAppGatewayConnectResult {
+  success: boolean;
+  connected: boolean;
+  state: string;
+  instanceName: string;
+  qrCodeBase64?: string;
+  pairingCode?: string;
+  profileName?: string;
+  ownerNumber?: string;
+  error?: string;
 }
 
 export type SpaceCategory = 'SALA' | 'LABORATORIO' | 'AUDITORIO' | 'ESPECIAL';
@@ -118,6 +149,7 @@ export interface Reservation {
   data: string; // ISO string YYYY-MM-DD
   inicio: string; // HH:mm
   fim: string; // HH:mm
+  availableSlotId?: string; // ID do registro explícito em `available_slots` liberado pelo ADM
   checkInExpiracao?: number | null; // timestamp (início + 5 minutos de tolerância)
   checkInRealizado?: boolean;
   status: ReservationStatus;
@@ -131,6 +163,29 @@ export interface Reservation {
   whatsappLembreteInicioEnviado?: boolean;
   whatsappAlertaDesocupacaoEnviado?: boolean;
   whatsappNoShowEnviado?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type AvailableSlotStatus = 'liberado' | 'ativo' | 'bloqueado' | 'inativo';
+
+/**
+ * Registro explícito de liberação de horário pelo Administrador na coleção `available_slots`.
+ * Por padrão, nenhum horário fica disponível para o Usuário/Aluno sem este registro ativo.
+ */
+export interface AvailableSlot {
+  id: string;
+  salaId: string; // Firestore doc ID em `salas`
+  salaInstitutionalId?: string; // Ex: LAB-001, SALA-003
+  salaNome: string;
+  data: string; // YYYY-MM-DD
+  inicio: string; // HH:mm
+  fim: string; // HH:mm
+  label?: string;
+  status: AvailableSlotStatus;
+  ativo: boolean;
+  liberadoPorId?: string;
+  liberadoPorNome?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -219,6 +274,16 @@ export type Punishment = PunishmentRecord;
 export interface AdminAuthConfig {
   codeAuth: string;
   allowAdminSignup: boolean;
+  updatedAt: number;
+  updatedBy: string;
+  updatedByName: string;
+}
+
+export interface WhatsAppIntegrationSettings {
+  whatsappConnected: boolean;
+  isConfigured: boolean;
+  instanceName: string;
+  provider: 'EVOLUTION' | 'META_CLOUD' | 'WEBHOOK';
   updatedAt: number;
   updatedBy: string;
   updatedByName: string;

@@ -94,6 +94,13 @@ interface ScheduleState {
   deleteException: (id: string, titulo?: string) => Promise<void>;
 }
 
+function assertAdminRole(): void {
+  const currentUser = useAuthStore.getState().user;
+  if (!currentUser || currentUser.role !== 'ADMIN') {
+    throw new Error('Operação restrita exclusivamente ao perfil Administrador (ADM).');
+  }
+}
+
 export const useScheduleStore = create<ScheduleState>((set, get) => ({
   config: DEFAULT_SCHEDULE_CONFIG,
   exceptions: [],
@@ -148,6 +155,7 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
   },
 
   saveGlobalConfig: async (partial) => {
+    assertAdminRole();
     const current = get().config;
     const { user } = useAuthStore.getState();
     const now = Date.now();
@@ -182,6 +190,7 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
   },
 
   addException: async (exceptionData) => {
+    assertAdminRole();
     const { user } = useAuthStore.getState();
     const now = Date.now();
 
@@ -227,6 +236,7 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
   },
 
   updateException: async (id, data) => {
+    assertAdminRole();
     const { user } = useAuthStore.getState();
     const now = Date.now();
     const cleanData: Record<string, unknown> = { updatedAt: now };
@@ -253,6 +263,7 @@ export const useScheduleStore = create<ScheduleState>((set, get) => ({
   },
 
   deleteException: async (id, titulo) => {
+    assertAdminRole();
     const { user } = useAuthStore.getState();
     try {
       await withRetry(() => deleteDoc(doc(db, 'schedules', id)));

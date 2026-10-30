@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Clock,
   Calendar,
@@ -17,21 +17,34 @@ import {
   X,
   Lock,
   Unlock,
+  Building2,
+  GraduationCap,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { useScheduleStore, buildTimeBlocks } from '../../../store/useScheduleStore';
 import { useRoomStore } from '../../../store/useRoomStore';
+import { useReservationStore } from '../../../store/useReservationStore';
+import {
+  isSlotActiveOrReleased,
+  matchesSlotRoom,
+  useAvailableSlotsStore,
+} from '../../../store/useAvailableSlotsStore';
+import {
+  getCurriculumClassesForRoomOnDate,
+  isSpaceReleasedByAdmin,
+} from '../../../services/reservationService';
 import { DayOfWeek, ScheduleException, TimeBlock } from '../../../types';
-import { formatDataBR, getTodayLocalISO } from '../../../utils/dateUtils';
+import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../../../utils/dateUtils';
 import { cn } from '../../../lib/utils';
 
 const ALL_WEEK_DAYS: DayOfWeek[] = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
 
 /**
- * Aba 1 — Abertura e Controle Centralizado de Horários
- * Permite ao Administrador configurar janelas operacionais, blocos padrão (ex: aulas de 50 min)
- * e exceções de horários para datas/ambientes específicos com persistência em `schedules`.
+ * Aba 1 — Abertura, Liberação Explícita (`available_slots`) e Controle Centralizado de Horários
+ * Por padrão, todos os horários iniciam bloqueados para Usuários/Alunos.
+ * O Administrador libera horários específicos por Sala + Data em `available_slots`, além de gerenciar
+ * a grade base de blocos pedagógicos e exceções de calendário em `schedules`.
  */
 export function AdminSchedulesTab() {
   const {
@@ -43,6 +56,37 @@ export function AdminSchedulesTab() {
     deleteException,
   } = useScheduleStore();
   const rooms = useRoomStore((state) => state.rooms);
+  const reservations = useReservationStore((state) => state.reservations);
+  const {
+    slots: availableSlots,
+    setSlotReleaseStatus,
+    releaseMultipleSlotsForRoomAndDate,
+    blockAllSlotsForRoomAndDate,
+    deleteSlot,
+  } = useAvailableSlotsStore();
+
+  const todayISO = getTodayLocalISO();
+  const tomorrowISO = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return normalizeDateToISO(d);
+  }, []);
+
+  // Estado da seção de Liberação Explícita (`available_slots`) por Sala + Data
+  const [releaseScopeRoomId, setReleaseScopeRoomId] = useState<string>('');
+  const [releaseDate, setReleaseDate] = useState<string>(todayISO);
+  const [customSlotStart, setCustomSlotStart] = useState<string>('17:00');
+  const [customSlotEnd, setCustomSlotEnd] = useState<string>('17:50');
+  const [customSlotLabel, setCustomSlotLabel] = useState<string>('');
+  const [selectedBatchBlockIds, setSelectedBatchBlockIds] = useState<string[]>([]);
+  const [isMutatingSlots, setIsMutatingSlots] = useState<boolean>(false);
+
+  // Inicializa sala padrão quando lista de salas carregar
+  useEffect(() => {
+    if (!releaseScopeRoomId && rooms.length > 0) {
+      setReleaseScopeRoomId(rooms[0].firestoreId);
+    }
+  }, [rooms, releaseScopeRoomId]);
 
   // Estado local editável da configuração global
   const [reservasAbertas, setReservasAbertas] = useState(config.reservasAbertas);
@@ -86,6 +130,305 @@ export function AdminSchedulesTab() {
     setBlocosPadrao(config.blocosPadrao || []);
   }, [config]);
 
+  const selectedRoomForRelease = useMemo(
+    () => rooms.find((r) => r.firestoreId === releaseScopeRoomId) || null,
+    [rooms, releaseScopeRoomId]
+  );
+
+  // Monta os slots da sala selecionada na data de liberação
+  const singleRoomSlotsForDate = useMemo(() => {
+    if (!selectedRoomForRelease || !releaseDate) return [];
+
+    const curriculumClasses = getCurriculumClassesForRoomOnDate(
+      selectedRoomForRelease,
+      releaseDate
+    );
+    const activeRoomReservations = reservations.filter(
+      (r) =>
+        (r.salaId === selectedRoomForRelease.firestoreId ||
+          r.salaInstitutionalId === selectedRoomForRelease.id) &&
+        r.data === releaseDate &&
+        (r.status === 'PENDENTE' || r.status === 'CONFIRMADA')
+    );
+
+    const existingDocs = availableSlots.filter(
+      (s) => s.data === releaseDate && matchesSlotRoom(s, selectedRoomForRelease)
+    );
+
+    const baseBlocks =
+      selectedRoomForRelease.blocosHorarios && selectedRoomForRelease.blocosHorarios.length > 0
+        ? selectedRoomForRelease.blocosHorarios
+        : config.blocosPadrao || [];
+
+    const map = new Map<string, { inicio: string; fim: string; label: string }>();
+    for (const b of baseBlocks) {
+      if (!b.inicio || !b.fim || b.inicio >= b.fim) continue;
+      map.set(`${b.inicio}_${b.fim}`, {
+        inicio: b.inicio,
+        fim: b.fim,
+        label: b.label || `Bloco ${b.inicio}–${b.fim}`,
+      });
+    }
+    for (const s of existingDocs) {
+      if (!s.inicio || !s.fim || s.inicio >= s.fim) continue;
+      map.set(`${s.inicio}_${s.fim}`, {
+        inicio: s.inicio,
+        fim: s.fim,
+        label: s.label || `Horário ${s.inicio}–${s.fim}`,
+      });
+    }
+
+    return Array.from(map.values())
+      .sort((a, b) => a.inicio.localeCompare(b.inicio))
+      .map((item) => {
+        const docMatch = existingDocs.find(
+          (d) => d.inicio === item.inicio && d.fim === item.fim
+        );
+        const classMatch = curriculumClasses.find(
+          (aula) => item.inicio < aula.horarioFim && item.fim > aula.horarioInicio
+        );
+        const resMatch = activeRoomReservations.find(
+          (res) => item.inicio < res.fim && item.fim > res.inicio
+        );
+        const isReleased = Boolean(docMatch && isSlotActiveOrReleased(docMatch));
+
+        return {
+          ...item,
+          slotDoc: docMatch,
+          classMatch,
+          resMatch,
+          isReleased,
+        };
+      });
+  }, [selectedRoomForRelease, releaseDate, reservations, availableSlots, config.blocosPadrao]);
+
+  // Lista de registros atualmente liberados em `available_slots` (a partir de hoje)
+  const activeUpcomingSlots = useMemo(() => {
+    return availableSlots
+      .filter((s) => s.data >= todayISO && isSlotActiveOrReleased(s))
+      .sort((a, b) => {
+        if (a.data !== b.data) return a.data.localeCompare(b.data);
+        if (a.salaNome !== b.salaNome) return a.salaNome.localeCompare(b.salaNome);
+        return a.inicio.localeCompare(b.inicio);
+      });
+  }, [availableSlots, todayISO]);
+
+  const handleToggleSingleSlotRelease = async (item: {
+    inicio: string;
+    fim: string;
+    label: string;
+    isReleased: boolean;
+  }) => {
+    if (!selectedRoomForRelease || !releaseDate) return;
+    setIsMutatingSlots(true);
+    try {
+      await setSlotReleaseStatus({
+        room: selectedRoomForRelease,
+        data: releaseDate,
+        inicio: item.inicio,
+        fim: item.fim,
+        label: item.label,
+        release: !item.isReleased,
+      });
+      toast.success(
+        !item.isReleased
+          ? `Horário ${item.inicio}–${item.fim} liberado para ${selectedRoomForRelease.nome} em ${formatDataBR(releaseDate)}.`
+          : `Horário ${item.inicio}–${item.fim} bloqueado novamente.`
+      );
+    } catch {
+      toast.error('Falha ao atualizar status de liberação do horário.');
+    } finally {
+      setIsMutatingSlots(false);
+    }
+  };
+
+  const handleReleaseAllFreeForRoom = async () => {
+    if (!selectedRoomForRelease || !releaseDate) return;
+    const freeBlocks = singleRoomSlotsForDate
+      .filter((item) => !item.classMatch && !item.resMatch)
+      .map((item) => ({
+        inicio: item.inicio,
+        fim: item.fim,
+        label: item.label,
+      }));
+
+    if (freeBlocks.length === 0) {
+      toast.error('Não há blocos livres de aula regular para liberar nesta sala e data.');
+      return;
+    }
+
+    setIsMutatingSlots(true);
+    try {
+      const count = await releaseMultipleSlotsForRoomAndDate({
+        room: selectedRoomForRelease,
+        data: releaseDate,
+        blocks: freeBlocks,
+      });
+      toast.success(
+        `${count} horário(s) liberado(s) em ${formatDataBR(releaseDate)} para ${selectedRoomForRelease.nome}.`
+      );
+    } catch {
+      toast.error('Erro ao liberar horários em lote.');
+    } finally {
+      setIsMutatingSlots(false);
+    }
+  };
+
+  const handleBlockAllForRoom = async () => {
+    if (!selectedRoomForRelease || !releaseDate) return;
+    setIsMutatingSlots(true);
+    try {
+      const count = await blockAllSlotsForRoomAndDate({
+        room: selectedRoomForRelease,
+        data: releaseDate,
+      });
+      if (count === 0) {
+        toast.info('Nenhum horário estava liberado nesta data para esta sala.');
+      } else {
+        toast.success(
+          `${count} horário(s) bloqueado(s) em ${formatDataBR(releaseDate)} para ${selectedRoomForRelease.nome}.`
+        );
+      }
+    } catch {
+      toast.error('Erro ao bloquear horários da sala.');
+    } finally {
+      setIsMutatingSlots(false);
+    }
+  };
+
+  const handleAddAndReleaseCustomSlot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!releaseDate || !customSlotStart || !customSlotEnd || customSlotStart >= customSlotEnd) {
+      toast.error('Informe um horário inicial anterior ao horário final.');
+      return;
+    }
+
+    if (releaseScopeRoomId === 'TODAS_ATIVAS') {
+      const activeRooms = rooms.filter((r) => isSpaceReleasedByAdmin(r).released);
+      if (activeRooms.length === 0) {
+        toast.error('Nenhuma sala ativa encontrada.');
+        return;
+      }
+      setIsMutatingSlots(true);
+      try {
+        let totalReleased = 0;
+        for (const room of activeRooms) {
+          const classes = getCurriculumClassesForRoomOnDate(room, releaseDate);
+          const hasClassConflict = classes.some(
+            (aula) => customSlotStart < aula.horarioFim && customSlotEnd > aula.horarioInicio
+          );
+          if (hasClassConflict) continue;
+          const c = await releaseMultipleSlotsForRoomAndDate({
+            room,
+            data: releaseDate,
+            blocks: [
+              {
+                inicio: customSlotStart,
+                fim: customSlotEnd,
+                label: customSlotLabel.trim() || `Horário ${customSlotStart}–${customSlotEnd}`,
+              },
+            ],
+          });
+          totalReleased += c;
+        }
+        setCustomSlotLabel('');
+        toast.success(
+          `Horário ${customSlotStart}–${customSlotEnd} liberado em ${totalReleased} sala(s) sem conflito de aula em ${formatDataBR(releaseDate)}.`
+        );
+      } catch {
+        toast.error('Erro ao liberar horário personalizado em lote.');
+      } finally {
+        setIsMutatingSlots(false);
+      }
+      return;
+    }
+
+    if (!selectedRoomForRelease) {
+      toast.error('Selecione uma sala válida.');
+      return;
+    }
+
+    const classes = getCurriculumClassesForRoomOnDate(selectedRoomForRelease, releaseDate);
+    const conflict = classes.find(
+      (aula) => customSlotStart < aula.horarioFim && customSlotEnd > aula.horarioInicio
+    );
+    if (conflict) {
+      toast.error(
+        `Conflito com aula regular da grade: ${conflict.materia} (${conflict.horarioInicio}–${conflict.horarioFim}).`
+      );
+      return;
+    }
+
+    setIsMutatingSlots(true);
+    try {
+      await setSlotReleaseStatus({
+        room: selectedRoomForRelease,
+        data: releaseDate,
+        inicio: customSlotStart,
+        fim: customSlotEnd,
+        label: customSlotLabel.trim() || `Horário ${customSlotStart}–${customSlotEnd}`,
+        release: true,
+      });
+      setCustomSlotLabel('');
+      toast.success(
+        `Horário personalizado ${customSlotStart}–${customSlotEnd} liberado para ${selectedRoomForRelease.nome}.`
+      );
+    } catch {
+      toast.error('Falha ao liberar horário personalizado.');
+    } finally {
+      setIsMutatingSlots(false);
+    }
+  };
+
+  const handleBatchReleaseAcrossAllActiveRooms = async () => {
+    const chosenBlocks = (config.blocosPadrao || []).filter((b) =>
+      selectedBatchBlockIds.includes(b.id)
+    );
+    if (chosenBlocks.length === 0) {
+      toast.error('Selecione ao menos um bloco de horário para liberar nas salas ativas.');
+      return;
+    }
+
+    const activeRooms = rooms.filter((r) => isSpaceReleasedByAdmin(r).released);
+    if (activeRooms.length === 0) {
+      toast.error('Nenhuma sala ativa disponível para liberação.');
+      return;
+    }
+
+    setIsMutatingSlots(true);
+    try {
+      let totalCreated = 0;
+      for (const room of activeRooms) {
+        const classes = getCurriculumClassesForRoomOnDate(room, releaseDate);
+        const nonConflicting = chosenBlocks.filter(
+          (blk) =>
+            !classes.some(
+              (aula) => blk.inicio < aula.horarioFim && blk.fim > aula.horarioInicio
+            )
+        );
+        if (nonConflicting.length > 0) {
+          const added = await releaseMultipleSlotsForRoomAndDate({
+            room,
+            data: releaseDate,
+            blocks: nonConflicting.map((b) => ({
+              inicio: b.inicio,
+              fim: b.fim,
+              label: b.label,
+            })),
+          });
+          totalCreated += added;
+        }
+      }
+      toast.success(
+        `${totalCreated} registro(s) liberado(s) em ${formatDataBR(releaseDate)} respeitando a grade curricular.`
+      );
+    } catch {
+      toast.error('Erro ao liberar horários para múltiplas salas.');
+    } finally {
+      setIsMutatingSlots(false);
+    }
+  };
+
   const toggleDayOfWeek = (day: DayOfWeek) => {
     setDiasPermitidos((prev) =>
       prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]
@@ -99,7 +442,9 @@ export function AdminSchedulesTab() {
       return;
     }
     setBlocosPadrao(generated);
-    toast.success(`${generated.length} blocos padrão de ${duracaoBloco} minutos gerados. Clique em Salvar Regras para publicar.`);
+    toast.success(
+      `${generated.length} blocos padrão de ${duracaoBloco} minutos gerados. Clique em Salvar Regras para publicar.`
+    );
   };
 
   const handleAddSingleBlock = (e: React.FormEvent) => {
@@ -150,7 +495,7 @@ export function AdminSchedulesTab() {
         diasSemanaPermitidos: diasPermitidos,
         blocosPadrao,
       });
-      toast.success('Janelas operacionais e blocos de horários atualizados em tempo real.');
+      toast.success('Janelas operacionais e grade base de blocos atualizadas em tempo real.');
     } catch {
       toast.error('Falha ao salvar configuração de horários.');
     } finally {
@@ -165,7 +510,7 @@ export function AdminSchedulesTab() {
       await saveGlobalConfig({ reservasAbertas: nextState });
       toast.success(
         nextState
-          ? 'Portal de agendamentos liberado para estudantes e servidores.'
+          ? 'Portal de agendamentos habilitado para receber reservas nos horários liberados.'
           : 'Novos agendamentos suspensos temporariamente.'
       );
     } catch {
@@ -253,7 +598,7 @@ export function AdminSchedulesTab() {
             <span className="font-semibold text-slate-900">Status Global de Agendamentos</span>
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums">
-              Janela ativa: {config.janelaInicio} às {config.janelaFim}
+              Janela base: {config.janelaInicio} às {config.janelaFim}
             </span>
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums">
@@ -262,11 +607,11 @@ export function AdminSchedulesTab() {
           </div>
           <h3 className="text-lg font-bold text-slate-900">
             {reservasAbertas
-              ? 'Ambientes pedagógicos liberados para reserva dentro das janelas operacionais'
+              ? 'Portal aberto — horários bloqueados por padrão até liberação explícita por sala e data'
               : 'Agendamentos suspensos globalmente pela Coordenação'}
           </h3>
           <p className="text-sm text-slate-500 max-w-2xl">
-            Alterações salvas nesta tela entram em vigor instantaneamente no Mapa de Salas e no Calendário Institucional.
+            Usuários/Alunos visualizam apenas a grade regular de aulas e os slots que você liberar explicitamente abaixo.
           </p>
         </div>
 
@@ -296,14 +641,399 @@ export function AdminSchedulesTab() {
         </div>
       </div>
 
-      {/* GRID PRINCIPAL: JANELAS OPERACIONAIS + BLOCOS PADRÃO */}
+      {/* SEÇÃO PRINCIPAL: LIBERAÇÃO EXPLÍCITA DE HORÁRIOS POR SALA E DATA (`available_slots`) */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-6">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span className="font-semibold text-fatec-red">Regra de Bloqueio Padrão Ativa</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono tabular-nums">
+                {activeUpcomingSlots.length} slot(s) liberado(s) a partir de hoje
+              </span>
+            </div>
+            <h3 className="text-base font-bold text-slate-900">
+              Liberação de Horários por Sala e Data
+            </h3>
+            <p className="text-xs text-slate-500 max-w-2xl">
+              Selecione a sala e a data para liberar ou bloquear horários de agendamento. Apenas os horários marcados como Liberados ficam clicáveis na visão do Aluno/Servidor.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setReleaseDate(todayISO)}
+              className={cn(
+                'px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer whitespace-nowrap',
+                releaseDate === todayISO
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+              )}
+            >
+              Hoje ({formatDataBR(todayISO)})
+            </button>
+            <button
+              type="button"
+              onClick={() => setReleaseDate(tomorrowISO)}
+              className={cn(
+                'px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer whitespace-nowrap',
+                releaseDate === tomorrowISO
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+              )}
+            >
+              Amanhã ({formatDataBR(tomorrowISO)})
+            </button>
+          </div>
+        </div>
+
+        {/* SELETORES DE SALA + DATA */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
+          <div className="md:col-span-7 space-y-1.5">
+            <label className="text-xs font-semibold text-slate-700 block">
+              Espaço Físico / Sala
+            </label>
+            <select
+              value={releaseScopeRoomId}
+              onChange={(e) => setReleaseScopeRoomId(e.target.value)}
+              className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-semibold text-slate-900 focus:ring-2 focus:ring-fatec-red outline-none"
+            >
+              {rooms.map((r) => (
+                <option key={r.firestoreId} value={r.firestoreId}>
+                  {r.id} — {r.nome} ({r.andar})
+                </option>
+              ))}
+              <option value="TODAS_ATIVAS">Lote: Todas as Salas Ativas da Unidade</option>
+            </select>
+          </div>
+
+          <div className="md:col-span-5 space-y-1.5">
+            <label className="text-xs font-semibold text-slate-700 block">
+              Data da Liberação
+            </label>
+            <input
+              type="date"
+              min={todayISO}
+              value={releaseDate}
+              onChange={(e) => setReleaseDate(e.target.value)}
+              className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-mono tabular-nums font-semibold text-slate-900 focus:ring-2 focus:ring-fatec-red outline-none"
+            />
+          </div>
+        </div>
+
+        {/* MODO 1: SALA INDIVIDUAL */}
+        {releaseScopeRoomId !== 'TODAS_ATIVAS' && selectedRoomForRelease && (
+          <div className="space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="text-xs text-slate-600 flex items-center gap-2">
+                <Building2 className="h-4 w-4 text-slate-400 shrink-0" />
+                <span>
+                  Grade de slots para <strong className="text-slate-900">{selectedRoomForRelease.nome}</strong> em{' '}
+                  <strong className="font-mono tabular-nums text-slate-900">{formatDataBR(releaseDate)}</strong>
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={isMutatingSlots}
+                  onClick={handleReleaseAllFreeForRoom}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                >
+                  <Unlock className="h-3.5 w-3.5" />
+                  Liberar Todos sem Aula
+                </button>
+                <button
+                  type="button"
+                  disabled={isMutatingSlots}
+                  onClick={handleBlockAllForRoom}
+                  className="px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                >
+                  <Lock className="h-3.5 w-3.5" />
+                  Bloquear Todos na Data
+                </button>
+              </div>
+            </div>
+
+            {singleRoomSlotsForDate.length === 0 ? (
+              <div className="p-8 text-center border border-dashed border-slate-200 rounded-xl text-xs text-slate-500">
+                Nenhum bloco base cadastrado. Gere os blocos padrão abaixo ou libere um horário personalizado a seguir.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {singleRoomSlotsForDate.map((item) => {
+                  const hasClass = Boolean(item.classMatch);
+                  const hasRes = Boolean(item.resMatch);
+
+                  return (
+                    <div
+                      key={`${item.inicio}_${item.fim}`}
+                      className={cn(
+                        'p-3.5 rounded-xl border flex items-center justify-between gap-3 transition-colors',
+                        hasClass
+                          ? 'bg-emerald-50/40 border-emerald-200'
+                          : hasRes
+                          ? 'bg-rose-50/40 border-rose-200'
+                          : item.isReleased
+                          ? 'bg-emerald-50/70 border-emerald-300'
+                          : 'bg-slate-50/70 border-slate-200'
+                      )}
+                    >
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="text-sm font-mono tabular-nums font-bold text-slate-900">
+                          {item.inicio} – {item.fim}
+                        </div>
+                        <p className="text-xs text-slate-600 truncate">
+                          {hasClass
+                            ? `Aula: ${item.classMatch?.materia}`
+                            : hasRes
+                            ? 'Já reservado por usuário'
+                            : item.isReleased
+                            ? 'Liberado para agendamento'
+                            : 'Bloqueado (Padrão)'}
+                        </p>
+                      </div>
+
+                      {hasClass ? (
+                        <span className="text-xs font-semibold text-emerald-800 flex items-center gap-1 shrink-0">
+                          <GraduationCap className="h-3.5 w-3.5" />
+                          Grade
+                        </span>
+                      ) : hasRes ? (
+                        <span className="text-xs font-semibold text-rose-700 shrink-0">
+                          Ocupado
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={isMutatingSlots}
+                          onClick={() => handleToggleSingleSlotRelease(item)}
+                          className={cn(
+                            'px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5 disabled:opacity-50',
+                            item.isReleased
+                              ? 'bg-white border border-slate-200 text-slate-700 hover:bg-red-50 hover:text-red-700 hover:border-red-200'
+                              : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                          )}
+                        >
+                          {item.isReleased ? (
+                            <>
+                              <Lock className="h-3 w-3" />
+                              Bloquear
+                            </>
+                          ) : (
+                            <>
+                              <Unlock className="h-3 w-3" />
+                              Liberar
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* MODO 2: LOTE EM TODAS AS SALAS ATIVAS */}
+        {releaseScopeRoomId === 'TODAS_ATIVAS' && (
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h4 className="text-sm font-bold text-slate-900">
+                  Liberação em Lote para Todas as Salas Ativas ({formatDataBR(releaseDate)})
+                </h4>
+                <p className="text-xs text-slate-500">
+                  Selecione os blocos que deseja abrir. Salas com aula regular na grade naquele horário são ignoradas automaticamente.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSelectedBatchBlockIds((config.blocosPadrao || []).map((b) => b.id))
+                  }
+                  className="text-xs font-semibold text-slate-600 hover:text-slate-900 cursor-pointer whitespace-nowrap"
+                >
+                  Marcar todos
+                </button>
+                <span className="text-slate-300">·</span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedBatchBlockIds([])}
+                  className="text-xs font-semibold text-slate-600 hover:text-slate-900 cursor-pointer whitespace-nowrap"
+                >
+                  Limpar
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+              {(config.blocosPadrao || []).map((blk) => {
+                const checked = selectedBatchBlockIds.includes(blk.id);
+                return (
+                  <button
+                    key={blk.id}
+                    type="button"
+                    onClick={() =>
+                      setSelectedBatchBlockIds((prev) =>
+                        prev.includes(blk.id)
+                          ? prev.filter((id) => id !== blk.id)
+                          : [...prev, blk.id]
+                      )
+                    }
+                    className={cn(
+                      'p-2.5 rounded-xl border text-left transition-colors cursor-pointer',
+                      checked
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-700 border-slate-200 hover:border-slate-400'
+                    )}
+                  >
+                    <div className="text-xs font-mono tabular-nums font-bold">
+                      {blk.inicio} – {blk.fim}
+                    </div>
+                    <div
+                      className={cn(
+                        'text-[11px] truncate',
+                        checked ? 'text-slate-300' : 'text-slate-500'
+                      )}
+                    >
+                      {blk.label}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                type="button"
+                disabled={isMutatingSlots || selectedBatchBlockIds.length === 0}
+                onClick={handleBatchReleaseAcrossAllActiveRooms}
+                className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                <Unlock className="h-4 w-4" />
+                Liberar Blocos Selecionados nas Salas sem Aula
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* CRIAR E LIBERAR HORÁRIO PERSONALIZADO NA DATA */}
+        <form
+          onSubmit={handleAddAndReleaseCustomSlot}
+          className="pt-4 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-12 gap-3 items-end"
+        >
+          <div className="sm:col-span-3 space-y-1">
+            <label className="text-xs font-semibold text-slate-700 block">
+              Horário Personalizado (Início)
+            </label>
+            <input
+              type="time"
+              value={customSlotStart}
+              onChange={(e) => setCustomSlotStart(e.target.value)}
+              required
+              className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono tabular-nums font-semibold text-slate-900 outline-none focus:ring-2 focus:ring-fatec-red"
+            />
+          </div>
+          <div className="sm:col-span-3 space-y-1">
+            <label className="text-xs font-semibold text-slate-700 block">Término</label>
+            <input
+              type="time"
+              value={customSlotEnd}
+              onChange={(e) => setCustomSlotEnd(e.target.value)}
+              required
+              className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-mono tabular-nums font-semibold text-slate-900 outline-none focus:ring-2 focus:ring-fatec-red"
+            />
+          </div>
+          <div className="sm:col-span-4 space-y-1">
+            <label className="text-xs font-semibold text-slate-700 block">
+              Identificação (Opcional)
+            </label>
+            <input
+              type="text"
+              placeholder="Ex: Plantão de Monitoria / Estudo"
+              value={customSlotLabel}
+              onChange={(e) => setCustomSlotLabel(e.target.value)}
+              className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm text-slate-900 outline-none focus:ring-2 focus:ring-fatec-red"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <button
+              type="submit"
+              disabled={isMutatingSlots}
+              className="w-full py-2 px-3 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 h-[38px] cursor-pointer disabled:opacity-50 whitespace-nowrap"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Liberar Slot
+            </button>
+          </div>
+        </form>
+
+        {/* RESUMO DE SLOTS LIBERADOS A PARTIR DE HOJE */}
+        {activeUpcomingSlots.length > 0 && (
+          <div className="pt-4 border-t border-slate-100 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <h4 className="text-xs font-bold text-slate-700">
+                Horários Liberados Ativos (a partir de {formatDataBR(todayISO)})
+              </h4>
+              <span className="text-xs font-mono tabular-nums text-slate-500">
+                Total: {activeUpcomingSlots.length}
+              </span>
+            </div>
+            <div className="max-h-56 overflow-y-auto border border-slate-200 rounded-xl divide-y divide-slate-100">
+              {activeUpcomingSlots.slice(0, 40).map((slot) => (
+                <div
+                  key={slot.id}
+                  className="px-4 py-2.5 flex items-center justify-between gap-3 text-xs hover:bg-slate-50"
+                >
+                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                    <span className="font-mono tabular-nums font-bold text-slate-900">
+                      {formatDataBR(slot.data)}
+                    </span>
+                    <span className="text-slate-300">·</span>
+                    <span className="font-mono tabular-nums font-semibold text-emerald-700">
+                      {slot.inicio} – {slot.fim}
+                    </span>
+                    <span className="text-slate-300">·</span>
+                    <span className="font-semibold text-slate-800 truncate">{slot.salaNome}</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isMutatingSlots}
+                    onClick={async () => {
+                      setIsMutatingSlots(true);
+                      try {
+                        await deleteSlot(slot.id);
+                        toast.success('Liberação removida.');
+                      } catch {
+                        toast.error('Erro ao remover liberação.');
+                      } finally {
+                        setIsMutatingSlots(false);
+                      }
+                    }}
+                    className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer shrink-0"
+                    title="Revogar e remover liberação"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* GRID SECUNDÁRIO: JANELAS OPERACIONAIS + BLOCOS PADRÃO */}
       <form onSubmit={handleSaveGlobalRules} className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
         {/* COLUNA ESQUERDA: PARÂMETROS DA JANELA */}
         <div className="xl:col-span-5 bg-white border border-slate-200 rounded-2xl p-6 space-y-6">
           <div>
             <h3 className="text-base font-bold text-slate-900">Janelas Operacionais Padrão</h3>
             <p className="text-xs text-slate-500 mt-1">
-              Defina os horários em que salas, laboratórios e auditórios aceitam reservas regulares.
+              Defina os parâmetros institucionais de abertura do portal e dias da semana habilitados.
             </p>
           </div>
 
@@ -405,20 +1135,20 @@ export function AdminSchedulesTab() {
               className="w-full py-3 px-4 bg-fatec-red hover:bg-red-800 text-white rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
             >
               <Save className="h-4 w-4" />
-              {isSavingGlobal ? 'Salvando configurações...' : 'Salvar Regras e Blocos Padrão'}
+              {isSavingGlobal ? 'Salvando configurações...' : 'Salvar Regras e Grade Base'}
             </button>
           </div>
         </div>
 
-        {/* COLUNA DIREITA: GERADOR E GESTÃO DE BLOCOS PADRÃO (EX: AULAS DE 50 MIN) */}
+        {/* COLUNA DIREITA: GERADOR E GESTÃO DE BLOCOS PADRÃO */}
         <div className="xl:col-span-7 bg-white border border-slate-200 rounded-2xl p-6 space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div>
               <h3 className="text-base font-bold text-slate-900">
-                Blocos Padrão de Horários Pedagógicos
+                Grade Base de Blocos Pedagógicos
               </h3>
               <p className="text-xs text-slate-500 mt-1">
-                Configure blocos padrão (ex: aulas de 50 minutos) oferecidos como seleção rápida na reserva.
+                Define os blocos base (ex: 50 min) usados como modelo. Permanecem bloqueados para alunos até serem liberados por sala e data na seção acima.
               </p>
             </div>
             <button
@@ -511,11 +1241,11 @@ export function AdminSchedulesTab() {
                       className={cn(
                         'px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap',
                         blk.ativo
-                          ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                          : 'bg-slate-200 text-slate-600 hover:bg-slate-300'
+                          ? 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                          : 'bg-slate-200 text-slate-500 hover:bg-slate-300'
                       )}
                     >
-                      {blk.ativo ? 'Liberado' : 'Inativo'}
+                      {blk.ativo ? 'Na Grade Base' : 'Oculto'}
                     </button>
                     <button
                       type="button"
@@ -562,7 +1292,7 @@ export function AdminSchedulesTab() {
             </p>
             <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
               Todos os dias seguem atualmente a janela operacional padrão ({config.janelaInicio} às{' '}
-              {config.janelaFim}). Adicione uma exceção para abrir horários especiais ou bloquear datas.
+              {config.janelaFim}). Adicione uma exceção para abrir janelas especiais ou fechar datas.
             </p>
           </div>
         ) : (
@@ -599,7 +1329,7 @@ export function AdminSchedulesTab() {
                       ) : (
                         <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums font-semibold text-emerald-700">
                           <CheckCircle2 className="h-3.5 w-3.5" />
-                          Liberado: {ex.janelaInicio} às {ex.janelaFim}
+                          Janela Especial: {ex.janelaInicio} às {ex.janelaFim}
                         </span>
                       )}
                     </td>
@@ -678,7 +1408,7 @@ export function AdminSchedulesTab() {
             >
               <div className="flex items-center justify-between">
                 <h4 id="modal-bloco-title" className="text-base font-bold text-slate-900">
-                  Adicionar Bloco de Horário
+                  Adicionar Bloco na Grade Base
                 </h4>
                 <button
                   type="button"
