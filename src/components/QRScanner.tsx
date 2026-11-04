@@ -5,17 +5,28 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { Html5Qrcode } from 'html5-qrcode';
-import { X, CameraOff, AlertCircle, Camera, Loader2, ShieldAlert, CheckCircle2 } from 'lucide-react';
+import { X, AlertCircle, Camera, Loader2, ShieldAlert, CheckCircle2, Clock } from 'lucide-react';
 import { useCheckInStore } from '../store/useCheckInStore';
+import { useAuthStore } from '../store/useAuthStore';
+import { isUserInactive } from '../types';
 
 interface QRScannerProps {
+  reservationId?: string | null;
   onScan?: (data: string) => void;
   onClose: () => void;
 }
 
-type ScannerStatus = 'CONSENT' | 'SCANNING' | 'DENIED' | 'LOADING' | 'EVALUATING' | 'SUCCESS' | 'ERROR';
+type ScannerStatus =
+  | 'CONSENT'
+  | 'SCANNING'
+  | 'DENIED'
+  | 'LOADING'
+  | 'EVALUATING'
+  | 'SUCCESS'
+  | 'QUEUED'
+  | 'ERROR';
 
-export function QRScanner({ onScan, onClose }: QRScannerProps) {
+export function QRScanner({ reservationId, onScan, onClose }: QRScannerProps) {
   const [status, setStatus] = useState<ScannerStatus>('LOADING');
   const [error, setError] = useState<string | null>(null);
   const qrScannerRef = useRef<Html5Qrcode | null>(null);
@@ -23,12 +34,25 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
   const containerId = "qr-reader-strict";
   const currentScanIdRef = useRef<string | null>(null);
   
-  const { processCheckIn, message, isProcessing, clearMessage } = useCheckInStore();
+  const currentUser = useAuthStore((state) => state.user);
+  const isInactiveUser = isUserInactive(currentUser);
+  const { processCheckIn, message, clearMessage } = useCheckInStore();
 
   const isMountedRef = useRef(true);
 
   useEffect(() => {
     isMountedRef.current = true;
+
+    if (isInactiveUser) {
+      setStatus('DENIED');
+      setError(
+        'Perfil inativado pelo ADM, caso tenha dúvidas procure o coordenador do curso para mais informações'
+      );
+      return () => {
+        isMountedRef.current = false;
+        clearMessage();
+      };
+    }
     
     const checkInitialPermission = async () => {
       try {
@@ -44,7 +68,7 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
           if (!isMountedRef.current) return;
           setStatus('CONSENT');
         }
-      } catch (err) {
+      } catch {
         if (!isMountedRef.current) return;
         setStatus('CONSENT');
       }
@@ -66,18 +90,19 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
     await stopScanner();
 
     try {
-      const success = await processCheckIn(decodedText);
+      const success = await processCheckIn(decodedText, reservationId || undefined);
 
       if (!isMountedRef.current) return;
 
       if (success) {
-        setStatus('SUCCESS');
+        const outcome = useCheckInStore.getState().lastOutcome;
+        setStatus(outcome === 'QUEUED_OFFLINE' ? 'QUEUED' : 'SUCCESS');
         if (onScan) onScan(decodedText);
         setTimeout(() => {
           if (isMountedRef.current) {
             onClose();
           }
-        }, 2500);
+        }, outcome === 'QUEUED_OFFLINE' ? 3400 : 2500);
       } else {
         const errorMsg = useCheckInStore.getState()?.message?.text || 'Código inválido para check-in.';
         setError(errorMsg);
@@ -92,6 +117,13 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
   };
 
   const startScanning = async () => {
+    if (isInactiveUser) {
+      setStatus('DENIED');
+      setError(
+        'Perfil inativado pelo ADM, caso tenha dúvidas procure o coordenador do curso para mais informações'
+      );
+      return;
+    }
     const scanId = Math.random().toString();
     currentScanIdRef.current = scanId;
 
@@ -188,22 +220,41 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
   };
 
   useEffect(() => {
-    return () => {
-      stopScanner();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
     };
-  }, []);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      void stopScanner();
+    };
+  }, [onClose]);
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="qr-scanner-modal-title"
+      className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md"
+    >
       <div className="relative w-full max-w-md bg-white rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/20">
         <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
           <div className="flex items-center gap-3">
             <div className="h-10 w-10 bg-fatec-red/10 rounded-xl flex items-center justify-center text-fatec-red">
-              <Camera className="h-5 w-5" />
+              <Camera className="h-5 w-5" aria-hidden="true" />
             </div>
-            <h3 className="font-black text-slate-900 uppercase italic tracking-tighter">Check-in Presencial</h3>
+            <h3 id="qr-scanner-modal-title" className="font-black text-slate-900 uppercase italic tracking-tighter">
+              Check-in Presencial
+            </h3>
           </div>
-          <button onClick={onClose} className="p-2 text-slate-400 hover:text-slate-600 transition-colors">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Fechar leitor de QR Code"
+            className="p-2 text-slate-400 hover:text-slate-600 transition-colors"
+          >
             <X className="h-6 w-6" />
           </button>
         </div>
@@ -338,6 +389,24 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
             </div>
           )}
 
+          {status === 'QUEUED' && (
+            <div className="text-center space-y-6 animate-in fade-in zoom-in duration-300">
+              <div className="p-7 bg-amber-50 rounded-3xl border border-amber-200">
+                <Clock className="h-14 w-14 text-amber-600 mx-auto mb-4" />
+                <p className="text-amber-950 font-black uppercase italic text-base mb-2">
+                  Pendente de Validação no Servidor
+                </p>
+                <p className="text-amber-900 text-xs font-bold leading-relaxed">
+                  {message?.text ||
+                    'Sem conexão no momento. A leitura foi salva localmente e será validada no servidor assim que a internet retornar.'}
+                </p>
+              </div>
+              <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                Aguardando reconexão automática...
+              </p>
+            </div>
+          )}
+
           {status === 'DENIED' && (
             <div className="text-center space-y-6">
               <div className="p-6 bg-red-50 rounded-3xl border border-red-100">
@@ -349,7 +418,8 @@ export function QRScanner({ onScan, onClose }: QRScannerProps) {
               </div>
               <button
                 onClick={startScanning}
-                className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-widest text-sm shadow-xl hover:bg-slate-800 transition-all"
+                disabled={isInactiveUser}
+                className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black uppercase tracking-widest text-sm shadow-xl hover:bg-slate-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Permitir câmera novamente
               </button>

@@ -31,7 +31,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { useAuthStore } from '../../store/useAuthStore';
 import { useReservationStore } from '../../store/useReservationStore';
 import { useRoomStore } from '../../store/useRoomStore';
-import { CalendarCourse, DayOfWeek, CalendarEvent, Room } from '../../types';
+import { CalendarCourse, DayOfWeek, CalendarEvent, Room, isUserInactive } from '../../types';
 import { GRADE_CURRICULAR_FATEC } from '../../data/gradeCurricular';
 import { CalendarFilters, CalendarViewMode } from './components/CalendarFilters';
 import { MonthCalendarGrid } from './components/MonthCalendarGrid';
@@ -90,6 +90,7 @@ export function CalendarioPage() {
   const user = useAuthStore(state => state.user);
   const updateProfile = useAuthStore(state => state.updateProfile);
   const isAdmin = user?.role === 'ADMIN';
+  const isInactiveUser = isUserInactive(user);
 
   const rawReservations = useReservationStore(state => state.reservations);
   const fetchReservations = useReservationStore(state => state.fetchReservations);
@@ -330,6 +331,9 @@ export function CalendarioPage() {
   };
 
   const handleCancelReservation = async (reservationId: string) => {
+    if (isInactiveUser) {
+      throw new Error('Perfil inativado pelo ADM. Cancelamentos estão bloqueados.');
+    }
     await updateReservation(reservationId, { status: 'CANCELADA' });
   };
 
@@ -339,6 +343,10 @@ export function CalendarioPage() {
   };
 
   const handleRequestRoomBooking = (roomName: string, preferredTime?: string) => {
+    if (isInactiveUser) {
+      toast.error('Perfil inativado pelo ADM. Agendamentos estão bloqueados.');
+      return;
+    }
     setBookingPrefill({
       roomName,
       startTime: preferredTime || '17:00'
@@ -398,7 +406,9 @@ export function CalendarioPage() {
 
           <button
             type="button"
+            disabled={isInactiveUser}
             onClick={() => {
+              if (isInactiveUser) return;
               const windowCheck = isBookingWindowOpen(new Date(), isAdmin);
               if (!windowCheck.isOpen) {
                 toast.error(windowCheck.message);
@@ -407,7 +417,7 @@ export function CalendarioPage() {
               setBookingPrefill({ startTime: '17:00' });
               setIsNewReservationOpen(true);
             }}
-            className="px-4 py-2.5 rounded-2xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-black uppercase tracking-wider shadow-sm shadow-red-500/20 flex items-center gap-2 transition-all active:scale-95 whitespace-nowrap shrink-0 cursor-pointer"
+            className="px-4 py-2.5 rounded-2xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-black uppercase tracking-wider shadow-sm shadow-red-500/20 flex items-center gap-2 transition-all active:scale-95 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus className="h-4 w-4" />
             Nova Reserva
@@ -483,6 +493,10 @@ export function CalendarioPage() {
             selectedRoomId={selectedRoomId}
             onSelectEvent={setSelectedEvent}
             onNewReservationOnDate={(dateStr, startTime, roomName) => {
+              if (isInactiveUser) {
+                toast.error('Perfil inativado pelo ADM. Agendamentos estão bloqueados.');
+                return;
+              }
               const targetRoomName =
                 roomName || (selectedRoomId !== 'TODAS' ? selectedRoomId : undefined);
               const targetRoom = targetRoomName

@@ -47,13 +47,13 @@ import {
   formatNoShowTag,
   getUserNoShowBlockedDate,
 } from '../../services/reservationService';
-import { Reservation, ReservationStatus } from '../../types';
+import { Reservation, ReservationStatus, isUserInactive } from '../../types';
 import { cn } from '../../lib/utils';
 import { toast } from 'sonner';
 import { getTodayLocalISO, formatDataBR, createSafeLocalDateTime } from '../../utils/dateUtils';
 import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 
-function UsageTimer({ resId, data, inicio, fim, isConfirmed, onCancel }: { resId: string, data: string, inicio: string, fim: string, isConfirmed: boolean, onCancel: () => void }) {
+function UsageTimer({ resId, data, inicio, fim, isConfirmed, onCancel, disabled }: { resId: string, data: string, inicio: string, fim: string, isConfirmed: boolean, onCancel: () => void, disabled?: boolean }) {
   const [current, setCurrent] = useState(Date.now());
 
   useEffect(() => {
@@ -85,8 +85,10 @@ function UsageTimer({ resId, data, inicio, fim, isConfirmed, onCancel }: { resId
         </div>
       </div>
       <button
+        type="button"
+        disabled={disabled}
         onClick={onCancel}
-        className="w-full bg-fatec-red hover:bg-fatec-red/80 text-white py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 flex items-center justify-center gap-2 shadow-lg shadow-red-950/40"
+        className="w-full bg-fatec-red hover:bg-fatec-red/80 text-white py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 flex items-center justify-center gap-2 shadow-lg shadow-red-950/40 disabled:opacity-50 disabled:cursor-not-allowed"
       >
         Terminar Reserva e Liberar Sala
       </button>
@@ -181,6 +183,7 @@ export function ReservasPage() {
   const activePunishment = usePunishmentStore(state => state.activePunishment);
   const fetchUserPunishments = usePunishmentStore(state => state.fetchUserPunishments);
   const isAdmin = user?.role === 'ADMIN';
+  const isInactiveUser = isUserInactive(user);
 
   const reservations = useMemo(
     () => (Array.isArray(rawReservations) ? rawReservations : []),
@@ -258,6 +261,10 @@ export function ReservasPage() {
   }, [fetchReservations, fetchRooms, fetchUserPunishments, user?.id, isAdmin]);
 
   const handleCancel = async (id: string, status: ReservationStatus) => {
+    if (isInactiveUser) {
+      toast.error('Perfil inativado pelo ADM. Cancelamentos e alterações estão bloqueados.');
+      return;
+    }
     setConfirmingCancelId(null);
     setCancellingIds(prev => new Set(prev).add(id));
     
@@ -289,6 +296,10 @@ export function ReservasPage() {
   };
 
   const initiateCancel = (id: string, status: ReservationStatus) => {
+    if (isInactiveUser) {
+      toast.error('Perfil inativado pelo ADM. Cancelamentos estão bloqueados.');
+      return;
+    }
     setConfirmingCancelId(id);
   };
 
@@ -304,6 +315,7 @@ export function ReservasPage() {
   };
 
   const handleHide = async (id: string) => {
+    if (isInactiveUser) return;
     try {
       await hideForUser(id);
       toast.success('Registro removido do seu histórico.');
@@ -408,8 +420,11 @@ export function ReservasPage() {
           {/* Quick action to book another room */}
           <button
             type="button"
-            onClick={() => navigate('/salas')}
-            className="px-4 py-2.5 rounded-2xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-semibold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            disabled={isInactiveUser}
+            onClick={() => {
+              if (!isInactiveUser) navigate('/salas');
+            }}
+            className="px-4 py-2.5 rounded-2xl bg-fatec-red hover:bg-fatec-red/90 text-white text-xs font-semibold flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus className="h-4 w-4" />
             <span>Nova Reserva</span>
@@ -713,8 +728,10 @@ export function ReservasPage() {
                             </span>
                             {isConfirmed && !isAdmin && (
                               <button
+                                type="button"
+                                disabled={isInactiveUser}
                                 onClick={() => initiateCancel(res.id, res.status)}
-                                className="text-slate-300 hover:text-fatec-red transition-colors p-0.5"
+                                className="text-slate-300 hover:text-fatec-red transition-colors p-0.5 disabled:opacity-40 disabled:cursor-not-allowed"
                                 title="Cancelar Check-in / Reserva"
                               >
                                 <XCircle className="h-4 w-4" />
@@ -808,6 +825,7 @@ export function ReservasPage() {
                         inicio={res.inicio} 
                         fim={res.fim} 
                         isConfirmed={isConfirmed} 
+                        disabled={isInactiveUser}
                         onCancel={() => handleCancel(res.id, res.status)} 
                       />
                     )}
@@ -822,8 +840,12 @@ export function ReservasPage() {
                   <div className="bg-slate-50/80 px-5 py-4 flex flex-col md:w-48 items-center justify-center gap-2.5 border-t md:border-t-0 md:border-l border-slate-100">
                     {canCheckIn && (
                       <button
-                        onClick={() => setScanningResId(res.id)}
-                        className="w-full bg-emerald-500 hover:bg-emerald-600 text-white py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-emerald-100 transition-all active:scale-95 flex items-center justify-center gap-2"
+                        type="button"
+                        disabled={isInactiveUser}
+                        onClick={() => {
+                          if (!isInactiveUser) setScanningResId(res.id);
+                        }}
+                        className="w-full bg-emerald-500 hover:bg-emerald-600 text-white py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-emerald-100 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <QrCode className="h-4 w-4" />
                         QR Check-in
@@ -839,13 +861,15 @@ export function ReservasPage() {
                             </p>
                             <div className="flex gap-2">
                               <button
+                                type="button"
                                 onClick={() => handleCancel(res.id, res.status)}
-                                disabled={cancellingIds.has(res.id)}
-                                className="flex-1 bg-fatec-red text-white py-2 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-red-700 transition-all active:scale-95 disabled:opacity-50"
+                                disabled={isInactiveUser || cancellingIds.has(res.id)}
+                                className="flex-1 bg-fatec-red text-white py-2 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-red-700 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                               >
                                 Sim
                               </button>
                               <button
+                                type="button"
                                 onClick={() => setConfirmingCancelId(null)}
                                 className="flex-1 bg-slate-100 text-slate-600 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-slate-200 transition-all active:scale-95"
                               >
@@ -855,10 +879,11 @@ export function ReservasPage() {
                           </div>
                         ) : (
                           <button
+                            type="button"
                             onClick={() => initiateCancel(res.id, res.status)}
-                            disabled={cancellingIds.has(res.id)}
+                            disabled={isInactiveUser || cancellingIds.has(res.id)}
                             className={cn(
-                              "w-full py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 disabled:opacity-50",
+                              "w-full py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed",
                               isConfirmed
                                 ? "bg-emerald-50 text-emerald-600 hover:bg-fatec-red hover:text-white border border-emerald-100"
                                 : canCheckIn 
@@ -881,9 +906,10 @@ export function ReservasPage() {
                     {!isAdmin ? (
                       <div className="flex items-center gap-2">
                         <button
+                          type="button"
                           onClick={() => handleHide(res.id)}
-                          disabled={!canManage}
-                          className={cn("p-2 transition-colors", canManage ? "text-slate-300 hover:text-slate-600" : "text-slate-100 cursor-not-allowed")}
+                          disabled={!canManage || isInactiveUser}
+                          className={cn("p-2 transition-colors", canManage && !isInactiveUser ? "text-slate-300 hover:text-slate-600" : "text-slate-100 cursor-not-allowed")}
                           title="Remover do histórico"
                         >
                           <Trash2 className="h-4 w-4" />

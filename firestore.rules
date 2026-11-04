@@ -32,9 +32,17 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isNotDeletedUserDoc(userData) {
+      return (!('deleted' in userData) || userData.deleted == null || userData.deleted == false) &&
+             (!('status' in userData) || userData.status == null || userData.status != 'deleted');
+    }
+
     function isActiveUserDoc(userData) {
-      return (!('bloqueado' in userData) || userData.bloqueado == null || userData.bloqueado == false) &&
-             (!('inativo' in userData) || userData.inativo == null || userData.inativo == false);
+      return isNotDeletedUserDoc(userData) &&
+             (!('bloqueado' in userData) || userData.bloqueado == null || userData.bloqueado == false) &&
+             (!('inativo' in userData) || userData.inativo == null || userData.inativo == false) &&
+             (!('active' in userData) || userData.active == null || userData.active == true) &&
+             (!('status' in userData) || userData.status == null || userData.status == 'active');
     }
 
     // Regra 3: Bloqueio por No-Show restrito estritamente à data exata da falta (blockedDate)
@@ -140,6 +148,11 @@ service cloud.firestore {
                (!('aprovado' in data) || data.aprovado is bool) &&
                (!('bloqueado' in data) || data.bloqueado is bool) &&
                (!('inativo' in data) || data.inativo is bool) &&
+               (!('active' in data) || data.active is bool) &&
+               (!('status' in data) || data.status == null || (data.status is string && data.status in ['active', 'inactive', 'deleted'])) &&
+               (!('deleted' in data) || data.deleted is bool) &&
+               (!('deletedAt' in data) || data.deletedAt == null || data.deletedAt is number) &&
+               (!('deletedBy' in data) || data.deletedBy == null || (data.deletedBy is string && data.deletedBy.size() <= 128)) &&
                (!('blockedDate' in data) || data.blockedDate == null || (data.blockedDate is string && data.blockedDate.size() <= 16)) &&
                (!('punidoAte' in data) || data.punidoAte == null || data.punidoAte is number) &&
                (!('motivoPunicao' in data) || data.motivoPunicao == null || (data.motivoPunicao is string && data.motivoPunicao.size() <= 500)) &&
@@ -149,6 +162,7 @@ service cloud.firestore {
                (!('semestre' in data) || data.semestre == null || data.semestre is number) &&
                (!('semester' in data) || data.semester == null || data.semester is number) &&
                (!('authCodeSubmitted' in data) || data.authCodeSubmitted == null || (data.authCodeSubmitted is string && data.authCodeSubmitted.size() <= 64)) &&
+               (!('adminCodeHashProof' in data) || data.adminCodeHashProof == null || (data.adminCodeHashProof is string && data.adminCodeHashProof.size() == 64 && data.adminCodeHashProof.matches('^[a-f0-9]{64}$'))) &&
                (!('createdAt' in data) || data.createdAt is number) &&
                (!('updatedAt' in data) || data.updatedAt is number);
       }
@@ -160,40 +174,42 @@ service cloud.firestore {
       allow create: if isSignedIn() && isValidId(userId) && isOwner(userId) &&
                     isValidUser(incoming()) &&
                     isActiveUserDoc(incoming()) &&
+                    !('authCodeSubmitted' in incoming()) &&
                     incoming().get('createdAt', 0) is number &&
                     (
                       (
                         incoming().get('role', 'USUARIO') == 'USUARIO' &&
                         incoming().get('tipoVinculo', 'ALUNO') in ['ALUNO', 'SERVIDOR'] &&
-                        !('authCodeSubmitted' in incoming())
+                        !('adminCodeHashProof' in incoming())
                       ) ||
                       (
                         incoming().get('role', 'USUARIO') == 'ADMIN' && (
                           isBootstrapAdmin() ||
                           (exists(/databases/$(database)/documents/settings/admin_auth) &&
-                           get(/databases/$(database)/documents/settings/admin_auth).data.get('allowAdminSignup', true) == true &&
-                           'authCodeSubmitted' in incoming() &&
-                           incoming().authCodeSubmitted is string &&
-                           incoming().authCodeSubmitted.size() <= 64 &&
-                           incoming().authCodeSubmitted == get(/databases/$(database)/documents/settings/admin_auth).data.get('codeAuth', '')) ||
-                          (!exists(/databases/$(database)/documents/settings/admin_auth) &&
-                           'authCodeSubmitted' in incoming() &&
-                           incoming().authCodeSubmitted is string &&
-                           incoming().authCodeSubmitted.size() <= 64 &&
-                           incoming().authCodeSubmitted == '051325')
+                           get(/databases/$(database)/documents/settings/admin_auth).data.get('allowAdminSignup', false) == true &&
+                           get(/databases/$(database)/documents/settings/admin_auth).data.get('codeHash', '').size() == 64 &&
+                           'adminCodeHashProof' in incoming() &&
+                           incoming().adminCodeHashProof is string &&
+                           incoming().adminCodeHashProof.size() == 64 &&
+                           incoming().adminCodeHashProof == get(/databases/$(database)/documents/settings/admin_auth).data.get('codeHash', ''))
                         )
                       )
                     );
 
       allow update: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
         isAdmin() ||
-        // Action 1: Owner updates personal profile fields or receives automatic single-day no-show penalty
+        // Action 1: Non-deleted owner (active OR inactive) updates personal profile data without altering status/role/punishments
         (isOwner(userId) &&
-         isActiveUserDoc(existing()) &&
-         isActiveUserDoc(incoming()) &&
+         isNotDeletedUserDoc(existing()) &&
+         isNotDeletedUserDoc(incoming()) &&
          incoming().get('email', '') == existing().get('email', '') &&
          incoming().get('role', 'USUARIO') == existing().get('role', 'USUARIO') &&
          incoming().get('aprovado', true) == existing().get('aprovado', true) &&
+         incoming().get('inativo', false) == existing().get('inativo', false) &&
+         incoming().get('bloqueado', false) == existing().get('bloqueado', false) &&
+         incoming().get('active', true) == existing().get('active', true) &&
+         incoming().get('status', 'active') == existing().get('status', 'active') &&
+         incoming().get('deleted', false) == existing().get('deleted', false) &&
          (existing().get('role', 'USUARIO') == 'ADMIN' || (
            incoming().get('tipoVinculo', 'ALUNO') in ['ALUNO', 'SERVIDOR'] &&
            incoming().get('curso', '') == existing().get('curso', '') &&
@@ -202,15 +218,33 @@ service cloud.firestore {
          incoming().diff(existing()).affectedKeys().hasOnly([
            'nome', 'name', 'phone', 'phoneFormatted', 'whatsappNotificationsEnabled',
            'ra', 'tipoVinculo', 'updatedAt', 'avatarUrl',
-           'dataNascimento', 'blockedDate', 'punidoAte', 'motivoPunicao',
-           'curso', 'course', 'semestre', 'semester'
+           'dataNascimento', 'curso', 'course', 'semestre', 'semester'
          ])) ||
-        // Action 2: Standard user self-deactivates (deletes) their own profile -> marked inactive for ADM
+        // Action 2: Active owner receives automatic single-day no-show penalty (cannot clear blockedDate to empty string)
         (isOwner(userId) &&
-         'inativo' in incoming() && incoming().inativo == true &&
-         'bloqueado' in incoming() && incoming().bloqueado == true &&
+         isActiveUserDoc(existing()) &&
+         isActiveUserDoc(incoming()) &&
+         incoming().get('blockedDate', '') is string &&
+         incoming().get('blockedDate', '').size() >= 8 &&
+         incoming().get('punidoAte', null) == null &&
+         incoming().get('motivoPunicao', '') is string &&
+         incoming().get('motivoPunicao', '').size() >= 5 &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'blockedDate', 'punidoAte', 'motivoPunicao', 'updatedAt'
+         ])) ||
+        // Action 3: Non-deleted user permanently excludes their own profile (deleted: true, omitted from ADM panel)
+        (isOwner(userId) &&
+         isNotDeletedUserDoc(existing()) &&
+         incoming().get('deleted', false) == true &&
+         incoming().get('status', '') == 'deleted' &&
+         incoming().get('active', true) == false &&
+         incoming().get('inativo', false) == true &&
+         incoming().get('bloqueado', false) == true &&
+         incoming().get('deletedBy', '') == request.auth.uid &&
          incoming().get('role', 'USUARIO') == existing().get('role', 'USUARIO') &&
-         incoming().diff(existing()).affectedKeys().hasOnly(['inativo', 'bloqueado', 'updatedAt']))
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'deleted', 'deletedAt', 'deletedBy', 'status', 'active', 'inativo', 'bloqueado', 'updatedAt'
+         ]))
       );
 
       allow delete: if isAdmin() && isValidId(userId);
@@ -284,6 +318,42 @@ service cloud.firestore {
       allow delete: if isAdmin() && isValidSlotId(slotId);
     }
 
+    // 3.2 SLOT LOCKS (/slot_locks/{lockId}) — Controle transacional contra dupla reserva concorrente
+    match /slot_locks/{lockId} {
+      function isValidSlotLock(data) {
+        return data.keys().hasAll(['id', 'salaId', 'data', 'inicio', 'fim', 'reservaId', 'usuarioId', 'createdAt', 'updatedAt']) &&
+               data.keys().hasOnly(['id', 'salaId', 'data', 'inicio', 'fim', 'reservaId', 'usuarioId', 'createdAt', 'updatedAt']) &&
+               data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+               data.salaId is string && data.salaId.size() >= 1 && data.salaId.size() <= 128 &&
+               data.data is string && data.data.size() >= 8 && data.data.size() <= 16 &&
+               data.inicio is string && data.inicio.size() >= 4 && data.inicio.size() <= 8 &&
+               data.fim is string && data.fim.size() >= 4 && data.fim.size() <= 8 &&
+               data.reservaId is string && data.reservaId.size() >= 1 && data.reservaId.size() <= 128 &&
+               data.usuarioId is string && data.usuarioId.size() >= 1 && data.usuarioId.size() <= 128 &&
+               data.createdAt is number &&
+               data.updatedAt is number;
+      }
+
+      allow get: if isSignedIn() && isValidSlotId(lockId);
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && isValidSlotId(lockId) && isValidSlotLock(incoming()) && (
+                      isAdmin() ||
+                      (incoming().usuarioId == request.auth.uid &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data))
+                    );
+      allow update: if isSignedIn() && isValidSlotId(lockId) && isValidSlotLock(incoming()) && (
+                      isAdmin() ||
+                      (incoming().usuarioId == request.auth.uid &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
+                       (existing().usuarioId == request.auth.uid ||
+                        !exists(/databases/$(database)/documents/reservas/$(existing().reservaId)) ||
+                        !(get(/databases/$(database)/documents/reservas/$(existing().reservaId)).data.get('status', '') in ['PENDENTE', 'CONFIRMADA'])))
+                    );
+      allow delete: if isAdmin() && isValidSlotId(lockId);
+    }
+
     // 4. RESERVAS (/reservas/{reservaId})
     match /reservas/{reservaId} {
       function isValidReservation(data) {
@@ -303,6 +373,8 @@ service cloud.firestore {
                (!('punicaoFim' in data) || data.punicaoFim == null || data.punicaoFim is number) &&
                (!('checkInExpiracao' in data) || data.checkInExpiracao == null || data.checkInExpiracao is number) &&
                (!('checkInRealizado' in data) || data.checkInRealizado is bool) &&
+               (!('checkInTimestamp' in data) || data.checkInTimestamp == null || data.checkInTimestamp is number) &&
+               (!('checkInMethod' in data) || data.checkInMethod == null || (data.checkInMethod is string && data.checkInMethod.size() <= 40)) &&
                (!('ocultoParaUsuario' in data) || data.ocultoParaUsuario is bool) &&
                (!('whatsappConfirmacaoEnviada' in data) || data.whatsappConfirmacaoEnviada is bool) &&
                (!('whatsappLembreteInicioEnviado' in data) || data.whatsappLembreteInicioEnviado is bool) &&
@@ -321,6 +393,7 @@ service cloud.firestore {
                       (isOwner(incoming().usuarioId) &&
                        'availableSlotId' in incoming() &&
                        isValidSlotId(incoming().availableSlotId) &&
+                       (!('checkInRealizado' in incoming()) || incoming().checkInRealizado == false) &&
                        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
                        isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data) &&
                        isNotBlockedOnDate(get(/databases/$(database)/documents/users/$(request.auth.uid)).data, incoming().data) &&
@@ -354,11 +427,16 @@ service cloud.firestore {
             (incoming().get('ocultoParaUsuario', false) == true &&
              incoming().status == existing().status &&
              incoming().diff(existing()).affectedKeys().hasOnly(['ocultoParaUsuario', 'updatedAt'])) ||
-            // Action 4: Perform QR check-in
+            // Action 4: Perform server-validated QR check-in strictly before official checkInExpiracao
             (existing().status == 'PENDENTE' &&
+             existing().get('checkInRealizado', false) == false &&
              incoming().get('checkInRealizado', false) == true &&
              incoming().status == 'CONFIRMADA' &&
-             incoming().diff(existing()).affectedKeys().hasOnly(['checkInRealizado', 'status', 'updatedAt'])) ||
+             (!('checkInExpiracao' in existing()) || existing().checkInExpiracao == null ||
+              (existing().checkInExpiracao is number && request.time.toMillis() <= existing().checkInExpiracao)) &&
+             incoming().diff(existing()).affectedKeys().hasOnly([
+               'checkInRealizado', 'checkInTimestamp', 'checkInMethod', 'status', 'updatedAt'
+             ])) ||
             // Action 5: Update WhatsApp lifecycle alert delivery flags
             (existing().status in ['PENDENTE', 'CONFIRMADA'] &&
              incoming().status == existing().status &&
@@ -437,7 +515,10 @@ service cloud.firestore {
       allow list: if isSignedIn() && (isAdmin() || resource.data.usuarioId == request.auth.uid);
       allow create: if isSignedIn() && isValidId(punishmentId) && isValidPunishment(incoming()) && (
                       isAdmin() ||
-                      (isOwner(incoming().usuarioId) && incoming().tipo == 'AUTOMATICA')
+                      (isOwner(incoming().usuarioId) &&
+                       incoming().tipo == 'AUTOMATICA' &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                       isActiveUserDoc(get(/databases/$(database)/documents/users/$(request.auth.uid)).data))
                     );
       allow update: if isAdmin() && isValidId(punishmentId) && isValidPunishment(incoming());
       allow delete: if isAdmin() && isValidId(punishmentId);
@@ -446,11 +527,15 @@ service cloud.firestore {
     // 7. ADMIN & INTEGRATION SETTINGS (/settings/{settingId})
     match /settings/{settingId} {
       function isValidAdminAuthSetting(data) {
-        return data.get('codeAuth', '') is string && data.get('codeAuth', '').size() >= 4 && data.get('codeAuth', '').size() <= 64 &&
-               data.get('allowAdminSignup', true) is bool &&
-               data.get('updatedAt', 0) is number &&
-               data.get('updatedBy', '') is string && data.get('updatedBy', '').size() >= 1 && data.get('updatedBy', '').size() <= 128 &&
-               data.get('updatedByName', '') is string && data.get('updatedByName', '').size() >= 1 && data.get('updatedByName', '').size() <= 120;
+        return data.keys().hasAll(['codeHash', 'codeMask', 'allowAdminSignup', 'updatedAt', 'updatedBy', 'updatedByName']) &&
+               data.keys().hasOnly(['codeHash', 'codeMask', 'allowAdminSignup', 'updatedAt', 'updatedBy', 'updatedByName']) &&
+               data.codeHash is string && (data.codeHash == '' || (data.codeHash.size() == 64 && data.codeHash.matches('^[a-f0-9]{64}$'))) &&
+               (data.allowAdminSignup == false || data.codeHash.size() == 64) &&
+               data.codeMask is string && data.codeMask.size() >= 1 && data.codeMask.size() <= 64 &&
+               data.allowAdminSignup is bool &&
+               data.updatedAt is number &&
+               data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 128 &&
+               data.updatedByName is string && data.updatedByName.size() >= 1 && data.updatedByName.size() <= 120;
       }
 
       function isValidWhatsAppSetting(data) {
@@ -477,7 +562,7 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // 8. AUDIT LOGS (/logs/{logId}) - Immutable Governance Trail
+    // 8. AUDIT LOGS (/logs/{logId}) - Immutable Governance Trail (Actor UID Verified)
     match /logs/{logId} {
       function isValidLog(data) {
         return data.get('acao', '') is string && data.get('acao', '').size() >= 1 && data.get('acao', '').size() <= 100 &&
@@ -491,7 +576,8 @@ service cloud.firestore {
 
       allow get: if isAdmin() && isValidId(logId);
       allow list: if isAdmin();
-      allow create: if isSignedIn() && isValidId(logId) && isValidLog(incoming());
+      allow create: if isSignedIn() && isValidId(logId) && isValidLog(incoming()) &&
+                    incoming().usuarioId == request.auth.uid;
       allow update, delete: if false;
     }
   }

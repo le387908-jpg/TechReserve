@@ -17,7 +17,7 @@ import {
   Lock,
   Unlock,
 } from 'lucide-react';
-import { CalendarEvent, DayOfWeek, CalendarCourse, Room } from '../../../types';
+import { CalendarEvent, DayOfWeek, CalendarCourse, Room, isUserInactive } from '../../../types';
 import { cn } from '../../../lib/utils';
 import { calculateDayTimeSlots, timeToMinutes } from '../../../utils/calendarTimeSlots';
 import {
@@ -90,6 +90,7 @@ export function MonthCalendarGrid({
   onApproveReservation,
 }: MonthCalendarGridProps) {
   const currentUser = useAuthStore((state) => state.user);
+  const isInactiveUser = isUserInactive(currentUser);
   const rawAvailableSlots = useAvailableSlotsStore((state) => state.slots);
   const rawReservations = useReservationStore((state) => state.reservations);
   const scheduleConfig = useScheduleStore((state) => state.config);
@@ -553,14 +554,16 @@ export function MonthCalendarGrid({
             ) : releasedSlotsForSelectedDate.length > 0 ? (
               <button
                 type="button"
-                onClick={() =>
+                disabled={isInactiveUser}
+                onClick={() => {
+                  if (isInactiveUser) return;
                   onNewReservationOnDate(
                     selectedDateStr,
                     releasedSlotsForSelectedDate[0].slot.inicio,
                     releasedSlotsForSelectedDate[0].room.nome
-                  )
-                }
-                className="px-4 py-2 rounded-2xl bg-amber-400 hover:bg-amber-500 text-slate-950 text-xs font-black transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0 cursor-pointer"
+                  );
+                }}
+                className="px-4 py-2 rounded-2xl bg-amber-400 hover:bg-amber-500 text-slate-950 text-xs font-black transition-all shadow-sm flex items-center gap-2 self-start sm:self-auto whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Unlock className="h-4 w-4" />
                 Horários Disponíveis ({releasedSlotsForSelectedDate.length})
@@ -732,10 +735,12 @@ export function MonthCalendarGrid({
 
                     <button
                       type="button"
-                      onClick={() =>
-                        onNewReservationOnDate(selectedDateStr, slot.inicio, room.nome)
-                      }
-                      className="w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-fatec-red text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                      disabled={isInactiveUser}
+                      onClick={() => {
+                        if (isInactiveUser) return;
+                        onNewReservationOnDate(selectedDateStr, slot.inicio, room.nome);
+                      }}
+                      className="w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-fatec-red text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Plus className="h-3.5 w-3.5" />
                       Reservar este Horário

@@ -15,7 +15,8 @@ import {
 import { collection, onSnapshot, query, orderBy } from 'firebase/firestore';
 import { db } from '../../services/firebase/config';
 import { useAuth } from '../../context/AuthContext';
-import { User } from '../../types';
+import { User, isUserDeleted } from '../../types';
+import { hydrateUserDocument } from '../../services/authService';
 import { AdminAnalyticsTab } from './components/AdminAnalyticsTab';
 import { AdminSchedulesTab } from './components/AdminSchedulesTab';
 import { AdminSpacesTab } from './components/AdminSpacesTab';
@@ -68,7 +69,11 @@ export function AdminPanelPage() {
     const unsub = onSnapshot(
       q,
       (snap) => {
-        setUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() } as User)));
+        setUsers(
+          snap.docs
+            .map((d) => hydrateUserDocument(d.data(), d.id))
+            .filter((u) => !isUserDeleted(u))
+        );
       },
       (err) => {
         console.warn('Admin users listener warning:', err);

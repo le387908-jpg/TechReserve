@@ -8,26 +8,35 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { pingEvolutionKeepAlive } from './server/whatsappGateway.ts';
 import {
-  WhatsAppProxyBody,
-  connectGatewayInstance,
-  disconnectGatewayInstance,
-  dispatchWhatsAppMessage,
-  getGatewayStatus,
-  pingEvolutionKeepAlive,
-} from './server/whatsappGateway.ts';
+  handleProtectedWhatsAppConnect,
+  handleProtectedWhatsAppDisconnect,
+  handleProtectedWhatsAppSend,
+  handleProtectedWhatsAppStatus,
+} from './server/whatsappHttpHandlers.ts';
+import { processServerQrCheckIn } from './server/checkInHandler.ts';
+import { processAdminRegistration } from './server/adminAuthHandler.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const KEEP_ALIVE_INTERVAL_MS = 8 * 60 * 1000; // 8 minutos para evitar hibernação da API WhatsApp
+const KEEP_ALIVE_INTERVAL_MS = 8 * 60 * 1000; // 8 minutos para evitar hibernação da API externa em execução contínua
 
 async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: '256kb' }));
+  app.disable('x-powered-by');
+  app.use(express.json({ limit: '64kb' }));
+
+  // Cabeçalhos básicos de proteção HTTP
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
 
   // Intercepta JSON malformado antes de retornar página HTML de erro do Express
   app.use(
@@ -45,78 +54,41 @@ async function startServer() {
     }
   );
 
+  // Healthcheck de conectividade real e sincronização de relógio oficial do servidor
   app.get('/api/health', (_req, res) => {
-    res.status(200).json({ ok: true });
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.status(200).json({ ok: true, serverTime: Date.now() });
   });
 
-  // Endpoint de diagnóstico e status da instância WhatsApp (não expõe chaves nem tokens)
+  // Endpoint seguro de validação presencial de check-in via QR Code
+  app.post('/api/checkin', async (req, res) => {
+    const result = await processServerQrCheckIn(req);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  // Endpoint seguro de validação de credencial administrativa (code-auth) no cadastro
+  app.post('/api/admin/register', async (req, res) => {
+    const result = await processAdminRegistration(req);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  // Rotas WhatsApp autenticadas com Firebase ID Token, RBAC e Rate Limiting
   app.get('/api/whatsapp/status', async (req, res) => {
-    try {
-      const instanceName = typeof req.query?.instance === 'string' ? req.query.instance : undefined;
-      const status = await getGatewayStatus(instanceName);
-      res.status(200).json(status);
-    } catch (err) {
-      console.error('[Server] Erro em GET /api/whatsapp/status:', err);
-      res.status(500).json({
-        configured: false,
-        provider: 'EVOLUTION',
-        connected: false,
-        state: 'close',
-        message: 'Erro interno ao consultar status do WhatsApp.',
-      });
-    }
+    await handleProtectedWhatsAppStatus(req, res);
   });
 
-  // Endpoint administrativo para criar/conectar instância WhatsApp e obter QR Code / Código de Pareamento
   app.post('/api/whatsapp/connect', async (req, res) => {
-    try {
-      const { phone, forceRecreate, instanceName } = (req.body || {}) as {
-        phone?: string;
-        forceRecreate?: boolean;
-        instanceName?: string;
-      };
-      const result = await connectGatewayInstance({ phone, forceRecreate, instanceName });
-      res.status(result.success ? 200 : 502).json(result);
-    } catch (err) {
-      console.error('[Server] Erro em POST /api/whatsapp/connect:', err);
-      res.status(500).json({
-        success: false,
-        connected: false,
-        state: 'close',
-        error: 'Erro interno ao processar conexão do WhatsApp.',
-      });
-    }
+    await handleProtectedWhatsAppConnect(req, res);
   });
 
-  // Endpoint administrativo para desconectar sessão atual do WhatsApp institucional
   app.post('/api/whatsapp/disconnect', async (req, res) => {
-    try {
-      const { instanceName } = (req.body || {}) as { instanceName?: string };
-      const result = await disconnectGatewayInstance(instanceName);
-      res.status(result.success ? 200 : 502).json(result);
-    } catch (err) {
-      console.error('[Server] Erro em POST /api/whatsapp/disconnect:', err);
-      res.status(500).json({
-        success: false,
-        message: 'Erro interno ao desconectar sessão do WhatsApp.',
-      });
-    }
+    await handleProtectedWhatsAppDisconnect(req, res);
   });
 
-  // Rota proxy server-side para envio de mensagens via Evolution API / Meta Cloud / Webhook
   app.post('/api/whatsapp/send', async (req, res) => {
-    try {
-      const body = (req.body || {}) as WhatsAppProxyBody;
-      const { httpStatus, payload } = await dispatchWhatsAppMessage(body);
-      res.status(httpStatus).json(payload);
-    } catch (err) {
-      console.error('[Server] Erro em POST /api/whatsapp/send:', err);
-      res.status(500).json({
-        success: false,
-        delivered: false,
-        error: 'Erro interno no serviço de envio do WhatsApp.',
-      });
-    }
+    await handleProtectedWhatsAppSend(req, res);
   });
 
   // Integração Vite em desenvolvimento vs arquivos estáticos em produção
@@ -131,8 +103,6 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
-    // Faz o bind da porta 3000 imediatamente e aguarda a inicialização do Vite nas primeiras requisições,
-    // evitando timeout de inicialização em cold-start do container.
     let viteMiddleware: express.RequestHandler | null = null;
     const viteReady = (async () => {
       const { createServer: createViteServer } = await import('vite');

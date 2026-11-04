@@ -219,7 +219,7 @@ export function ConfiguracoesPage() {
     setIsDeactivating(true);
     try {
       await deactivateMyProfile();
-      toast.success('Seu perfil foi encerrado e marcado como inativo.');
+      toast.success('Seu perfil foi excluído com sucesso.');
       navigate('/login');
     } catch (err) {
       toast.error(getFriendlyErrorMessage(err, 'Não foi possível excluir o perfil no momento.'));
@@ -290,31 +290,34 @@ export function ConfiguracoesPage() {
               <p className="text-sm text-slate-500">{user?.email}</p>
               <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2 text-xs text-slate-600 pt-1">
                 {isAdmin ? (
-                  <span className="inline-flex items-center gap-1.5 font-semibold text-slate-800">
-                    <ShieldCheck className="h-4 w-4 text-fatec-red" />
-                    Coordenação da Unidade · Acesso Global
+                  <span
+                    key="admin-role-badge"
+                    className="inline-flex items-center gap-1.5 font-semibold text-slate-800"
+                  >
+                    <ShieldCheck className="h-4 w-4 text-fatec-red shrink-0" />
+                    <span>Coordenação da Unidade · Acesso Global</span>
                   </span>
                 ) : (
-                  <>
+                  <span key="student-role-badges" className="inline-flex items-center gap-2">
                     <span className="font-semibold text-fatec-red">{userCourseInfo.sigla}</span>
                     <span aria-hidden="true">·</span>
                     <span>{semestre}º Semestre</span>
-                    {ra && (
-                      <>
+                    {ra ? (
+                      <span key="student-ra" className="inline-flex items-center gap-2">
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums">RA {ra}</span>
-                      </>
-                    )}
-                  </>
+                      </span>
+                    ) : null}
+                  </span>
                 )}
-                {isPhoneValid && (
-                  <>
+                {isPhoneValid ? (
+                  <span key="header-phone-badge" className="inline-flex items-center gap-2">
                     <span aria-hidden="true">·</span>
                     <span className="font-mono tabular-nums text-emerald-700 font-semibold">
-                      WhatsApp {formattedPhone}
+                      {`WhatsApp ${formattedPhone}`}
                     </span>
-                  </>
-                )}
+                  </span>
+                ) : null}
               </div>
               {!isAdmin &&
                 user?.blockedDate &&
@@ -351,27 +354,29 @@ export function ConfiguracoesPage() {
                   Número de Telefone / WhatsApp
                 </label>
                 {phone ? (
-                  <span
-                    className={cn(
-                      'inline-flex items-center gap-1 text-[11px] font-medium',
-                      isPhoneValid ? 'text-emerald-700' : 'text-fatec-red'
-                    )}
-                  >
-                    {isPhoneValid ? (
-                      <>
-                        <CheckCircle2 className="h-3.5 w-3.5" />
-                        11 dígitos válidos
-                      </>
-                    ) : (
-                      <>
-                        <AlertCircle className="h-3.5 w-3.5" />
-                        Exige 11 dígitos
-                      </>
-                    )}
-                  </span>
+                  isPhoneValid ? (
+                    <span
+                      key="phone-badge-valid"
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      <span>11 dígitos válidos</span>
+                    </span>
+                  ) : (
+                    <span
+                      key="phone-badge-invalid"
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-fatec-red"
+                    >
+                      <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                      <span>Exige 11 dígitos</span>
+                    </span>
+                  )
                 ) : (
-                  <span className="text-[11px] text-amber-700 font-medium">
-                    Pendente de cadastro
+                  <span
+                    key="phone-badge-pending"
+                    className="text-[11px] text-amber-700 font-medium"
+                  >
+                    <span>Pendente de cadastro</span>
                   </span>
                 )}
               </div>
@@ -379,6 +384,9 @@ export function ConfiguracoesPage() {
                 <Phone className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
                 <input
                   type="tel"
+                  id="admin-profile-phone"
+                  name="phone"
+                  autoComplete="tel"
                   inputMode="numeric"
                   required
                   maxLength={15}
@@ -566,11 +574,19 @@ export function ConfiguracoesPage() {
                 Receber alertas e lembretes de reserva via WhatsApp
               </p>
               <p className="text-xs text-slate-500 mt-0.5">
-                {whatsappNotificationsEnabled
-                  ? `Ativo para o número ${
-                      isPhoneValid ? formattedPhone : 'informado acima (salve para ativar)'
-                    }.`
-                  : 'Notificações via WhatsApp silenciadas para sua conta.'}
+                {whatsappNotificationsEnabled ? (
+                  <span key="wa-pref-active">
+                    Ativo para o número{' '}
+                    <span className="font-semibold text-slate-700">
+                      {isPhoneValid ? formattedPhone : 'informado acima (salve para ativar)'}
+                    </span>
+                    .
+                  </span>
+                ) : (
+                  <span key="wa-pref-muted">
+                    Notificações via WhatsApp silenciadas para sua conta.
+                  </span>
+                )}
               </p>
             </div>
 
@@ -661,7 +677,7 @@ export function ConfiguracoesPage() {
               <div>
                 <p className="font-bold text-fatec-red text-sm">Excluir Meu Perfil</p>
                 <p className="text-xs text-slate-500 mt-0.5 max-w-xl">
-                  Ao excluir seu perfil, seu acesso será encerrado imediatamente e sua conta permanecerá registrada como inativa para fins de auditoria institucional.
+                  Ao excluir seu perfil, seu acesso será encerrado imediatamente e seu cadastro será removido da listagem ativa da instituição.
                 </p>
               </div>
               <button
@@ -724,7 +740,7 @@ export function ConfiguracoesPage() {
               </div>
 
               <p className="text-xs text-slate-600 leading-relaxed">
-                Seu perfil passará para o status <strong>Inativo</strong> junto à Coordenação e não poderá realizar novos logins ou reservas de salas até eventual reativação administrativa.
+                Seu perfil será marcado como <strong>excluído</strong>, removido da listagem de usuários ativos do painel administrativo e seu acesso será encerrado imediatamente.
               </p>
 
               <div className="pt-2 flex justify-end gap-2 border-t border-slate-100">

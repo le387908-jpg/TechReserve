@@ -4,28 +4,30 @@ import App from './App.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import './index.css';
 
-// Unregister any existing service workers and clear caches safely
-if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
-  navigator.serviceWorker
-    .getRegistrations()
-    .then((registrations) => {
-      for (const registration of registrations) {
-        registration.unregister().catch(() => {});
-      }
-    })
-    .catch(() => {});
-}
+const isProductionBuild = Boolean(
+  (import.meta as unknown as { env?: { PROD?: boolean } }).env?.PROD
+);
 
-// Clear caches to ensure no corrupted SW or data is interfering
-if (typeof window !== 'undefined' && 'caches' in window) {
-  caches
-    .keys()
-    .then((names) => {
-      for (const name of names) {
-        caches.delete(name).catch(() => {});
-      }
-    })
-    .catch(() => {});
+if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+  if (isProductionBuild) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker
+        .register('/sw.js', { scope: '/' })
+        .catch((err) => {
+          console.warn('[PWA] Falha não crítica ao registrar Service Worker:', err);
+        });
+    });
+  } else {
+    // Em desenvolvimento local (Vite), remove Service Workers antigos para evitar cache de módulos
+    navigator.serviceWorker
+      .getRegistrations()
+      .then((registrations) => {
+        for (const registration of registrations) {
+          registration.unregister().catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }
 }
 
 const rootElement = document.getElementById('root');

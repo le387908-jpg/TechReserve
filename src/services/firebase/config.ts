@@ -17,7 +17,6 @@ import {
   getDocFromServer,
 } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
-// @ts-ignore
 import firebaseConfig from '../../../firebase-applet-config.json';
 
 const TAB_INSTANCE_ID_KEY = 'techreserve_tab_instance_id_v2';

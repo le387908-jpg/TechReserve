@@ -41,6 +41,7 @@ import {
   RoomStatus,
   SpaceCategory,
   inferSpaceCategory,
+  isUserInactive,
   resolveRoomRealtimeStatus,
 } from '../../types';
 import { REALTIME_SPACE_STATUS_LABELS, SPACE_CATEGORY_LABELS } from '../../constants';
@@ -121,6 +122,7 @@ export function SalasPage() {
   );
 
   const isAdmin = user?.role === 'ADMIN';
+  const isInactiveUser = isUserInactive(user);
   const standardizedRef = useRef(false);
   const effectivePunishments = React.useMemo(() => {
     if (isAdmin) return punishments;
@@ -167,7 +169,7 @@ export function SalasPage() {
   }, [rooms, isAdmin, now]);
 
   const openBookingModal = (room: Room) => {
-    if (user?.bloqueado || user?.inativo) {
+    if (isInactiveUser || user?.bloqueado) {
       toast.error('Sua conta está inativa ou bloqueada e não pode realizar reservas.');
       return;
     }
@@ -543,7 +545,7 @@ export function SalasPage() {
     e.preventDefault();
     if (!user || !bookingRoom) return;
 
-    if (user.bloqueado || user.inativo) {
+    if (isInactiveUser || user.bloqueado) {
       toast.error('Sua conta está inativa ou bloqueada e não pode realizar reservas.');
       return;
     }
@@ -1123,11 +1125,11 @@ export function SalasPage() {
 
                         <button
                           type="button"
-                          disabled={isMaintenance}
+                          disabled={isMaintenance || isInactiveUser}
                           onClick={() => openBookingModal(room)}
                           className={cn(
                             'w-full py-3 rounded-xl font-semibold text-xs transition-colors whitespace-nowrap shrink-0',
-                            isMaintenance
+                            isMaintenance || isInactiveUser
                               ? 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
                               : !isAdmin && todaySchedule.reservableCount === 0 && upcomingReleasedCount === 0
                               ? 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200 cursor-pointer'
@@ -1136,6 +1138,8 @@ export function SalasPage() {
                         >
                           {isMaintenance
                             ? 'Em Manutenção / Suspenso'
+                            : isInactiveUser
+                            ? 'Agendamento Indisponível (Perfil Inativo)'
                             : isAdmin
                             ? 'Reservar (ADM)'
                             : todaySchedule.reservableCount > 0 || upcomingReleasedCount > 0
@@ -1290,9 +1294,10 @@ export function SalasPage() {
                       setSelectedAvailableSlotId(slot.availableSlotId);
                     }}
                     disabledByUserRule={
-                      !isAdmin &&
-                      (selectedDateNoShow.blocked ||
-                        Boolean(selectedDateQuota && !selectedDateQuota.allowed))
+                      isInactiveUser ||
+                      (!isAdmin &&
+                        (selectedDateNoShow.blocked ||
+                          Boolean(selectedDateQuota && !selectedDateQuota.allowed)))
                     }
                     isAdmin={isAdmin}
                   />
@@ -1360,6 +1365,7 @@ export function SalasPage() {
                   <button
                     type="submit"
                     disabled={
+                      isInactiveUser ||
                       !windowStatus.isOpen ||
                       !bookingStartTime ||
                       !bookingEndTime ||
@@ -1372,7 +1378,8 @@ export function SalasPage() {
                     }
                     className={cn(
                       'px-5 py-2.5 rounded-xl font-semibold text-xs transition-colors whitespace-nowrap shrink-0',
-                      !windowStatus.isOpen ||
+                      isInactiveUser ||
+                        !windowStatus.isOpen ||
                         !bookingStartTime ||
                         !bookingEndTime ||
                         (!isAdmin &&

@@ -5,8 +5,6 @@
 
 import { PunishmentCategory, RealtimeSpaceStatus, SpaceCategory, UserVinculo } from './types';
 
-export const ADMIN_AUTH_CODE = '051325';
-
 export const COLORS = {
   primary: '#8B0000', // Vinho Institucional
   secondary: '#1A1A1A', // Preto

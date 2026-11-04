@@ -9,7 +9,11 @@
     "start": "node server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint:rules": "eslint firestore.rules",
+    "lint:code": "eslint src server api server.ts tests",
+    "lint": "tsc --noEmit && eslint firestore.rules && eslint src server api server.ts tests",
+    "test": "tsx tests/runAuditTests.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -23,6 +27,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "firebase": "10.13.0",
+    "firebase-admin": "^14.5.0",
     "html5-qrcode": "^2.3.8",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
@@ -39,6 +44,7 @@
     "zustand": "^5.0.13"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@firebase/eslint-plugin-security-rules": "^0.0.2",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
@@ -46,6 +52,7 @@
     "eslint": "^10.13.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
-    "typescript": "~5.8.2"
+    "typescript": "~5.8.2",
+    "typescript-eslint": "^8.72.1"
   }
 }

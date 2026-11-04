@@ -6,6 +6,7 @@
 export type UserRole = 'ADMIN' | 'USUARIO';
 export type UserVinculo = 'ALUNO' | 'SERVIDOR' | 'COORDENACAO';
 export type CalendarCourse = 'GTI' | 'GEEE';
+export type UserAccountStatus = 'active' | 'inactive' | 'deleted';
 
 /**
  * Interface padronizada do Perfil de Usuário no Firestore (`users/{userId}`),
@@ -41,6 +42,11 @@ export interface User {
   aprovado: boolean;
   bloqueado: boolean;
   inativo?: boolean;
+  active?: boolean;
+  status?: UserAccountStatus;
+  deleted?: boolean;
+  deletedAt?: number | null;
+  deletedBy?: string | null;
   blockedDate?: string | null; // Data única bloqueada por No-Show/suspensão pontual (YYYY-MM-DD)
   punidoAte?: number | null; // Campo legado opcional (não utilizado para bloqueios multi-dias)
   motivoPunicao?: string | null;
@@ -152,6 +158,8 @@ export interface Reservation {
   availableSlotId?: string; // ID do registro explícito em `available_slots` liberado pelo ADM
   checkInExpiracao?: number | null; // timestamp (início + 5 minutos de tolerância)
   checkInRealizado?: boolean;
+  checkInTimestamp?: number | null;
+  checkInMethod?: string;
   status: ReservationStatus;
   observacoes?: string;
   blockedDate?: string | null; // Data exata bloqueada (YYYY-MM-DD) quando status === 'PUNIDA'
@@ -273,7 +281,9 @@ export interface PunishmentRecord {
 export type Punishment = PunishmentRecord;
 
 export interface AdminAuthConfig {
-  codeAuth: string;
+  codeAuth?: string; // Legado (não persistido em novas gravações)
+  codeHash?: string; // Hash SHA-256 irreversível do code-auth
+  codeMask?: string; // Máscara visual segura (ex.: ****89)
   allowAdminSignup: boolean;
   updatedAt: number;
   updatedBy: string;
@@ -332,6 +342,32 @@ export interface CalendarEvent {
   data?: string;
   observacoes?: string;
   reservationId?: string;
+}
+
+/**
+ * Verifica se o perfil do usuário foi excluído (pelo próprio usuário ou pelo ADM).
+ */
+export function isUserDeleted(
+  user?: Partial<Pick<User, 'deleted' | 'status'>> | null
+): boolean {
+  if (!user) return false;
+  return user.deleted === true || user.status === 'deleted';
+}
+
+/**
+ * Verifica se o perfil do usuário está inativado pelo ADM.
+ * Perfis excluídos são tratados separadamente por `isUserDeleted`.
+ */
+export function isUserInactive(
+  user?: Partial<Pick<User, 'role' | 'inativo' | 'active' | 'status' | 'bloqueado' | 'deleted'>> | null
+): boolean {
+  if (!user || isUserDeleted(user)) return false;
+  return (
+    user.inativo === true ||
+    user.active === false ||
+    user.status === 'inactive' ||
+    user.bloqueado === true
+  );
 }
 
 /**

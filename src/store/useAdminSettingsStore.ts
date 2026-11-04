@@ -7,8 +7,8 @@ import { create } from 'zustand';
 import { doc, onSnapshot, setDoc } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
 import { AdminAuthConfig, WhatsAppIntegrationSettings } from '../types';
-import { ADMIN_AUTH_CODE } from '../constants';
 import { OperationType, handleFirestoreError, withRetry } from '../services/firebase/utils';
+import { computeAdminCodeHashClient } from '../services/apiClient';
 import { useAuthStore } from './useAuthStore';
 import { useLogStore } from './useLogStore';
 
@@ -30,18 +30,19 @@ interface AdminSettingsState {
   whatsappInitialized: boolean;
 
   fetchAdminAuthConfig: () => () => void;
-  saveAdminAuthConfig: (data: { codeAuth: string; allowAdminSignup: boolean }) => Promise<void>;
+  saveAdminAuthConfig: (data: { codeAuth?: string; allowAdminSignup: boolean }) => Promise<void>;
   fetchWhatsAppIntegration: () => () => void;
   saveWhatsAppIntegration: (data: SaveWhatsAppIntegrationInput) => Promise<void>;
   generateSecureCode: () => string;
 }
 
 const DEFAULT_AUTH_CONFIG: AdminAuthConfig = {
-  codeAuth: ADMIN_AUTH_CODE,
-  allowAdminSignup: true,
+  codeHash: '',
+  codeMask: 'Não definido',
+  allowAdminSignup: false,
   updatedAt: 0,
   updatedBy: 'SISTEMA',
-  updatedByName: 'Padrão Institucional',
+  updatedByName: 'Segurança Institucional',
 };
 
 const DEFAULT_WHATSAPP_INTEGRATION: WhatsAppIntegrationSettings = {
@@ -77,10 +78,22 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
       (snap) => {
         if (snap.exists()) {
           const data = snap.data() as AdminAuthConfig;
+          const fallbackMask =
+            data.codeMask ||
+            (data.codeAuth && data.codeAuth.length >= 2
+              ? `${'*'.repeat(Math.max(4, data.codeAuth.length - 2))}${data.codeAuth.slice(-2)}`
+              : data.codeHash
+              ? '********'
+              : 'Não definido');
           set({
             authConfig: {
               ...DEFAULT_AUTH_CONFIG,
-              ...data,
+              allowAdminSignup: data.allowAdminSignup ?? false,
+              codeHash: data.codeHash || '',
+              codeMask: fallbackMask,
+              updatedAt: data.updatedAt || 0,
+              updatedBy: data.updatedBy || 'SISTEMA',
+              updatedByName: data.updatedByName || 'Administrador',
             },
             loading: false,
             initialized: true,
@@ -108,28 +121,40 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
       throw new Error('Apenas administradores podem alterar o código de autorização.');
     }
 
+    const current = get().authConfig;
     const cleanCode = String(codeAuth || '').trim();
-    if (cleanCode.length < 4 || cleanCode.length > 64) {
-      throw new Error('O código de autorização (code-auth) deve ter entre 4 e 64 caracteres.');
+
+    let nextHash = current.codeHash || '';
+    let nextMask = current.codeMask || 'Não definido';
+
+    if (cleanCode) {
+      if (cleanCode.length < 6 || cleanCode.length > 64) {
+        throw new Error(
+          'O novo código de autorização (code-auth) deve ter entre 6 e 64 caracteres.'
+        );
+      }
+      nextHash = await computeAdminCodeHashClient(cleanCode);
+      nextMask = `${'*'.repeat(Math.max(4, cleanCode.length - 2))}${cleanCode.slice(-2)}`;
+    } else if (!nextHash && allowAdminSignup) {
+      throw new Error(
+        'Defina ou gere um novo código code-auth (mínimo 6 caracteres) antes de habilitar cadastros administrativos.'
+      );
     }
 
     const now = Date.now();
-    const payload: AdminAuthConfig = {
-      codeAuth: cleanCode,
-      allowAdminSignup,
+    const payload = {
+      codeHash: nextHash,
+      codeMask: nextMask,
+      allowAdminSignup: Boolean(allowAdminSignup),
       updatedAt: now,
-      updatedBy: user.id,
-      updatedByName: user.nome,
+      updatedBy: user.id.slice(0, 128),
+      updatedByName: (user.nome || 'Administrador').slice(0, 120),
     };
 
     try {
       await withRetry(() => setDoc(doc(db, 'settings', 'admin_auth'), payload));
       set({ authConfig: payload });
 
-      const masked =
-        cleanCode.length > 2
-          ? `${'*'.repeat(cleanCode.length - 2)}${cleanCode.slice(-2)}`
-          : '****';
       await useLogStore
         .getState()
         .addLog({
@@ -137,7 +162,7 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
           usuarioId: user.id,
           usuarioNome: user.nome,
           entidade: 'SISTEMA',
-          detalhes: `Código de autorização administrativa (code-auth: ${masked}) atualizado. Novos cadastros ADM: ${
+          detalhes: `Credencial administrativa protegida por hash SHA-256 (${nextMask}) atualizada. Novos cadastros ADM: ${
             allowAdminSignup ? 'Habilitados' : 'Bloqueados'
           }.`,
         })
@@ -204,10 +229,11 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
     }
 
     const current = get().whatsappIntegration;
-    const cleanInstance = (instanceName ?? current.instanceName ?? 'techreserve')
-      .trim()
-      .replace(/[^a-zA-Z0-9_-]/g, '')
-      .slice(0, 80) || 'techreserve';
+    const cleanInstance =
+      (instanceName ?? current.instanceName ?? 'techreserve')
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 80) || 'techreserve';
     const resolvedProvider = provider || current.provider || 'EVOLUTION';
     const now = Date.now();
 
@@ -248,9 +274,11 @@ export const useAdminSettingsStore = create<AdminSettingsState>((set, get) => ({
 
   generateSecureCode: () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const randomValues = new Uint32Array(8);
+    crypto.getRandomValues(randomValues);
     let randomPart = '';
-    for (let i = 0; i < 6; i++) {
-      randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
+    for (let i = 0; i < 8; i++) {
+      randomPart += chars.charAt(randomValues[i] % chars.length);
     }
     return `ADM-${randomPart}`;
   },

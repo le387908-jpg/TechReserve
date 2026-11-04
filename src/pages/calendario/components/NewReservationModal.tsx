@@ -17,7 +17,7 @@ import {
   Layers,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Room, CalendarCourse, User as UserType, CalendarEvent } from '../../../types';
+import { Room, CalendarCourse, User as UserType, CalendarEvent, isUserInactive } from '../../../types';
 import { useReservationStore } from '../../../store/useReservationStore';
 import { useScheduleStore } from '../../../store/useScheduleStore';
 import {
@@ -86,6 +86,7 @@ export function NewReservationModal({
   const punishments = Array.isArray(rawPunishments) ? rawPunishments : [];
 
   const isAdmin = currentUser?.role === 'ADMIN';
+  const isInactiveUser = isUserInactive(currentUser);
 
   // Usuários comuns SÓ visualizam salas liberadas explicitamente pelo ADM
   const availableRooms = React.useMemo(() => {
@@ -351,13 +352,15 @@ export function NewReservationModal({
   if (!isOpen) return null;
 
   const isUserBlockedByQuotaOrNoShow =
-    !isAdmin &&
-    (availableRooms.length === 0 ||
-      noShowCheck.blocked ||
-      Boolean(quotaCheck && !quotaCheck.allowed));
+    isInactiveUser ||
+    (!isAdmin &&
+      (availableRooms.length === 0 ||
+        noShowCheck.blocked ||
+        Boolean(quotaCheck && !quotaCheck.allowed)));
 
   const isSubmitDisabled =
     isSubmitting ||
+    isInactiveUser ||
     conflictCheck.hasConflict ||
     !windowStatus.isOpen ||
     !startTime ||
@@ -375,7 +378,7 @@ export function NewReservationModal({
       return;
     }
 
-    if (currentUser.bloqueado || currentUser.inativo) {
+    if (isInactiveUser || currentUser.bloqueado) {
       toast.error('Sua conta está inativa ou bloqueada e não pode realizar reservas.');
       return;
     }

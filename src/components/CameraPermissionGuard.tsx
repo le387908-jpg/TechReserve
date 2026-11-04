@@ -96,11 +96,26 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
     }
   };
 
+  useEffect(() => {
+    if (!showOverlay) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        safeSetLocalFlag('camera_permission_asked', 'true');
+        setShowOverlay(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showOverlay]);
+
   return (
     <>
       <AnimatePresence>
         {showOverlay && (
           <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="camera-permission-title"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -112,10 +127,10 @@ export function CameraPermissionGuard({ children }: { children: React.ReactNode 
               className="bg-white rounded-[2rem] p-8 max-w-md w-full shadow-2xl text-center"
             >
               <div className="w-20 h-20 bg-fatec-red/10 rounded-3xl flex items-center justify-center mx-auto mb-6 text-fatec-red">
-                <Camera className="h-10 w-10" />
+                <Camera className="h-10 w-10" aria-hidden="true" />
               </div>
 
-              <h2 className="text-2xl font-black text-slate-900 mb-3 tracking-tight">
+              <h2 id="camera-permission-title" className="text-2xl font-black text-slate-900 mb-3 tracking-tight">
                 Permissão de Câmera
               </h2>
 

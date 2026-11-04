@@ -20,7 +20,8 @@ import { toast } from 'sonner';
 import { db } from '../../../services/firebase/config';
 import { usePunishmentStore } from '../../../store/usePunishmentStore';
 import { useReservationStore } from '../../../store/useReservationStore';
-import { PunishmentCategory, User } from '../../../types';
+import { PunishmentCategory, User, isUserDeleted, isUserInactive } from '../../../types';
+import { hydrateUserDocument } from '../../../services/authService';
 import { PUNISHMENT_CATEGORY_LABELS, USER_VINCULO_LABELS } from '../../../constants';
 import { formatNoShowTag } from '../../../services/reservationService';
 import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../../../utils/dateUtils';
@@ -89,7 +90,11 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
     const unsub = onSnapshot(
       q,
       (snap) => {
-        setInternalUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() } as User)));
+        setInternalUsers(
+          snap.docs
+            .map((d) => hydrateUserDocument(d.data(), d.id))
+            .filter((u) => !isUserDeleted(u))
+        );
         setLoadingUsers(false);
       },
       () => setLoadingUsers(false)
@@ -103,11 +108,14 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
     };
   }, [externalUsers]);
 
-  const users = Array.isArray(externalUsers)
-    ? externalUsers
-    : Array.isArray(internalUsers)
-    ? internalUsers
-    : [];
+  const users = useMemo(() => {
+    const rawList = Array.isArray(externalUsers)
+      ? externalUsers
+      : Array.isArray(internalUsers)
+      ? internalUsers
+      : [];
+    return rawList.filter((u) => Boolean(u) && !isUserDeleted(u));
+  }, [externalUsers, internalUsers]);
 
   // Contabiliza faltas (no-show) por usuário a partir das reservas PUNIDA
   const noShowCountMap = useMemo(() => {
@@ -129,7 +137,7 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
 
         const normBlocked = u.blockedDate ? normalizeDateToISO(u.blockedDate) : '';
         const isDatePunished = Boolean(normBlocked && normBlocked >= todayISO);
-        const isRestricted = isDatePunished || Boolean(u.bloqueado || u.inativo);
+        const isRestricted = isDatePunished || isUserInactive(u);
         const userNoShows = noShowCountMap[u.id] || 0;
 
         if (statusFilter === 'RESTRITOS' && !isRestricted) return false;
@@ -150,7 +158,7 @@ export function AdminModerationTab({ externalUsers }: AdminModerationTabProps) {
       users.filter((u) => {
         if (u.role === 'ADMIN') return false;
         const normBlocked = u.blockedDate ? normalizeDateToISO(u.blockedDate) : '';
-        return Boolean((normBlocked && normBlocked >= todayISO) || u.bloqueado || u.inativo);
+        return Boolean((normBlocked && normBlocked >= todayISO) || isUserInactive(u));
       }).length,
     [users, todayISO]
   );

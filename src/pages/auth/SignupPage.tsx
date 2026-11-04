@@ -155,12 +155,15 @@ export function SignupPage() {
                 <label className="text-xs font-semibold text-slate-700">
                   Número de Telefone / WhatsApp <span className="text-fatec-red">*</span>
                 </label>
-                {phone && isPhoneValid && (
-                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700">
+                {phone && isPhoneValid ? (
+                  <span
+                    key="signup-phone-valid"
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700"
+                  >
                     <CheckCircle2 className="h-3.5 w-3.5" />
-                    11 dígitos válidos
+                    <span>11 dígitos válidos</span>
                   </span>
-                )}
+                ) : null}
               </div>
               <div className="relative">
                 <Phone className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
@@ -257,13 +260,15 @@ export function SignupPage() {
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-700 ml-1">
+              <label htmlFor="signup-email" className="text-xs font-semibold text-slate-700 ml-1">
                 E-mail Institucional ou Pessoal
               </label>
               <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" aria-hidden="true" />
                 <input
+                  id="signup-email"
                   type="email"
+                  autoComplete="email"
                   required
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
@@ -274,11 +279,15 @@ export function SignupPage() {
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-700 ml-1">Senha de Acesso</label>
+              <label htmlFor="signup-password" className="text-xs font-semibold text-slate-700 ml-1">
+                Senha de Acesso
+              </label>
               <div className="relative">
-                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" aria-hidden="true" />
                 <input
+                  id="signup-password"
                   type={showPassword ? 'text' : 'password'}
+                  autoComplete="new-password"
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
@@ -287,6 +296,7 @@ export function SignupPage() {
                 />
                 <button
                   type="button"
+                  aria-label={showPassword ? 'Ocultar senha' : 'Mostrar senha'}
                   onClick={() => setShowPassword(!showPassword)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600 transition-colors"
                 >

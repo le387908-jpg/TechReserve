@@ -1,0 +1,34 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // 0. Negação global por padrão (Princípio do Menor Privilégio)
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // 1. Avatares de perfil de usuários autenticados (/avatars/{userId}/{fileName})
+    // Restrições estritas de propriedade, MIME type de imagem segura e tamanho máximo de 2 MB
+    match /avatars/{userId}/{fileName} {
+      allow get: if request.auth != null &&
+                 userId.size() >= 1 &&
+                 userId.size() <= 128 &&
+                 fileName.size() >= 1 &&
+                 fileName.size() <= 120;
+
+      allow create, update: if request.auth != null &&
+                            request.auth.uid == userId &&
+                            fileName.size() >= 1 &&
+                            fileName.size() <= 120 &&
+                            fileName.matches('^[a-zA-Z0-9._\\-]+$') &&
+                            request.resource != null &&
+                            request.resource.size > 0 &&
+                            request.resource.size <= 2 * 1024 * 1024 &&
+                            request.resource.contentType.matches('^image/(jpeg|png|webp)$');
+
+      allow delete: if request.auth != null &&
+                    request.auth.uid == userId &&
+                    fileName.size() >= 1 &&
+                    fileName.size() <= 120;
+    }
+  }
+}

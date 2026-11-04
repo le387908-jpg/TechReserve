@@ -18,21 +18,23 @@ import {
   User as UserIcon,
   ChevronLeft,
   ChevronRight,
-  WifiOff,
   AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { useAuth } from '../../context/AuthContext';
+import { isUserInactive } from '../../types';
 import { useReservationStore } from '../../store/useReservationStore';
 import { useRoomStore } from '../../store/useRoomStore';
 import { useScheduleStore } from '../../store/useScheduleStore';
 import { useAvailableSlotsStore } from '../../store/useAvailableSlotsStore';
 import { usePunishmentStore } from '../../store/usePunishmentStore';
 import { useAdminSettingsStore } from '../../store/useAdminSettingsStore';
+import { useConnectivityStore } from '../../store/useConnectivityStore';
 import { useWhatsAppReservationAlerts } from '../../hooks/useWhatsAppReservationAlerts';
 import { Logo } from '../Logo';
 import { GlobalAlert } from '../GlobalAlert';
+import { ConnectivityBanner, ConnectivityHeaderBadge } from '../ConnectivityBanner';
 import { CameraPermissionGuard } from '../CameraPermissionGuard';
 import { EditProfileModal } from '../profile/EditProfileModal';
 import { ErrorBoundary } from '../ErrorBoundary';
@@ -85,9 +87,6 @@ function formatPunishmentDuration(millis: number): string {
 
 export function MainLayout({ children }: { children: React.ReactNode }) {
   const { user, signOut } = useAuth();
-  const [isOnline, setIsOnline] = React.useState(
-    typeof navigator !== 'undefined' ? navigator.onLine : true
-  );
   const [now, setNow] = useState(Date.now());
   const [isEditProfileOpen, setIsEditProfileOpen] = useState(false);
   const location = useLocation();
@@ -98,12 +97,15 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     const timer = setInterval(() => {
-      setNow(Date.now());
+      setNow(useConnectivityStore.getState().getOfficialNow());
     }, 1000);
     return () => clearInterval(timer);
   }, []);
 
   const fetchReservations = useReservationStore((state) => state.fetchReservations);
+  const reconcileServerReservation = useReservationStore(
+    (state) => state.reconcileServerReservation
+  );
   const fetchRooms = useRoomStore((state) => state.fetchRooms);
   const fetchSchedules = useScheduleStore((state) => state.fetchSchedules);
   const fetchAvailableSlots = useAvailableSlotsStore((state) => state.fetchAvailableSlots);
@@ -111,6 +113,10 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const fetchUserPunishments = usePunishmentStore((state) => state.fetchUserPunishments);
   const fetchWhatsAppIntegration = useAdminSettingsStore(
     (state) => state.fetchWhatsAppIntegration
+  );
+  const notifyOfflineDetected = useConnectivityStore((state) => state.notifyOfflineDetected);
+  const synchronizeAfterReconnect = useConnectivityStore(
+    (state) => state.synchronizeAfterReconnect
   );
 
   React.useEffect(() => {
@@ -148,22 +154,52 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   ]);
 
   React.useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
+    if (user?.id) {
+      void synchronizeAfterReconnect(user.id, 'STARTUP', reconcileServerReservation);
+    }
+
+    const handleOnline = () => {
+      if (user?.id) {
+        void synchronizeAfterReconnect(user.id, 'ONLINE_EVENT', reconcileServerReservation);
+      }
+    };
+    const handleOffline = () => {
+      void notifyOfflineDetected(user?.id);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && user?.id) {
+        const st = useConnectivityStore.getState();
+        if (st.status !== 'CONECTADO' || st.pendingCheckInsCount > 0) {
+          void synchronizeAfterReconnect(user.id, 'VISIBILITY', reconcileServerReservation);
+        }
+      }
+    };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, []);
+  }, [user?.id, notifyOfflineDetected, synchronizeAfterReconnect, reconcileServerReservation]);
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
+  React.useEffect(() => {
+    if (!isMobileMenuOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsMobileMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isMobileMenuOpen]);
+
   const isAdmin = user?.role === 'ADMIN';
+  const isInactiveUser = isUserInactive(user);
 
   const handleLogout = async () => {
     try {
@@ -178,21 +214,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen bg-slate-50 overflow-hidden font-sans relative">
-      <AnimatePresence>
-        {!isOnline && (
-          <motion.div
-            initial={{ y: -50, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: -50, opacity: 0 }}
-            className="fixed top-0 left-0 right-0 z-[100] bg-fatec-red text-white py-2 px-4 flex items-center justify-center gap-3 shadow-xl"
-          >
-            <WifiOff className="h-5 w-5" />
-            <span className="text-xs font-semibold">
-              Você está offline. Algumas funções podem não funcionar corretamente.
-            </span>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <ConnectivityBanner />
 
       <GlobalAlert />
       <EditProfileModal
@@ -232,6 +254,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                 <Link
                   key={item.path}
                   to={item.path}
+                  aria-current={isActive ? 'page' : undefined}
                   className={cn(
                     'flex items-center gap-3 px-3 py-3 rounded-lg transition-colors group relative whitespace-nowrap',
                     isActive
@@ -294,6 +317,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
             </div>
 
             <div className="flex items-center gap-3 shrink-0">
+              <ConnectivityHeaderBadge />
               <button
                 type="button"
                 onClick={() => setIsEditProfileOpen(true)}
@@ -324,6 +348,24 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
 
           {/* Content Area */}
           <main className="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar overflow-touch">
+            {isInactiveUser && (
+              <motion.div
+                initial={{ opacity: 0, y: -12 }}
+                animate={{ opacity: 1, y: 0 }}
+                role="alert"
+                className="mb-6 bg-red-50 border border-red-200 rounded-2xl p-5 flex items-center gap-4 shadow-xs"
+              >
+                <div className="h-10 w-10 rounded-xl bg-fatec-red flex items-center justify-center text-white shrink-0">
+                  <AlertTriangle className="h-5 w-5" />
+                </div>
+                <div className="flex-1">
+                  <p className="text-sm font-bold text-rose-950 leading-relaxed">
+                    Perfil inativado pelo ADM, caso tenha dúvidas procure o coordenador do curso para mais informações
+                  </p>
+                </div>
+              </motion.div>
+            )}
+
             {user?.punidoAte && user.punidoAte > now && (
               <motion.div
                 initial={{ opacity: 0, y: -12 }}
@@ -376,6 +418,9 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                 className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs z-40 md:hidden"
               />
               <motion.div
+                role="dialog"
+                aria-modal="true"
+                aria-label="Menu de navegação"
                 initial={{ x: '-100%' }}
                 animate={{ x: 0 }}
                 exit={{ x: '-100%' }}
@@ -385,6 +430,8 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                 <div className="flex items-center justify-between mb-8">
                   <Logo variant="dark" />
                   <button
+                    type="button"
+                    aria-label="Fechar menu"
                     onClick={() => setIsMobileMenuOpen(false)}
                     className="p-2 text-slate-400 hover:text-white"
                   >
@@ -401,6 +448,7 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
                       <Link
                         key={item.path}
                         to={item.path}
+                        aria-current={isActive ? 'page' : undefined}
                         onClick={() => setIsMobileMenuOpen(false)}
                         className={cn(
                           'flex items-center gap-4 px-4 py-3.5 rounded-xl transition-colors',

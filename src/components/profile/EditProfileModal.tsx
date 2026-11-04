@@ -223,32 +223,34 @@ export function EditProfileModal({ isOpen, onClose }: EditProfileModalProps) {
                   <label className="text-xs font-semibold text-slate-700">
                     Número de Telefone / WhatsApp
                   </label>
-                  {phone && (
-                    <span
-                      className={cn(
-                        'inline-flex items-center gap-1 text-[11px] font-medium',
-                        isPhoneValid ? 'text-emerald-700' : 'text-fatec-red'
-                      )}
-                    >
-                      {isPhoneValid ? (
-                        <>
-                          <CheckCircle2 className="h-3.5 w-3.5" />
-                          11 dígitos válidos
-                        </>
-                      ) : (
-                        <>
-                          <AlertCircle className="h-3.5 w-3.5" />
-                          Exige 11 dígitos
-                        </>
-                      )}
-                    </span>
-                  )}
+                  {phone ? (
+                    isPhoneValid ? (
+                      <span
+                        key="modal-phone-valid"
+                        className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        <span>11 dígitos válidos</span>
+                      </span>
+                    ) : (
+                      <span
+                        key="modal-phone-invalid"
+                        className="inline-flex items-center gap-1 text-[11px] font-medium text-fatec-red"
+                      >
+                        <AlertCircle className="h-3.5 w-3.5" />
+                        <span>Exige 11 dígitos</span>
+                      </span>
+                    )
+                  ) : null}
                 </div>
 
                 <div className="flex gap-2">
                   <div className="relative flex-1">
                     <Phone className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
                     <input
+                      id="edit-profile-phone"
+                      name="phone"
+                      autoComplete="tel"
                       type="tel"
                       inputMode="numeric"
                       required

@@ -13,7 +13,14 @@ import {
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
 import { auth, db, ensureTabIsolationReady } from './firebase/config';
-import { User, UserRole, UserVinculo, CalendarCourse } from '../types';
+import {
+  User,
+  UserRole,
+  UserVinculo,
+  CalendarCourse,
+  UserAccountStatus,
+  isUserDeleted,
+} from '../types';
 import {
   OperationType,
   handleFirestoreError,
@@ -28,6 +35,7 @@ import {
   validatePhone,
 } from '../utils/formatters';
 import { useLogStore } from '../store/useLogStore';
+import { clearUserRecoveryData } from './offlineRecoveryService';
 
 export interface SignUpPayload {
   email: string;
@@ -79,17 +87,12 @@ export function loadTabUserSession(): User | null {
     if (!raw) return inMemoryTabUserSnapshot;
     const parsed = JSON.parse(raw) as User;
     if (parsed && typeof parsed.id === 'string') {
-      const normalizedRole: UserRole = parsed.role === 'ADMIN' ? 'ADMIN' : 'USUARIO';
-      const normalizedUser: User = {
-        ...parsed,
-        role: normalizedRole,
-        tipoVinculo:
-          normalizedRole === 'ADMIN'
-            ? 'COORDENACAO'
-            : parsed.tipoVinculo === 'SERVIDOR'
-            ? 'SERVIDOR'
-            : 'ALUNO',
-      };
+      const normalizedUser = hydrateUserDocument(parsed, parsed.id);
+      if (isUserDeleted(normalizedUser)) {
+        window.sessionStorage.removeItem(TAB_SESSION_STORAGE_KEY);
+        inMemoryTabUserSnapshot = null;
+        return null;
+      }
       inMemoryTabUserSnapshot = normalizedUser;
       return normalizedUser;
     }
@@ -160,6 +163,19 @@ export function hydrateUserDocument(
   );
   const formattedPhone = sanitizedPhone ? formatPhone(sanitizedPhone) : '';
 
+  const isDeleted = safeRaw.deleted === true || safeRaw.status === 'deleted';
+  const isInactive =
+    !isDeleted &&
+    (safeRaw.inativo === true ||
+      safeRaw.active === false ||
+      safeRaw.status === 'inactive' ||
+      safeRaw.bloqueado === true);
+  const resolvedStatus: UserAccountStatus = isDeleted
+    ? 'deleted'
+    : isInactive
+    ? 'inactive'
+    : 'active';
+
   return {
     ...(safeRaw as User),
     id: String(safeRaw.id || fallbackUid || ''),
@@ -168,6 +184,11 @@ export function hydrateUserDocument(
     email: String(safeRaw.email || ''),
     role: resolvedRole,
     tipoVinculo: resolvedVinculo,
+    deleted: isDeleted,
+    inativo: isDeleted ? true : isInactive,
+    bloqueado: isDeleted ? true : Boolean(safeRaw.bloqueado || isInactive),
+    active: !isDeleted && !isInactive,
+    status: resolvedStatus,
     phone: sanitizedPhone,
     phoneFormatted: formattedPhone,
     whatsappNotificationsEnabled: safeRaw.whatsappNotificationsEnabled !== false,
@@ -202,6 +223,10 @@ function buildDefaultUserDocument(uid: string, email: string, displayName?: stri
     role: 'USUARIO',
     aprovado: true,
     bloqueado: false,
+    inativo: false,
+    active: true,
+    status: 'active',
+    deleted: false,
     blockedDate: '',
     motivoPunicao: '',
     curso: 'GTI',
@@ -242,10 +267,10 @@ export async function loginWithEmail(email: string, pass: string): Promise<User>
       await setDoc(userRef, stripUndefinedFields(userData));
     }
 
-    if (userData.bloqueado || userData.inativo) {
+    if (isUserDeleted(userData)) {
       clearTabUserSession();
       await firebaseSignOut(auth).catch(() => {});
-      throw new Error('Sua conta está bloqueada ou suspensa pela administração.');
+      throw new Error('Este perfil foi excluído do sistema.');
     }
 
     saveTabUserSession(userData);
@@ -318,7 +343,55 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
     const cleanName = String(nome || '').trim().slice(0, 120) || 'Usuário';
     const resolvedCourse: CalendarCourse = curso || 'GTI';
     const resolvedSemester = semestre || 1;
+    const normalizedBirthDate = normalizeDateToISO(dataNascimento) || '2000-01-01';
+    const cleanRa = (ra || '').trim().slice(0, 32);
     const now = Date.now();
+
+    if (isAdminTarget) {
+      const idToken = await createdFirebaseUser.getIdToken(true);
+      const adminRes = await fetch('/api/admin/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          code: submittedCode,
+          nome: cleanName,
+          phone: sanitizedPhone,
+          phoneFormatted: formattedPhone,
+          whatsappNotificationsEnabled: Boolean(whatsappNotificationsEnabled),
+          ra: cleanRa,
+          dataNascimento: normalizedBirthDate,
+        }),
+      });
+
+      const adminBody = (await adminRes.json().catch(() => ({}))) as {
+        success?: boolean;
+        user?: Record<string, unknown>;
+        error?: string;
+      };
+
+      if (!adminRes.ok || !adminBody?.success || !adminBody?.user) {
+        clearTabUserSession();
+        try {
+          await deleteUser(createdFirebaseUser);
+        } catch {
+          await firebaseSignOut(auth).catch(() => {});
+        }
+        const rejectionErr = new Error(
+          adminBody?.error ||
+            'Código de autorização administrativa (code-auth) inválido ou cadastro de novos administradores desativado.'
+        );
+        (rejectionErr as Error & { isDirectMessage?: boolean }).isDirectMessage = true;
+        throw rejectionErr;
+      }
+
+      const adminUserData = hydrateUserDocument(adminBody.user, createdFirebaseUser.uid);
+      saveTabUserSession(adminUserData);
+      return adminUserData;
+    }
 
     const userData: User = {
       id: createdFirebaseUser.uid,
@@ -328,17 +401,19 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
       phone: sanitizedPhone,
       phoneFormatted: formattedPhone,
       whatsappNotificationsEnabled: Boolean(whatsappNotificationsEnabled),
-      ra: (ra || '').trim().slice(0, 32),
+      ra: cleanRa,
       tipoVinculo: resolvedVinculo,
-      dataNascimento: normalizeDateToISO(dataNascimento) || '2000-01-01',
+      dataNascimento: normalizedBirthDate,
       role: resolvedRole,
       aprovado: true,
       bloqueado: false,
+      inativo: false,
+      active: true,
+      status: 'active',
+      deleted: false,
       blockedDate: '',
       motivoPunicao: '',
-      ...(isAdminTarget
-        ? { authCodeSubmitted: submittedCode }
-        : resolvedVinculo === 'SERVIDOR'
+      ...(resolvedVinculo === 'SERVIDOR'
         ? { curso: resolvedCourse, course: resolvedCourse }
         : {
             curso: resolvedCourse,
@@ -358,37 +433,20 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
     await useLogStore
       .getState()
       .addLog({
-        acao: isAdminTarget ? 'CADASTRO_NOVO_ADMIN' : 'CADASTRO_NOVO_USUARIO',
+        acao: 'CADASTRO_NOVO_USUARIO',
         usuarioId: createdFirebaseUser.uid,
         usuarioNome: userData.nome,
         entidade: 'USERS',
-        detalhes: `Novo perfil ${
-          isAdminTarget ? 'ADMINISTRATIVO' : resolvedVinculo
-        } cadastrado (${cleanEmail} · WhatsApp: ${formattedPhone}).`,
+        detalhes: `Novo perfil ${resolvedVinculo} cadastrado (${cleanEmail} · WhatsApp: ${formattedPhone}).`,
       })
       .catch(() => {});
 
     return userData;
   } catch (err: any) {
-    if (
-      createdFirebaseUser &&
-      isAdminTarget &&
-      (err?.code === 'permission-denied' ||
-        String(err?.message || '').toLowerCase().includes('permission') ||
-        String(err?.message || '').toLowerCase().includes('insufficient'))
-    ) {
-      clearTabUserSession();
-      try {
-        await deleteUser(createdFirebaseUser);
-      } catch {
-        await firebaseSignOut(auth).catch(() => {});
-      }
-      throw new Error(
-        'Código de autorização administrativa (code-auth) inválido ou cadastro de novos administradores desativado.'
-      );
-    }
-
     clearTabUserSession();
+    if (err?.isDirectMessage) {
+      throw new Error(err.message);
+    }
     throw new Error(translateAuthError(err?.code, err?.message));
   } finally {
     isRegisteringInTab = false;
@@ -397,10 +455,15 @@ export async function registerWithEmail(payload: SignUpPayload): Promise<User> {
 }
 
 /**
- * Encerra exclusivamente a sessão da aba atual sem impactar outros perfis logados em outras abas.
+ * Encerra exclusivamente a sessão da aba atual sem impactar outros perfis logados em outras abas,
+ * limpando também dados locais temporários de recuperação offline do usuário.
  */
 export async function logoutTabSession(): Promise<void> {
+  const activeUid = auth.currentUser?.uid || loadTabUserSession()?.id || '';
   clearTabUserSession();
+  if (activeUid) {
+    await clearUserRecoveryData(activeUid).catch(() => {});
+  }
   await firebaseSignOut(auth).catch(() => {});
 }
 
@@ -426,8 +489,17 @@ export async function updateUserProfileInFirestore(
     delete sanitizedData.role;
     delete sanitizedData.bloqueado;
     delete sanitizedData.inativo;
+    delete sanitizedData.active;
+    delete sanitizedData.status;
+    delete sanitizedData.deleted;
+    delete sanitizedData.deletedAt;
+    delete sanitizedData.deletedBy;
     delete sanitizedData.aprovado;
     delete sanitizedData.authCodeSubmitted;
+    delete sanitizedData.adminCodeHashProof;
+    delete sanitizedData.blockedDate;
+    delete sanitizedData.punidoAte;
+    delete sanitizedData.motivoPunicao;
     if (sanitizedData.tipoVinculo !== undefined) {
       sanitizedData.tipoVinculo =
         sanitizedData.tipoVinculo === 'SERVIDOR' ? 'SERVIDOR' : 'ALUNO';
@@ -495,7 +567,8 @@ export async function updateUserProfileInFirestore(
 }
 
 /**
- * Inativa o próprio perfil do usuário no Firestore e encerra a sessão apenas na aba atual.
+ * Exclui logicamente (`deleted: true`, `status: 'deleted'`) o próprio perfil do usuário no Firestore,
+ * ocultando-o completamente da lista do ADM e encerrando a sessão apenas na aba atual.
  */
 export async function deactivateCurrentUserProfile(currentUser: User): Promise<void> {
   const now = Date.now();
@@ -507,18 +580,24 @@ export async function deactivateCurrentUserProfile(currentUser: User): Promise<v
         usuarioId: currentUser.id,
         usuarioNome: currentUser.nome,
         entidade: 'USERS',
-        detalhes: `O usuário ${currentUser.nome} (${currentUser.email}) solicitou a exclusão/inativação do próprio perfil.`,
+        detalhes: `O usuário ${currentUser.nome} (${currentUser.email}) excluiu permanentemente o próprio perfil.`,
       })
       .catch(() => {});
 
     const userRef = doc(db, 'users', currentUser.id);
     await updateDoc(userRef, {
+      deleted: true,
+      deletedAt: now,
+      deletedBy: currentUser.id,
+      status: 'deleted',
+      active: false,
       inativo: true,
       bloqueado: true,
       updatedAt: now,
     });
 
     clearTabUserSession();
+    await clearUserRecoveryData(currentUser.id).catch(() => {});
     await firebaseSignOut(auth).catch(() => {});
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.id}`);
@@ -573,11 +652,9 @@ export function subscribeToTabAuthState(callbacks: TabAuthSubscriptionCallbacks)
 
             if (docSnap.exists()) {
               const data = hydrateUserDocument(docSnap.data(), activeUid);
-              if (data.bloqueado || data.inativo) {
+              if (isUserDeleted(data)) {
                 clearTabUserSession();
-                callbacks.onUnauthenticated(
-                  'Sua conta está bloqueada ou inativa pela administração.'
-                );
+                callbacks.onUnauthenticated('Este perfil foi excluído do sistema.');
                 void firebaseSignOut(auth).catch(() => {});
               } else {
                 saveTabUserSession(data);

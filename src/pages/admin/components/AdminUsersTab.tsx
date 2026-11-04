@@ -24,6 +24,8 @@ import {
   ArrowRight,
   UserX,
   UserCheck,
+  Trash2,
+  AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -41,7 +43,15 @@ import { useAdminSettingsStore } from '../../../store/useAdminSettingsStore';
 import { useRoomStore } from '../../../store/useRoomStore';
 import { useLogStore } from '../../../store/useLogStore';
 import { useAuthStore } from '../../../store/useAuthStore';
-import { CalendarCourse, Reservation, User, UserVinculo } from '../../../types';
+import {
+  CalendarCourse,
+  Reservation,
+  User,
+  UserVinculo,
+  isUserDeleted,
+  isUserInactive,
+} from '../../../types';
+import { hydrateUserDocument } from '../../../services/authService';
 import { USER_VINCULO_LABELS } from '../../../constants';
 import { formatNoShowTag } from '../../../services/reservationService';
 import { formatDataBR, getTodayLocalISO, normalizeDateToISO } from '../../../utils/dateUtils';
@@ -80,9 +90,9 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
   const [loading, setLoading] = useState(!externalUsers);
   const [now, setNow] = useState(() => Date.now());
 
-  // Estado do painel `code-auth`
-  const [codeAuthInput, setCodeAuthInput] = useState(authConfig?.codeAuth || '');
-  const [allowAdminSignup, setAllowAdminSignup] = useState(authConfig?.allowAdminSignup ?? true);
+  // Estado do painel `code-auth` (armazenado exclusivamente via hash SHA-256 irreversível)
+  const [codeAuthInput, setCodeAuthInput] = useState('');
+  const [allowAdminSignup, setAllowAdminSignup] = useState(authConfig?.allowAdminSignup ?? false);
   const [showCodeAuth, setShowCodeAuth] = useState(false);
   const [isSavingCodeAuth, setIsSavingCodeAuth] = useState(false);
 
@@ -107,6 +117,10 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
   const [editBloqueado, setEditBloqueado] = useState(false);
   const [isSavingUser, setIsSavingUser] = useState(false);
 
+  // Modal de Exclusão Permanente de Perfil pelo ADM
+  const [deletingUser, setDeletingUser] = useState<User | null>(null);
+  const [isDeletingUser, setIsDeletingUser] = useState(false);
+
   useEffect(() => {
     const unsubCode = fetchAdminAuthConfig();
     const t = setInterval(() => setNow(Date.now()), 15000);
@@ -121,9 +135,21 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
   }, [fetchAdminAuthConfig]);
 
   useEffect(() => {
-    setCodeAuthInput(authConfig?.codeAuth || '');
-    setAllowAdminSignup(authConfig?.allowAdminSignup ?? true);
+    setAllowAdminSignup(authConfig?.allowAdminSignup ?? false);
   }, [authConfig]);
+
+  useEffect(() => {
+    if (!historyUser && !editingUser && !deletingUser) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (historyUser) setHistoryUser(null);
+        else if (editingUser && !isSavingUser) setEditingUser(null);
+        else if (deletingUser && !isDeletingUser) setDeletingUser(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [historyUser, editingUser, deletingUser, isSavingUser, isDeletingUser]);
 
   useEffect(() => {
     if (externalUsers) {
@@ -134,7 +160,11 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
     const unsub = onSnapshot(
       q,
       (snap) => {
-        setInternalUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() } as User)));
+        setInternalUsers(
+          snap.docs
+            .map((d) => hydrateUserDocument(d.data(), d.id))
+            .filter((u) => !isUserDeleted(u))
+        );
         setLoading(false);
       },
       () => setLoading(false)
@@ -176,20 +206,23 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
     };
   }, [historyUser]);
 
-  const users = Array.isArray(externalUsers)
-    ? externalUsers
-    : Array.isArray(internalUsers)
-    ? internalUsers
-    : [];
+  const users = useMemo(() => {
+    const rawList = Array.isArray(externalUsers)
+      ? externalUsers
+      : Array.isArray(internalUsers)
+      ? internalUsers
+      : [];
+    return rawList.filter((u) => Boolean(u) && !isUserDeleted(u));
+  }, [externalUsers, internalUsers]);
 
   const todayISO = useMemo(() => getTodayLocalISO(), [now]);
 
   const filteredUsers = useMemo(() => {
     return users.filter((u) => {
-      if (!u) return false;
+      if (!u || isUserDeleted(u)) return false;
       const normBlocked = u.blockedDate ? normalizeDateToISO(u.blockedDate) : '';
       const isPunished = Boolean(normBlocked && normBlocked >= todayISO);
-      const isBlocked = Boolean(u.bloqueado || u.inativo);
+      const isBlocked = isUserInactive(u);
       const vinculo: UserVinculo =
         u.role === 'ADMIN'
           ? 'COORDENACAO'
@@ -228,7 +261,9 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
         codeAuth: codeAuthInput,
         allowAdminSignup,
       });
-      toast.success('Código de autorização (code-auth) atualizado com sucesso.');
+      setCodeAuthInput('');
+      setShowCodeAuth(false);
+      toast.success('Código de autorização (code-auth) protegido por hash atualizado com sucesso.');
     } catch (err) {
       toast.error(getFriendlyErrorMessage(err, 'Erro ao salvar code-auth.'));
     } finally {
@@ -237,9 +272,15 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
   };
 
   const handleCopyCodeAuth = async () => {
+    if (!codeAuthInput.trim()) {
+      toast.info(
+        'Por segurança, o código salvo permanece criptografado (SHA-256). Gere ou digite um novo código para copiá-lo antes de salvar.'
+      );
+      return;
+    }
     try {
       await navigator.clipboard.writeText(codeAuthInput);
-      toast.success('Código code-auth copiado para a área de transferência.');
+      toast.success('Novo código code-auth copiado para a área de transferência.');
     } catch {
       toast.error('Não foi possível copiar automaticamente.');
     }
@@ -251,12 +292,12 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
     setEditVinculo(u.role === 'ADMIN' ? 'COORDENACAO' : u.tipoVinculo || 'ALUNO');
     setEditCurso(u.curso || 'GTI');
     setEditSemestre(u.semestre || 1);
-    setEditBloqueado(Boolean(u.bloqueado || u.inativo));
+    setEditBloqueado(isUserInactive(u));
   };
 
   const handleToggleUserInactive = async (target: User) => {
     if (!currentUser || target.id === currentUser.id) return;
-    const currentlyInactive = Boolean(target.inativo || target.bloqueado);
+    const currentlyInactive = isUserInactive(target);
     const nextState = !currentlyInactive;
 
     try {
@@ -264,6 +305,8 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
         updateDoc(doc(db, 'users', target.id), {
           inativo: nextState,
           bloqueado: nextState,
+          active: !nextState,
+          status: nextState ? 'inactive' : 'active',
           updatedAt: Date.now(),
         })
       );
@@ -293,6 +336,47 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
     }
   };
 
+  const handleConfirmDeleteUser = async () => {
+    if (!deletingUser || !currentUser || deletingUser.id === currentUser.id) return;
+    setIsDeletingUser(true);
+    const nowTs = Date.now();
+
+    try {
+      await withRetry(() =>
+        updateDoc(doc(db, 'users', deletingUser.id), {
+          deleted: true,
+          deletedAt: nowTs,
+          deletedBy: currentUser.id,
+          status: 'deleted',
+          active: false,
+          inativo: true,
+          bloqueado: true,
+          updatedAt: nowTs,
+        })
+      );
+
+      await useLogStore
+        .getState()
+        .addLog({
+          acao: 'EXCLUIR_USUARIO_ADM',
+          usuarioId: deletingUser.id,
+          usuarioNome: currentUser.nome,
+          entidade: 'USERS',
+          detalhes: `Perfil de ${deletingUser.nome} (${deletingUser.email}) foi excluído da base pelo administrador.`,
+        })
+        .catch(() => {});
+
+      toast.success(`Perfil de ${deletingUser.nome} excluído da lista.`);
+      setDeletingUser(null);
+    } catch (err) {
+      toast.error(
+        getFriendlyErrorMessage(err, 'Não foi possível excluir o perfil do usuário.')
+      );
+    } finally {
+      setIsDeletingUser(false);
+    }
+  };
+
   const handleSaveUserEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingUser || !currentUser) return;
@@ -303,6 +387,8 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
         ra: editRa.trim().slice(0, 32),
         bloqueado: editBloqueado,
         inativo: editBloqueado,
+        active: !editBloqueado,
+        status: editBloqueado ? 'inactive' : 'active',
         updatedAt: Date.now(),
       };
 
@@ -368,7 +454,7 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
               Controle do Código de Autorização para Novos Perfis Administrativos
             </h3>
             <p className="text-xs text-slate-500 max-w-3xl">
-              Este código é exigido e validado diretamente pelas regras de segurança do banco de dados no cadastro de novos coordenadores ou administradores.
+              Armazenado com hash criptográfico SHA-256 irreversível e validado no servidor com proteção contra força bruta.
             </p>
           </div>
 
@@ -389,16 +475,22 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
               type={showCodeAuth ? 'text' : 'password'}
               value={codeAuthInput}
               onChange={(e) => setCodeAuthInput(e.target.value)}
-              minLength={4}
+              minLength={6}
               maxLength={64}
-              required
+              required={!authConfig?.codeHash && allowAdminSignup}
+              placeholder={
+                authConfig?.codeHash
+                  ? `Código ativo (${authConfig.codeMask || '********'}) — digite novo para alterar`
+                  : 'Defina um novo code-auth (mín. 6 caracteres)'
+              }
               aria-label="Código de autorização code-auth"
-              className="w-full pl-4 pr-20 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-mono tabular-nums font-bold text-slate-900 outline-none focus:bg-white focus:ring-2 focus:ring-fatec-red"
+              className="w-full pl-4 pr-20 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-mono tabular-nums font-bold text-slate-900 outline-none focus:bg-white focus:ring-2 focus:ring-fatec-red placeholder:font-sans placeholder:font-normal placeholder:text-xs"
             />
             <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
               <button
                 type="button"
                 onClick={() => setShowCodeAuth((v) => !v)}
+                aria-label={showCodeAuth ? 'Ocultar código' : 'Mostrar código'}
                 className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
                 title={showCodeAuth ? 'Ocultar código' : 'Mostrar código'}
               >
@@ -407,6 +499,7 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
               <button
                 type="button"
                 onClick={handleCopyCodeAuth}
+                aria-label="Copiar código"
                 className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
                 title="Copiar código"
               >
@@ -552,7 +645,7 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                 {filteredUsers.map((u) => {
                   const normBlocked = u.blockedDate ? normalizeDateToISO(u.blockedDate) : '';
                   const isPunished = Boolean(normBlocked && normBlocked >= todayISO);
-                  const isBlocked = Boolean(u.bloqueado || u.inativo);
+                  const isBlocked = isUserInactive(u);
                   const vinculo: UserVinculo =
                     u.role === 'ADMIN'
                       ? 'COORDENACAO'
@@ -678,6 +771,17 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                           >
                             <Edit3 className="h-4 w-4" />
                           </button>
+
+                          {u.id !== currentUser?.id && (
+                            <button
+                              type="button"
+                              onClick={() => setDeletingUser(u)}
+                              className="p-2 text-slate-400 hover:text-fatec-red hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                              title="Excluir perfil da lista"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -724,6 +828,7 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                 </div>
                 <button
                   type="button"
+                  aria-label="Fechar histórico de reservas"
                   onClick={() => setHistoryUser(null)}
                   className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg"
                 >
@@ -856,6 +961,7 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                 </h4>
                 <button
                   type="button"
+                  aria-label="Fechar edição cadastral"
                   onClick={() => setEditingUser(null)}
                   className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg"
                 >
@@ -962,6 +1068,85 @@ export function AdminUsersTab({ externalUsers, onNavigateToModeration }: AdminUs
                   </button>
                 </div>
               </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL: CONFIRMAÇÃO DE EXCLUSÃO DE PERFIL PELO ADM */}
+      <AnimatePresence>
+        {deletingUser && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="modal-admin-delete-user-title"
+          >
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !isDeletingUser && setDeletingUser(null)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-xs"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="relative w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden p-6 space-y-4"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-200 flex items-center justify-center text-fatec-red shrink-0">
+                    <AlertTriangle className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h4
+                      id="modal-admin-delete-user-title"
+                      className="text-base font-bold text-slate-900"
+                    >
+                      Excluir Perfil de Usuário
+                    </h4>
+                    <p className="text-xs text-slate-500">
+                      Esta ação removerá o perfil da listagem administrativa.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Fechar confirmação de exclusão"
+                  disabled={isDeletingUser}
+                  onClick={() => setDeletingUser(null)}
+                  className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Tem certeza que deseja excluir o perfil de{' '}
+                <strong className="text-slate-900">{deletingUser.nome}</strong> (
+                {deletingUser.email})? O registro será marcado como excluído e não aparecerá mais no painel.
+              </p>
+
+              <div className="pt-2 flex justify-end gap-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  disabled={isDeletingUser}
+                  onClick={() => setDeletingUser(null)}
+                  className="px-4 py-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={isDeletingUser}
+                  onClick={handleConfirmDeleteUser}
+                  className="px-5 py-2.5 text-xs font-semibold bg-fatec-red hover:bg-red-800 text-white rounded-xl cursor-pointer disabled:opacity-50"
+                >
+                  {isDeletingUser ? 'Excluindo...' : 'Confirmar Exclusão'}
+                </button>
+              </div>
             </motion.div>
           </div>
         )}

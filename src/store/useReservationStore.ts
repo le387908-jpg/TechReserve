@@ -13,10 +13,12 @@ import {
   doc,
   query,
   getDoc,
+  getDocFromServer,
   orderBy,
+  runTransaction,
 } from 'firebase/firestore';
 import { db } from '../services/firebase/config';
-import { Reservation, User } from '../types';
+import { Reservation, User, isUserDeleted, isUserInactive } from '../types';
 import {
   OperationType,
   getFriendlyErrorMessage,
@@ -44,6 +46,9 @@ import {
   notifyReservationCancelled,
   notifyReservationConfirmed,
 } from '../services/whatsappService';
+import { buildAvailableSlotId } from './useAvailableSlotsStore';
+import { syncUserActiveReservationsToLocal } from '../services/offlineRecoveryService';
+import { useConnectivityStore } from './useConnectivityStore';
 import { toast } from 'sonner';
 
 interface ReservationState {
@@ -59,6 +64,10 @@ interface ReservationState {
   hideForUser: (id: string) => Promise<void>;
   deleteReservation: (id: string) => Promise<void>;
   processMissedCheckIns: () => Promise<void>;
+  reconcileServerReservation: (
+    id: string,
+    serverData: Record<string, unknown> | null
+  ) => void;
 
   scanningResId: string | null;
   setScanningResId: (id: string | null) => void;
@@ -100,6 +109,13 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           } as Reservation;
         });
         set({ reservations, loading: false, initialized: true, error: null });
+        const activeUid = useAuthStore.getState().user?.id;
+        if (activeUid) {
+          const isOfflineNow = !useConnectivityStore.getState().isReachable;
+          void syncUserActiveReservationsToLocal(activeUid, reservations, isOfflineNow).then(
+            () => useConnectivityStore.getState().refreshPendingCounts(activeUid)
+          );
+        }
       },
       (error) => {
         try {
@@ -122,6 +138,11 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
     const { user } = useAuthStore.getState();
     if (!user) {
       throw new Error('Autenticação necessária para realizar agendamentos.');
+    }
+    if (isUserDeleted(user) || isUserInactive(user)) {
+      throw new Error(
+        'Perfil inativado pelo ADM, caso tenha dúvidas procure o coordenador do curso para mais informações'
+      );
     }
     const isAdmin = user.role === 'ADMIN';
     let verifiedAvailableSlotId: string | undefined = resData.availableSlotId;
@@ -225,20 +246,76 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         effectiveResData as unknown as Record<string, unknown>
       );
 
+      const slotLockId = buildAvailableSlotId(
+        String(effectiveResData.salaId || ''),
+        String(effectiveResData.data || ''),
+        String(effectiveResData.inicio || ''),
+        String(effectiveResData.fim || '')
+      );
+
       const docRef = await withRetry(() =>
-        addDoc(
-          collection(db, 'reservas'),
-          stripUndefinedFields({
-            ...cleanData,
-            ocultoParaUsuario: false,
-            whatsappConfirmacaoEnviada: false,
-            whatsappLembreteInicioEnviado: false,
-            whatsappAlertaDesocupacaoEnviado: false,
-            whatsappNoShowEnviado: false,
+        runTransaction(db, async (tx) => {
+          const slotLockRef = doc(db, 'slot_locks', slotLockId);
+          const slotLockSnap = await tx.get(slotLockRef);
+
+          if (slotLockSnap.exists()) {
+            const lockedReservaId = String(slotLockSnap.data()?.reservaId || '');
+            if (lockedReservaId) {
+              const lockedResSnap = await tx.get(doc(db, 'reservas', lockedReservaId));
+              if (lockedResSnap.exists()) {
+                const lockedStatus = String(lockedResSnap.data()?.status || '');
+                if (lockedStatus === 'PENDENTE' || lockedStatus === 'CONFIRMADA') {
+                  const conflictErr = new Error(
+                    'Este horário acabou de ser reservado por outro usuário. Selecione outro bloco disponível.'
+                  );
+                  (conflictErr as Error & { isDirectConflict?: boolean }).isDirectConflict = true;
+                  throw conflictErr;
+                }
+              }
+            }
+          }
+
+          if (!isAdmin && verifiedAvailableSlotId) {
+            const slotRef = doc(db, 'available_slots', verifiedAvailableSlotId);
+            const slotSnap = await tx.get(slotRef);
+            if (!slotSnap.exists() || slotSnap.data()?.ativo === false) {
+              const closedErr = new Error(
+                'Este horário não está mais liberado para agendamento. Atualize a grade e tente novamente.'
+              );
+              (closedErr as Error & { isDirectConflict?: boolean }).isDirectConflict = true;
+              throw closedErr;
+            }
+          }
+
+          const newResRef = doc(collection(db, 'reservas'));
+          tx.set(
+            newResRef,
+            stripUndefinedFields({
+              ...cleanData,
+              ocultoParaUsuario: false,
+              whatsappConfirmacaoEnviada: false,
+              whatsappLembreteInicioEnviado: false,
+              whatsappAlertaDesocupacaoEnviado: false,
+              whatsappNoShowEnviado: false,
+              createdAt: now,
+              updatedAt: now,
+            })
+          );
+
+          tx.set(slotLockRef, {
+            id: slotLockId,
+            salaId: String(effectiveResData.salaId || ''),
+            data: String(effectiveResData.data || ''),
+            inicio: String(effectiveResData.inicio || ''),
+            fim: String(effectiveResData.fim || ''),
+            reservaId: newResRef.id,
+            usuarioId: String(effectiveResData.usuarioId || user.id),
             createdAt: now,
             updatedAt: now,
-          })
-        )
+          });
+
+          return newResRef;
+        })
       );
 
       if (user) {
@@ -318,7 +395,10 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
           }
         })();
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.isDirectConflict) {
+        throw err;
+      }
       handleFirestoreError(err, OperationType.CREATE, 'reservas');
     }
   },
@@ -327,6 +407,11 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
     const { user } = useAuthStore.getState();
     if (!user) {
       throw new Error('Autenticação necessária.');
+    }
+    if (isUserDeleted(user) || isUserInactive(user)) {
+      throw new Error(
+        'Perfil inativado pelo ADM, caso tenha dúvidas procure o coordenador do curso para mais informações'
+      );
     }
     let target = get().reservations.find((r) => r.id === id);
     if (!target) {
@@ -464,6 +549,11 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
     if (!user) {
       throw new Error('Autenticação necessária.');
     }
+    if (isUserDeleted(user) || isUserInactive(user)) {
+      throw new Error(
+        'Perfil inativado pelo ADM, caso tenha dúvidas procure o coordenador do curso para mais informações'
+      );
+    }
     const target = get().reservations.find((r) => r.id === id);
     if (user.role !== 'ADMIN' && target && target.usuarioId !== user.id) {
       throw new Error('Você só pode realizar check-in na sua própria reserva.');
@@ -497,7 +587,12 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
   hideForUser: async (id) => {
     const { user } = useAuthStore.getState();
     const target = get().reservations.find((r) => r.id === id);
-    if (!user || (user.role !== 'ADMIN' && target && target.usuarioId !== user.id)) {
+    if (
+      !user ||
+      isUserDeleted(user) ||
+      isUserInactive(user) ||
+      (user.role !== 'ADMIN' && target && target.usuarioId !== user.id)
+    ) {
       throw new Error('Permissão insuficiente.');
     }
 
@@ -540,12 +635,49 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
     }
   },
 
+  reconcileServerReservation: (id, serverData) => {
+    set((state) => {
+      const current = Array.isArray(state.reservations) ? state.reservations : [];
+      if (!serverData) {
+        return { reservations: current.filter((r) => r.id !== id) };
+      }
+      const hydrated: Reservation = {
+        ...(serverData as unknown as Reservation),
+        id,
+        salaId: String(serverData.salaId || ''),
+        salaNome: String(serverData.salaNome || ''),
+        usuarioId: String(serverData.usuarioId || ''),
+        data: String(serverData.data || ''),
+        inicio: String(serverData.inicio || ''),
+        fim: String(serverData.fim || ''),
+        status: (serverData.status as Reservation['status']) || 'PENDENTE',
+      };
+      const idx = current.findIndex((r) => r.id === id);
+      if (idx === -1) {
+        return { reservations: [hydrated, ...current] };
+      }
+      const next = [...current];
+      next[idx] = hydrated;
+      return { reservations: next };
+    });
+  },
+
   processMissedCheckIns: async () => {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    const connectivity = useConnectivityStore.getState();
+    if (
+      !connectivity.isReachable ||
+      connectivity.status !== 'CONECTADO' ||
+      connectivity.pendingCheckInsCount > 0
+    ) {
+      return;
+    }
+
     const rawReservations = get().reservations;
     const reservations = Array.isArray(rawReservations) ? rawReservations : [];
-    const now = Date.now();
+    const now = connectivity.getOfficialNow();
     const { user: currentUser } = useAuthStore.getState();
-    if (!currentUser) return;
+    if (!currentUser || isUserDeleted(currentUser) || isUserInactive(currentUser)) return;
 
     // 1. Conclui automaticamente reservas confirmadas (com check-in realizado) cujo horário de término já passou
     const completedCandidates = reservations.filter((r) => {
@@ -587,6 +719,22 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         }
 
         if (res.observacoes === 'Reserva ADM' || res.observacoes === 'Reserva Administrativa') {
+          continue;
+        }
+
+        // Reconfirma diretamente no servidor Firestore antes de aplicar No-Show (evita falso-positivo pós-queda de rede)
+        const serverResSnap = await getDocFromServer(doc(db, 'reservas', res.id));
+        if (!serverResSnap.exists()) {
+          continue;
+        }
+        const serverResData = serverResSnap.data();
+        const officialNow = useConnectivityStore.getState().getOfficialNow();
+        if (
+          serverResData.status !== 'PENDENTE' ||
+          serverResData.checkInRealizado === true ||
+          typeof serverResData.checkInExpiracao !== 'number' ||
+          serverResData.checkInExpiracao >= officialNow
+        ) {
           continue;
         }
 

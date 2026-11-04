@@ -17,7 +17,7 @@ import {
   UserCheck,
   XCircle,
 } from 'lucide-react';
-import { Room } from '../../types';
+import { Room, isUserInactive } from '../../types';
 import { useAuthStore } from '../../store/useAuthStore';
 import { useAvailableSlotsStore } from '../../store/useAvailableSlotsStore';
 import { useReservationStore } from '../../store/useReservationStore';
@@ -63,9 +63,12 @@ export function RoomSlotSelector({
   selectedEndTime,
   onSelectSlot,
   onSelectDate,
+  disabledByUserRule = false,
   isAdmin = false,
 }: RoomSlotSelectorProps) {
   const currentUser = useAuthStore((state) => state.user);
+  const isInactiveUser = isUserInactive(currentUser);
+  const isSlotBookingDisabled = !isAdmin && (disabledByUserRule || isInactiveUser);
   const rawAvailableSlots = useAvailableSlotsStore((state) => state.slots);
   const slotsLoading = useAvailableSlotsStore((state) => state.loading);
   const rawReservations = useReservationStore((state) => state.reservations);
@@ -328,6 +331,7 @@ export function RoomSlotSelector({
 
             const isSelected =
               isLiberado &&
+              !isSlotBookingDisabled &&
               selectedStartTime === slot.inicio &&
               selectedEndTime === slot.fim;
             const isSelectedByAdmin =
@@ -338,10 +342,10 @@ export function RoomSlotSelector({
               selectedStartTime === slot.inicio &&
               selectedEndTime === slot.fim;
 
-            // Horários Liberados (`LIBERADO`) e `Sua Reserva` (`OCUPADO_RESERVA_PROPRIA`) permitem clique
+            // Horários Liberados (`LIBERADO`) só permitem seleção se o usuário estiver ativo e apto
             const canSelectForBooking = isAdmin
               ? !isAula && !isReservaOutro && !isReservaPropria
-              : isLiberado;
+              : isLiberado && !isSlotBookingDisabled;
             const canClick = canSelectForBooking || isReservaPropria;
 
             return (
@@ -367,8 +371,10 @@ export function RoomSlotSelector({
                   'w-full px-3.5 py-2.5 rounded-xl text-left transition-colors flex items-center justify-between gap-3',
                   (isSelected || isSelectedByAdmin)
                     ? 'bg-slate-900 border-2 border-slate-900 text-white cursor-pointer'
-                    : isLiberado
+                    : isLiberado && !isSlotBookingDisabled
                     ? 'bg-amber-50/50 hover:bg-amber-50 border-2 border-amber-400 hover:border-amber-500 text-slate-900 cursor-pointer'
+                    : isLiberado && isSlotBookingDisabled
+                    ? 'bg-amber-50/30 border-2 border-amber-300/70 text-slate-500 opacity-60 cursor-not-allowed'
                     : isReservaPropria
                     ? 'bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-300 text-emerald-950 cursor-pointer'
                     : isAula

@@ -10,41 +10,41 @@ import {
   QrCode, 
   X, 
   CheckCircle2,
-  AlertCircle,
   Bell
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useReservationStore } from '../store/useReservationStore';
 import { useAuthStore } from '../store/useAuthStore';
 import { useRoomStore } from '../store/useRoomStore';
+import { useConnectivityStore } from '../store/useConnectivityStore';
+import { isUserInactive } from '../types';
 import { formatNoShowTag } from '../services/reservationService';
 import { formatDataBR, getTodayLocalISO } from '../utils/dateUtils';
 import { getFriendlyErrorMessage } from '../services/firebase/utils';
 import { QRScanner } from './QRScanner';
 import { toast } from 'sonner';
-import { cn } from '../lib/utils';
 
 export function GlobalAlert() {
   const { user } = useAuthStore();
-  const { 
-    reservations, 
-    updateReservation, 
-    checkIn, 
-    scanningResId, 
+  const {
+    reservations,
+    updateReservation,
+    scanningResId,
     setScanningResId,
-    processMissedCheckIns
+    processMissedCheckIns,
   } = useReservationStore();
   const { rooms } = useRoomStore();
-  
-  const [now, setNow] = useState(Date.now());
+  const getOfficialNow = useConnectivityStore((s) => s.getOfficialNow);
+  const isInactiveUser = isUserInactive(user);
+
+  const [now, setNow] = useState(() => getOfficialNow());
 
   useEffect(() => {
     const interval = setInterval(() => {
-      const currentTime = Date.now();
-      setNow(currentTime);
+      setNow(getOfficialNow());
     }, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [getOfficialNow]);
 
   const safeReservations = useMemo(
     () => (Array.isArray(reservations) ? reservations.filter(Boolean) : []),
@@ -56,12 +56,16 @@ export function GlobalAlert() {
   );
 
   useEffect(() => {
+    if (isInactiveUser) {
+      if (scanningResId) setScanningResId(null);
+      return;
+    }
     void Promise.resolve(processMissedCheckIns()).catch(() => {});
     const interval = setInterval(() => {
       void Promise.resolve(processMissedCheckIns()).catch(() => {});
     }, 5000);
     return () => clearInterval(interval);
-  }, [processMissedCheckIns]);
+  }, [processMissedCheckIns, isInactiveUser, scanningResId, setScanningResId]);
 
   // Verifica punição de No-Show estritamente para o usuário logado e apenas na data de hoje (Regra do Dia Faltante)
   const todayISO = useMemo(() => getTodayLocalISO(), [now]);
@@ -79,7 +83,7 @@ export function GlobalAlert() {
 
   // Find pending check-in (within 5-minute check-in window)
   const pendingCheckInRes = useMemo(() => {
-    if (!user?.id || user?.role !== 'USUARIO' || activePunishmentRes) return null;
+    if (!user?.id || user?.role !== 'USUARIO' || isInactiveUser || activePunishmentRes) return null;
     return safeReservations.find(
       (r) =>
         r?.usuarioId === user.id &&
@@ -88,11 +92,11 @@ export function GlobalAlert() {
         (r.checkInExpiracao as number) > now &&
         (r.checkInExpiracao as number) - now <= 5 * 60 * 1000
     );
-  }, [safeReservations, user, now, activePunishmentRes]);
+  }, [safeReservations, user, now, isInactiveUser, activePunishmentRes]);
 
   // Find active ongoing confirmed/checked-in reservation today
   const activeConfirmedRes = useMemo(() => {
-    if (!user?.id) return null;
+    if (!user?.id || isInactiveUser) return null;
     const todayStr = getTodayLocalISO();
     return safeReservations.find(
       (r) =>
@@ -101,7 +105,7 @@ export function GlobalAlert() {
         Boolean(r?.checkInRealizado) &&
         r?.data === todayStr
     );
-  }, [safeReservations, user]);
+  }, [safeReservations, user, isInactiveUser]);
 
   const activeConfirmedTimeLeft = useMemo(() => {
     if (
@@ -195,50 +199,7 @@ export function GlobalAlert() {
     return null;
   }, [safeReservations, user, now]);
 
-  const handleScan = async (scannedRoomId: string) => {
-    if (!scanningResId) return;
-
-    const res = safeReservations.find((r) => r?.id === scanningResId);
-    if (!res) return;
-
-    const room = safeRooms.find((r) => r?.firestoreId === res.salaId);
-    if (!room) return;
-
-    const safeScanned = String(scannedRoomId || '').trim();
-    let normalizedScanned = safeScanned;
-    if (safeScanned.startsWith('TECHRESERVE:')) {
-      const parts = safeScanned.split(':');
-      normalizedScanned = parts[2] ? safeScanned.substring(13) : parts[1] || '';
-    }
-
-    if (res.checkInRealizado || res.status === 'CONFIRMADA') {
-      toast.error('erro no check-in, código QR incompatível com sua reserva atual', {
-        icon: <AlertCircle className="h-5 w-5 text-fatec-red" />,
-      });
-      setScanningResId(null);
-      return;
-    }
-
-    if (
-      normalizedScanned === room.id ||
-      normalizedScanned === room.codigo ||
-      normalizedScanned === room.firestoreId
-    ) {
-      try {
-        await checkIn(res.id);
-        toast.success('Check-in realizado com sucesso!', {
-          icon: <CheckCircle2 className="h-5 w-5 text-emerald-500" />,
-        });
-        setScanningResId(null);
-      } catch (err) {
-        toast.error(getFriendlyErrorMessage(err, 'Erro ao realizar check-in.'));
-      }
-    } else {
-      toast.error('erro ao realizar check-in, Código QR inválido para esta sala', {
-        icon: <AlertCircle className="h-5 w-5 text-fatec-red" />,
-      });
-    }
-  };
+  // A validação e gravação do check-in ocorrem de forma única e autoritativa no servidor via QRScanner -> /api/checkin.
 
   const handleCancel = async (id: string) => {
     try {
@@ -294,8 +255,11 @@ export function GlobalAlert() {
   return (
     <>
       <AnimatePresence>
-        {scanningResId && (
-          <QRScanner onScan={handleScan} onClose={() => setScanningResId(null)} />
+        {scanningResId && !isInactiveUser && (
+          <QRScanner
+            reservationId={scanningResId}
+            onClose={() => setScanningResId(null)}
+          />
         )}
       </AnimatePresence>
 
@@ -310,6 +274,8 @@ export function GlobalAlert() {
             {activePunishmentRes ? (
               <div className="overflow-hidden rounded-2xl bg-red-50 border border-red-100 relative">
                 <button 
+                  type="button"
+                  aria-label="Fechar alerta"
                   onClick={handleDismiss}
                   className="absolute top-2 right-2 p-1.5 text-white/70 hover:text-white transition-colors z-10 cursor-pointer"
                 >
@@ -384,6 +350,8 @@ export function GlobalAlert() {
             ) : pendingCheckInRes ? (
               <div className="overflow-hidden rounded-2xl bg-amber-50 border border-amber-100 relative">
                 <button 
+                  type="button"
+                  aria-label="Fechar alerta"
                   onClick={handleDismiss}
                   className="absolute top-2 right-2 p-1.5 text-white/50 hover:text-white transition-colors z-10"
                 >
@@ -430,6 +398,8 @@ export function GlobalAlert() {
             ) : activeConfirmedRes && activeConfirmedTimeLeft > 0 ? (
               <div className="overflow-hidden rounded-2xl bg-[#1A1A1A] border border-neutral-800 relative text-white">
                 <button 
+                  type="button"
+                  aria-label="Fechar alerta"
                   onClick={handleDismiss}
                   className="absolute top-2 right-2 p-1.5 text-white/50 hover:text-white transition-colors z-10"
                 >
@@ -464,6 +434,8 @@ export function GlobalAlert() {
             ) : adminReminderRes ? (
               <div className="overflow-hidden rounded-2xl bg-slate-900 text-white border border-slate-800 relative">
                 <button 
+                  type="button"
+                  aria-label="Fechar alerta"
                   onClick={handleDismiss}
                   className="absolute top-2 right-2 p-1.5 text-white/50 hover:text-white transition-colors z-10"
                 >

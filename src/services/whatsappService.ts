@@ -16,6 +16,7 @@ import { formatDataBR } from '../utils/dateUtils';
 import { formatPhoneMask, toWhatsAppApiPhone } from '../utils/phoneUtils';
 import { useLogStore } from '../store/useLogStore';
 import { useAdminSettingsStore } from '../store/useAdminSettingsStore';
+import { buildAuthenticatedJsonHeaders } from './apiClient';
 import {
   calculateCheckInDeadline,
   CHECKIN_TOLERANCE_MINUTES,
@@ -151,9 +152,10 @@ export async function getWhatsAppGatewayStatus(
 
   try {
     const query = resolvedInstance ? `?instance=${encodeURIComponent(resolvedInstance)}` : '';
+    const authHeaders = await buildAuthenticatedJsonHeaders();
     const res = await fetch(`/api/whatsapp/status${query}`, {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      headers: authHeaders,
       signal: controller.signal,
     });
 
@@ -197,9 +199,10 @@ export async function connectWhatsAppGateway(options?: {
   const resolvedInstance = getConfiguredInstanceName(options?.instanceName);
 
   try {
+    const authHeaders = await buildAuthenticatedJsonHeaders();
     const res = await fetch('/api/whatsapp/connect', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: authHeaders,
       body: JSON.stringify({
         ...(options || {}),
         instanceName: resolvedInstance,
@@ -246,9 +249,10 @@ export async function disconnectWhatsAppGateway(
 }> {
   const resolvedInstance = getConfiguredInstanceName(instanceName);
   try {
+    const authHeaders = await buildAuthenticatedJsonHeaders();
     const res = await fetch('/api/whatsapp/disconnect', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: authHeaders,
       body: JSON.stringify({ instanceName: resolvedInstance }),
     });
     const data = await res.json().catch(() => ({}));
@@ -350,12 +354,10 @@ export async function sendWhatsAppMessage(
   });
 
   try {
+    const authHeaders = await buildAuthenticatedJsonHeaders();
     const response = await fetch(targetEndpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
+      headers: authHeaders,
       body: JSON.stringify({
         to: apiPhone,
         message: payload.message,
@@ -369,8 +371,13 @@ export async function sendWhatsAppMessage(
     const contentType = response.headers.get('content-type') || '';
     const isHtmlFallback = !contentType.includes('application/json');
 
-    // Fallback direto para `${VITE_WHATSAPP_API_URL}/message/sendText/${instanceName}` em hospedagem puramente estática
-    if ((response.status === 404 || isHtmlFallback) && !customEndpoint && ENV_DIRECT_API_URL) {
+    // Fallback direto permitido apenas em desenvolvimento local explícito sem rotas /api/*
+    if (
+      (response.status === 404 || isHtmlFallback) &&
+      !customEndpoint &&
+      Boolean(viteEnv.DEV) &&
+      Boolean(ENV_DIRECT_API_URL)
+    ) {
       clearTimeout(timeoutId);
       const directController = new AbortController();
       const directTimeout = setTimeout(() => directController.abort(), REQUEST_TIMEOUT_MS);

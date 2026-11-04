@@ -9,7 +9,8 @@ import { Users, ShieldAlert, LayoutDashboard } from 'lucide-react';
 import { collection, onSnapshot, query, orderBy } from 'firebase/firestore';
 import { db } from '../../services/firebase/config';
 import { useAuth } from '../../context/AuthContext';
-import { User } from '../../types';
+import { User, isUserDeleted } from '../../types';
+import { hydrateUserDocument } from '../../services/authService';
 import { AdminUsersTab } from '../admin/components/AdminUsersTab';
 import { AdminModerationTab } from '../admin/components/AdminModerationTab';
 import { ErrorBoundary } from '../../components/ErrorBoundary';
@@ -34,7 +35,11 @@ export function UsuariosPage() {
     const unsub = onSnapshot(
       q,
       (snap) => {
-        setUsers(snap.docs.map((d) => ({ id: d.id, ...d.data() } as User)));
+        setUsers(
+          snap.docs
+            .map((d) => hydrateUserDocument(d.data(), d.id))
+            .filter((u) => !isUserDeleted(u))
+        );
       },
       (err) => {
         console.warn('Users page listener warning:', err);

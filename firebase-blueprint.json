@@ -19,6 +19,11 @@
         "aprovado": { "type": "boolean" },
         "bloqueado": { "type": "boolean" },
         "inativo": { "type": "boolean" },
+        "active": { "type": "boolean", "description": "Whether the user profile is active (false when inactivated by ADM)" },
+        "status": { "type": "string", "enum": ["active", "inactive", "deleted"], "description": "Lifecycle status of the user profile" },
+        "deleted": { "type": "boolean", "description": "Soft-delete flag when user deletes own profile or is deleted by ADM" },
+        "deletedAt": { "type": "number" },
+        "deletedBy": { "type": "string", "maxLength": 128 },
         "blockedDate": { "type": "string", "maxLength": 16, "description": "Single ISO date YYYY-MM-DD blocked due to No-Show or single-day restriction" },
         "punidoAte": { "type": "number" },
         "motivoPunicao": { "type": "string", "maxLength": 500 },
@@ -29,7 +34,8 @@
         "course": { "type": "string", "enum": ["GTI", "GEEE"] },
         "semestre": { "type": "number" },
         "semester": { "type": "number" },
-        "authCodeSubmitted": { "type": "string", "maxLength": 64 }
+        "authCodeSubmitted": { "type": "string", "maxLength": 64 },
+        "adminCodeHashProof": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" }
       },
       "required": ["id", "nome", "email", "role", "aprovado", "bloqueado", "createdAt", "updatedAt"]
     },
@@ -75,7 +81,9 @@
         "status": { "type": "string", "enum": ["PENDENTE", "CONFIRMADA", "CANCELADA", "CONCLUIDA", "PUNIDA"] },
         "checkInExpiracao": { "type": "number" },
         "checkInRealizado": { "type": "boolean" },
-        "observacoes": { "type": "string", "maxLength": 500 },
+        "checkInTimestamp": { "type": "number" },
+        "checkInMethod": { "type": "string", "maxLength": 40 },
+        "observacoes": { "type": "string", "maxLength": 600 },
         "blockedDate": { "type": "string", "maxLength": 16 },
         "punicaoMotivo": { "type": "string", "maxLength": 500 },
         "punicaoFim": { "type": "number" },
@@ -144,16 +152,17 @@
     },
     "AdminAuthSettings": {
       "title": "AdminAuthSettings",
-      "description": "Protected administrative authorization code (code-auth) configuration",
+      "description": "Protected administrative authorization code (code-auth) stored strictly as SHA-256 hash",
       "type": "object",
       "properties": {
-        "codeAuth": { "type": "string", "minLength": 4, "maxLength": 64 },
+        "codeHash": { "type": "string", "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+        "codeMask": { "type": "string", "minLength": 1, "maxLength": 64 },
         "allowAdminSignup": { "type": "boolean" },
         "updatedAt": { "type": "number" },
         "updatedBy": { "type": "string", "maxLength": 128 },
         "updatedByName": { "type": "string", "maxLength": 120 }
       },
-      "required": ["codeAuth", "allowAdminSignup", "updatedAt", "updatedBy", "updatedByName"]
+      "required": ["codeHash", "codeMask", "allowAdminSignup", "updatedAt", "updatedBy", "updatedByName"]
     },
     "WhatsAppIntegrationSettings": {
       "title": "WhatsAppIntegrationSettings",
@@ -175,14 +184,31 @@
       "description": "Immutable governance audit trail record",
       "type": "object",
       "properties": {
-        "acao": { "type": "string", "maxLength": 80 },
+        "acao": { "type": "string", "maxLength": 100 },
         "usuarioId": { "type": "string", "maxLength": 128 },
         "usuarioNome": { "type": "string", "maxLength": 120 },
         "entidade": { "type": "string", "enum": ["USERS", "SALAS", "RESERVAS", "PUNIDAS", "HORARIOS", "SISTEMA", "CHAMADOS", "WHATSAPP"] },
-        "detalhes": { "type": "string", "maxLength": 800 },
+        "detalhes": { "type": "string", "maxLength": 1000 },
         "createdAt": { "type": "number" }
       },
       "required": ["acao", "usuarioId", "usuarioNome", "entidade", "detalhes", "createdAt"]
+    },
+    "SlotLock": {
+      "title": "SlotLock",
+      "description": "Deterministic transactional slot lock preventing concurrent double-booking of the same room, date, and time window",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "salaId": { "type": "string", "maxLength": 128 },
+        "data": { "type": "string", "maxLength": 16 },
+        "inicio": { "type": "string", "maxLength": 8 },
+        "fim": { "type": "string", "maxLength": 8 },
+        "reservaId": { "type": "string", "maxLength": 128 },
+        "usuarioId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "salaId", "data", "inicio", "fim", "reservaId", "usuarioId", "createdAt", "updatedAt"]
     },
     "AvailableSlot": {
       "title": "AvailableSlot",
@@ -212,6 +238,7 @@
     "/users/{userId}": { "schema": "User", "description": "User profiles with academic enrollment, WhatsApp contact, and single-day no-show moderation status" },
     "/salas/{salaId}": { "schema": "Room", "description": "Academic spaces inventory (classrooms, laboratories, auditoriums) with ADM booking release controls" },
     "/available_slots/{slotId}": { "schema": "AvailableSlot", "description": "Explicitly ADM-released room/date time slots enabling student/user bookings" },
+    "/slot_locks/{lockId}": { "schema": "SlotLock", "description": "Transactional slot lock preventing concurrent double-booking" },
     "/reservas/{reservaId}": { "schema": "Reservation", "description": "Space bookings, QR check-in deadlines, weekly quota tracking, and WhatsApp notification flags" },
     "/schedules/{scheduleId}": { "schema": "ScheduleDocument", "description": "Operational time windows, standard blocks, and date exceptions" },
     "/punishments/{punishmentId}": { "schema": "Punishment", "description": "Single-day No-Show suspensions and manual date restrictions" },

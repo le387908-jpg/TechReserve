@@ -179,13 +179,17 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
     const now = Date.now();
 
     try {
+      const nextInactiveState = Boolean(bloquearConta);
       // 1. Atualiza o perfil do usuário com a data exata do bloqueio (sem suspensão por múltiplos dias)
       await withRetry(() =>
         updateDoc(doc(db, 'users', targetUser.id), {
           blockedDate: normalizedBlockedDate,
           punidoAte: null,
           motivoPunicao: cleanReason,
-          bloqueado: Boolean(bloquearConta),
+          bloqueado: nextInactiveState,
+          inativo: nextInactiveState,
+          active: !nextInactiveState,
+          status: nextInactiveState ? 'inactive' : 'active',
           updatedAt: now,
         })
       );
@@ -252,6 +256,9 @@ export const usePunishmentStore = create<PunishmentState>((set) => ({
           punidoAte: null,
           motivoPunicao: '',
           bloqueado: false,
+          inativo: false,
+          active: true,
+          status: 'active',
           updatedAt: now,
         })
       );

@@ -23,7 +23,7 @@ import {
   ExternalLink
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { CalendarEvent, Room, User as UserType } from '../../../types';
+import { CalendarEvent, Room, User as UserType, isUserInactive } from '../../../types';
 import { getFriendlyErrorMessage } from '../../../services/firebase/utils';
 import { cn } from '../../../lib/utils';
 import { toast } from 'sonner';
@@ -57,6 +57,7 @@ export function EventDetailModal({
   const isGrade = event.tipo === 'AULA_GRADE';
   const isReserva = event.tipo === 'RESERVA_USUARIO';
   const isAdmin = currentUser?.role === 'ADMIN';
+  const isInactiveUser = isUserInactive(currentUser);
   const isOwner = currentUser && event.usuarioId === currentUser.id;
   const canUserBookRoom =
     isAdmin ||
@@ -82,6 +83,10 @@ export function EventDetailModal({
 
   const handleCancel = async () => {
     if (!event?.reservationId || !onCancelReservation) return;
+    if (!isAdmin && isInactiveUser) {
+      toast.error('Perfil inativado pelo ADM. Cancelamentos estão bloqueados.');
+      return;
+    }
     setIsProcessing(true);
     try {
       await onCancelReservation(event.reservationId);
@@ -350,9 +355,11 @@ export function EventDetailModal({
                   {isReserva && !isAdmin && isOwner && onCancelReservation && (
                     <button
                       type="button"
-                      disabled={isProcessing}
-                      onClick={() => setConfirmAction('cancel')}
-                      className="px-4 py-2.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-fatec-red border border-rose-200 text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer"
+                      disabled={isProcessing || isInactiveUser}
+                      onClick={() => {
+                        if (!isInactiveUser) setConfirmAction('cancel');
+                      }}
+                      className="px-4 py-2.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-fatec-red border border-rose-200 text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <XCircle className="h-4 w-4" />
                       Cancelar Minha Reserva

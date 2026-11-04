@@ -10,7 +10,7 @@ import { db } from '../services/firebase/config';
 import { hydrateUserDocument } from '../services/authService';
 import { useAuthStore } from '../store/useAuthStore';
 import { useReservationStore } from '../store/useReservationStore';
-import { User } from '../types';
+import { User, isUserDeleted, isUserInactive } from '../types';
 import { createSafeLocalDateTime, getTodayLocalISO } from '../utils/dateUtils';
 import {
   canReceiveWhatsAppAlerts,
@@ -67,7 +67,7 @@ export function useWhatsAppReservationAlerts(): void {
   const userCacheRef = useRef<Map<string, { profile: User; expiresAt: number }>>(new Map());
 
   useEffect(() => {
-    if (!user?.id) return;
+    if (!user?.id || isUserDeleted(user) || isUserInactive(user)) return;
     let disposed = false;
 
     const resolveTargetUser = async (usuarioId: string): Promise<User | null> => {
