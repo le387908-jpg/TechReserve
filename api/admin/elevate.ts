@@ -1,4 +1,4 @@
-import { processAdminRegistration } from '../../server/adminAuthHandler';
+import { processAdminRegistration } from '../_server/adminAuthHandler.ts';
 
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {

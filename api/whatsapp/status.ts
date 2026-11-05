@@ -1,4 +1,4 @@
-import { handleProtectedWhatsAppStatus } from '../../server/whatsappHttpHandlers';
+import { handleProtectedWhatsAppStatus } from '../_server/whatsappHttpHandlers.ts';
 
 export default async function handler(req: any, res: any) {
   if (req.method !== 'GET') {

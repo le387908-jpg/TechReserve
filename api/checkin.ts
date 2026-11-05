@@ -1,4 +1,4 @@
-import { processServerQrCheckIn } from '../server/checkInHandler';
+import { processServerQrCheckIn } from './_server/checkInHandler.ts';
 
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {

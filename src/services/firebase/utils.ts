@@ -92,14 +92,28 @@ export function getFriendlyErrorMessage(
 ): string {
   if (!error) return fallbackMessage;
 
-  const rawMessage =
-    error instanceof Error
-      ? error.message
-      : typeof error === 'string'
-      ? error
-      : typeof (error as { message?: unknown })?.message === 'string'
-      ? String((error as { message?: unknown }).message)
-      : '';
+  let rawMessage = '';
+  if (error instanceof Error) {
+    rawMessage = error.message;
+  } else if (typeof error === 'string') {
+    rawMessage = error;
+  } else if (typeof error === 'object' && error !== null) {
+    const errObj = error as Record<string, unknown>;
+    if (typeof errObj.message === 'string' && errObj.message.trim()) {
+      rawMessage = errObj.message.trim();
+    } else if (errObj.error && typeof errObj.error === 'object' && errObj.error !== null) {
+      const nested = errObj.error as Record<string, unknown>;
+      if (typeof nested.message === 'string' && nested.message.trim()) {
+        rawMessage = nested.message.trim();
+      } else if (typeof nested.code === 'string' && nested.code.trim()) {
+        rawMessage = nested.code.trim();
+      }
+    } else if (typeof errObj.error === 'string' && errObj.error.trim()) {
+      rawMessage = errObj.error.trim();
+    } else if (typeof errObj.reason === 'string' && errObj.reason.trim()) {
+      rawMessage = errObj.reason.trim();
+    }
+  }
 
   if (!rawMessage.trim()) return fallbackMessage;
 

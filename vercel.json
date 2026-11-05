@@ -1,4 +1,9 @@
 {
+  "functions": {
+    "api/**/*.ts": {
+      "includeFiles": "{api/**,server/**,firebase-applet-config.json}"
+    }
+  },
   "headers": [
     {
       "source": "/(.*)",

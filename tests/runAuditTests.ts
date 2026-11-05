@@ -42,6 +42,8 @@ import {
   doesCurriculumClassMatchRoom,
   getRoomScheduleSlotsForDate,
 } from '../src/services/reservationService';
+import { extractSafeErrorMessage } from '../src/services/whatsappService';
+import { getFriendlyErrorMessage } from '../src/services/firebase/utils';
 import type { AvailableSlot, PunishmentRecord, Reservation, Room, ScheduleConfig, User } from '../src/types';
 
 interface TestResult {
@@ -555,6 +557,113 @@ async function main(): Promise<void> {
         `Esperado HTTP 401 para ${ep.method} ${ep.path} sem token, recebido ${resp.status}`
       );
     }
+  });
+
+  // 7. Testes de Empacotamento Vercel Serverless, Resolução de Módulos e Prevenção do Erro React #31
+  await runTest('7.1 Rotas Serverless Vercel (/api/whatsapp/*, /api/checkin, /api/admin/*) importam e resolvem handlers sem ERR_MODULE_NOT_FOUND', async () => {
+    const apiWhatsAppSend = await import('../api/whatsapp/send.ts');
+    assert.equal(typeof apiWhatsAppSend.default, 'function', 'api/whatsapp/send.ts deve exportar default handler');
+
+    const apiWhatsAppStatus = await import('../api/whatsapp/status.ts');
+    assert.equal(typeof apiWhatsAppStatus.default, 'function', 'api/whatsapp/status.ts deve exportar default handler');
+
+    const apiWhatsAppConnect = await import('../api/whatsapp/connect.ts');
+    assert.equal(typeof apiWhatsAppConnect.default, 'function', 'api/whatsapp/connect.ts deve exportar default handler');
+
+    const apiWhatsAppDisconnect = await import('../api/whatsapp/disconnect.ts');
+    assert.equal(typeof apiWhatsAppDisconnect.default, 'function', 'api/whatsapp/disconnect.ts deve exportar default handler');
+
+    const apiCheckin = await import('../api/checkin.ts');
+    assert.equal(typeof apiCheckin.default, 'function', 'api/checkin.ts deve exportar default handler');
+
+    const apiAdminRegister = await import('../api/admin/register.ts');
+    assert.equal(typeof apiAdminRegister.default, 'function', 'api/admin/register.ts deve exportar default handler');
+
+    const apiAdminElevate = await import('../api/admin/elevate.ts');
+    assert.equal(typeof apiAdminElevate.default, 'function', 'api/admin/elevate.ts deve exportar default handler');
+
+    const apiReservationsCheckin = await import('../api/reservations/checkin.ts');
+    assert.equal(typeof apiReservationsCheckin.default, 'function', 'api/reservations/checkin.ts deve exportar default handler');
+  });
+
+  await runTest('7.2 Módulos internos em api/_server/*.ts e re-exports em server/*.ts resolvem com extensões completas', async () => {
+    const serverHandlers = await import('../api/_server/whatsappHttpHandlers.ts');
+    assert.equal(typeof serverHandlers.handleProtectedWhatsAppSend, 'function');
+    assert.equal(typeof serverHandlers.handleProtectedWhatsAppStatus, 'function');
+
+    const serverGateway = await import('../api/_server/whatsappGateway.ts');
+    assert.equal(typeof serverGateway.dispatchWhatsAppMessage, 'function');
+    assert.equal(typeof serverGateway.getGatewayStatus, 'function');
+
+    const serverAdmin = await import('../api/_server/firebaseAdmin.ts');
+    assert.equal(typeof serverAdmin.hashAdminAuthCode, 'function');
+
+    // Re-exports de compatibilidade
+    const compatHandlers = await import('../server/whatsappHttpHandlers.ts');
+    assert.equal(typeof compatHandlers.handleProtectedWhatsAppSend, 'function');
+  });
+
+  await runTest('7.3 Prevenção do erro React #31: extractSafeErrorMessage extrai strings seguras de objetos {code, message}', async () => {
+    // 1. Objeto de erro da Vercel quando a função falha
+    const vercelErrorObj = {
+      code: 'FUNCTION_INVOCATION_FAILED',
+      message: "Cannot find module '/var/task/server/whatsappHttpHandlers'",
+    };
+    const extracted1 = extractSafeErrorMessage(vercelErrorObj);
+    assert.equal(typeof extracted1, 'string');
+    assert.ok(extracted1.includes('Cannot find module'));
+    assert.ok(extracted1.includes('FUNCTION_INVOCATION_FAILED'));
+
+    // 2. Objeto encapsulado { error: { code, message } }
+    const nestedVercelError = {
+      error: {
+        code: 'FUNCTION_INVOCATION_FAILED',
+        message: 'Falha interna na execução da função serverless',
+      },
+    };
+    const extracted2 = extractSafeErrorMessage(nestedVercelError);
+    assert.equal(typeof extracted2, 'string');
+    assert.ok(extracted2.includes('Falha interna na execução'));
+
+    // 3. String crua
+    const strError = 'Instância do WhatsApp desconectada.';
+    const extracted3 = extractSafeErrorMessage(strError);
+    assert.equal(extracted3, 'Instância do WhatsApp desconectada.');
+
+    // 4. Instância de Error
+    const errInstance = new Error('Falha de rede ao conectar à Evolution API');
+    const extracted4 = extractSafeErrorMessage(errInstance);
+    assert.equal(extracted4, 'Falha de rede ao conectar à Evolution API');
+
+    // 5. Objeto com reason
+    const reasonObj = { success: false, reason: 'Número sem WhatsApp ativo' };
+    const extracted5 = extractSafeErrorMessage(reasonObj);
+    assert.equal(extracted5, 'Número sem WhatsApp ativo');
+
+    // 6. Null ou undefined
+    const extracted6 = extractSafeErrorMessage(null, 'Mensagem padrão');
+    assert.equal(extracted6, 'Mensagem padrão');
+
+    // 7. String JSON serializada
+    const jsonStr = JSON.stringify({ message: 'Conexão rejeitada pelo gateway' });
+    const extracted7 = extractSafeErrorMessage(jsonStr);
+    assert.equal(extracted7, 'Conexão rejeitada pelo gateway');
+  });
+
+  await runTest('7.4 getFriendlyErrorMessage sanitiza objetos de erro técnicos sem retornar payload bruto ou quebrar UI', async () => {
+    const errorObj = {
+      error: {
+        code: 'permission-denied',
+        message: 'Missing or insufficient permissions.',
+      },
+    };
+    const friendly = getFriendlyErrorMessage(errorObj);
+    assert.equal(typeof friendly, 'string');
+    assert.ok(friendly.includes('permissão'));
+
+    const networkErr = { message: 'Failed to fetch' };
+    const friendlyNet = getFriendlyErrorMessage(networkErr);
+    assert.ok(friendlyNet.includes('conexão'));
   });
 
   const failed = results.filter((r) => !r.passed);

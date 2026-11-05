@@ -38,7 +38,7 @@ import {
   sanitizePhone,
   validatePhone,
 } from '../../utils/formatters';
-import { sendTestWhatsAppAlert } from '../../services/whatsappService';
+import { extractSafeErrorMessage, sendTestWhatsAppAlert } from '../../services/whatsappService';
 import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { EditProfileModal } from '../../components/profile/EditProfileModal';
 import { WhatsAppGatewayCard } from '../../components/admin/WhatsAppGatewayCard';
@@ -204,12 +204,15 @@ export function ConfiguracoesPage() {
       } else {
         console.error('[Configurações][Teste WhatsApp] Falha no disparo:', result);
         toast.error(
-          result.reason || 'Falha ao enviar mensagem de teste via Evolution API. Verifique o console para detalhes.'
+          extractSafeErrorMessage(
+            result.reason,
+            'Falha ao enviar mensagem de teste via Evolution API. Verifique o console para detalhes.'
+          )
         );
       }
-      } catch (err) {
+    } catch (err) {
       console.error('[Configurações][Teste WhatsApp] Exceção:', err);
-      toast.error(getFriendlyErrorMessage(err, 'Erro ao validar alerta WhatsApp.'));
+      toast.error(extractSafeErrorMessage(err, 'Erro ao validar alerta WhatsApp.'));
     } finally {
       setTestingWhatsApp(false);
     }

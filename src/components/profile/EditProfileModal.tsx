@@ -25,7 +25,7 @@ import {
   sanitizePhone,
   validatePhone,
 } from '../../utils/formatters';
-import { sendTestWhatsAppAlert } from '../../services/whatsappService';
+import { extractSafeErrorMessage, sendTestWhatsAppAlert } from '../../services/whatsappService';
 import { getFriendlyErrorMessage } from '../../services/firebase/utils';
 import { cn } from '../../lib/utils';
 
@@ -134,12 +134,15 @@ export function EditProfileModal({ isOpen, onClose }: EditProfileModalProps) {
       } else {
         console.error('[Perfil][Teste WhatsApp] Falha no disparo:', res);
         toast.error(
-          res.reason || 'Falha ao disparar teste de WhatsApp via Evolution API.'
+          extractSafeErrorMessage(
+            res.reason,
+            'Falha ao disparar teste de WhatsApp via Evolution API.'
+          )
         );
       }
-      } catch (err) {
+    } catch (err) {
       console.error('[Perfil][Teste WhatsApp] Exceção:', err);
-      toast.error(getFriendlyErrorMessage(err, 'Erro ao validar alerta de WhatsApp.'));
+      toast.error(extractSafeErrorMessage(err, 'Erro ao validar alerta de WhatsApp.'));
     } finally {
       setTestingAlert(false);
     }

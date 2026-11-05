@@ -67,6 +67,83 @@ const ENV_DEFAULT_INSTANCE = String(viteEnv.VITE_WHATSAPP_INSTANCE || 'techreser
 // Tolerância de 50s para absorver eventual cold-start do provedor externo (ex.: Render)
 const REQUEST_TIMEOUT_MS = 50000;
 
+/**
+ * Garante que qualquer erro (mesmo objetos com chaves { code, message }, erros de função Vercel,
+ * instâncias de Error ou strings serializadas) seja convertido em uma string segura e legível
+ * para exibição em componentes React e toasts sem disparar o erro React #31.
+ */
+export function extractSafeErrorMessage(
+  err: unknown,
+  fallback = 'Ocorreu um erro inesperado.'
+): string {
+  if (err === null || err === undefined) return fallback;
+
+  if (typeof err === 'string') {
+    const trimmed = err.trim();
+    if (!trimmed) return fallback;
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return extractSafeErrorMessage(parsed, fallback);
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+
+  if (err instanceof Error) {
+    return extractSafeErrorMessage(err.message, fallback);
+  }
+
+  if (typeof err === 'object') {
+    const obj = err as Record<string, unknown>;
+
+    // Suporte específico a objetos de erro Vercel Serverless: { error: { code, message } }
+    if (obj.error && typeof obj.error === 'object') {
+      return extractSafeErrorMessage(obj.error, fallback);
+    }
+    if (typeof obj.error === 'string' && obj.error.trim()) {
+      return extractSafeErrorMessage(obj.error, fallback);
+    }
+
+    // Suporte a objetos com code e message: { code: '...', message: '...' }
+    if (typeof obj.message === 'string' && obj.message.trim()) {
+      const msg = obj.message.trim();
+      if (typeof obj.code === 'string' && obj.code.trim()) {
+        return `${obj.code}: ${msg}`;
+      }
+      return msg;
+    }
+
+    if (typeof obj.reason === 'string' && obj.reason.trim()) {
+      return obj.reason.trim();
+    }
+    if (obj.reason && typeof obj.reason === 'object') {
+      return extractSafeErrorMessage(obj.reason, fallback);
+    }
+
+    if (typeof obj.details === 'string' && obj.details.trim()) {
+      return obj.details.trim();
+    }
+
+    if (typeof obj.code === 'string' && obj.code.trim()) {
+      return obj.code.trim();
+    }
+
+    try {
+      const json = JSON.stringify(obj);
+      if (json && json !== '{}') {
+        return json.length > 200 ? `${json.slice(0, 197)}...` : json;
+      }
+    } catch {
+      // Ignora erro de serialização
+    }
+  }
+
+  return fallback;
+}
+
 export interface DirectReservationAlertInput {
   phone: string;
   userName: string;
@@ -160,26 +237,36 @@ export async function getWhatsAppGatewayStatus(
     });
 
     const contentType = res.headers.get('content-type') || '';
+    const data = await res.json().catch(() => ({}));
     if (!res.ok || !contentType.includes('application/json')) {
       return {
-        configured: Boolean(ENV_DIRECT_API_URL),
-        provider: 'EVOLUTION',
+        configured: Boolean(data?.configured ?? ENV_DIRECT_API_URL),
+        provider: data?.provider || 'EVOLUTION',
         connected: false,
-        state: ENV_DIRECT_API_URL ? 'ready' : 'unconfigured',
-        instanceName: resolvedInstance,
-        message: 'Serviço de status WhatsApp indisponível.',
+        state: data?.state || (ENV_DIRECT_API_URL ? 'ready' : 'unconfigured'),
+        instanceName: data?.instanceName || resolvedInstance,
+        message: extractSafeErrorMessage(
+          data?.message || data?.error,
+          'Serviço de status WhatsApp indisponível.'
+        ),
       };
     }
 
-    return (await res.json()) as WhatsAppGatewayStatus;
-  } catch {
+    return {
+      ...(data as WhatsAppGatewayStatus),
+      message: data?.message ? extractSafeErrorMessage(data.message) : undefined,
+    };
+  } catch (err) {
     return {
       configured: Boolean(ENV_DIRECT_API_URL),
       provider: 'EVOLUTION',
       connected: false,
       state: 'close',
       instanceName: resolvedInstance,
-      message: 'Não foi possível verificar o status do Gateway WhatsApp no momento.',
+      message: extractSafeErrorMessage(
+        err,
+        'Não foi possível verificar o status do Gateway WhatsApp no momento.'
+      ),
     };
   } finally {
     clearTimeout(timeoutId);
@@ -221,17 +308,34 @@ export async function connectWhatsAppGateway(options?: {
       };
     }
 
-    return (await res.json()) as WhatsAppGatewayConnectResult;
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.success === false) {
+      return {
+        success: false,
+        connected: false,
+        state: data?.state || 'close',
+        instanceName: data?.instanceName || resolvedInstance,
+        error: extractSafeErrorMessage(
+          data?.error || data?.message,
+          `Falha HTTP ${res.status} ao conectar à Evolution API.`
+        ),
+      };
+    }
+
+    return {
+      ...(data as WhatsAppGatewayConnectResult),
+      error: data?.error ? extractSafeErrorMessage(data.error) : undefined,
+    };
   } catch (err) {
     return {
       success: false,
       connected: false,
       state: 'close',
       instanceName: resolvedInstance,
-      error:
-        err instanceof Error
-          ? err.message
-          : 'Tempo limite ou erro de rede ao gerar QR Code do WhatsApp.',
+      error: extractSafeErrorMessage(
+        err,
+        'Tempo limite ou erro de rede ao gerar QR Code do WhatsApp.'
+      ),
     };
   } finally {
     clearTimeout(timeoutId);
@@ -258,12 +362,18 @@ export async function disconnectWhatsAppGateway(
     const data = await res.json().catch(() => ({}));
     return {
       success: Boolean(res.ok && data?.success !== false),
-      message: data?.message || 'Sessão desconectada.',
+      message: extractSafeErrorMessage(
+        data?.message || data?.error,
+        res.ok ? 'Sessão desconectada.' : 'Não foi possível desconectar a sessão no momento.'
+      ),
     };
-  } catch {
+  } catch (err) {
     return {
       success: false,
-      message: 'Não foi possível desconectar a sessão no momento.',
+      message: extractSafeErrorMessage(
+        err,
+        'Não foi possível desconectar a sessão no momento.'
+      ),
     };
   }
 }
@@ -471,8 +581,11 @@ export async function sendWhatsAppMessage(
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok || data?.success === false) {
-      const errorReason =
-        data?.error || `Falha HTTP ${response.status} ao comunicar com a Evolution API.`;
+      const rawError = data?.error || data?.message || data?.details;
+      const errorReason = extractSafeErrorMessage(
+        rawError,
+        `Falha HTTP ${response.status} ao comunicar com a Evolution API.`
+      );
 
       console.error('[WhatsApp][Erro na Resposta da API]', {
         eventType: payload.eventType,

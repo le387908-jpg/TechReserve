@@ -20,6 +20,7 @@ import { toast } from 'sonner';
 import {
   connectWhatsAppGateway,
   disconnectWhatsAppGateway,
+  extractSafeErrorMessage,
   getWhatsAppGatewayStatus,
 } from '../../services/whatsappService';
 import { useAdminSettingsStore } from '../../store/useAdminSettingsStore';
@@ -224,7 +225,7 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
       }
 
       if (!res?.success) {
-        toast.error(res?.error || 'Não foi possível gerar o QR Code no momento.');
+        toast.error(extractSafeErrorMessage(res?.error, 'Não foi possível gerar o QR Code no momento.'));
         return;
       }
 
@@ -255,7 +256,7 @@ export function WhatsAppGatewayCard({ compact = false }: WhatsAppGatewayCardProp
         toast.success('Sessão do aparelho desconectada.');
         await refreshStatus(false, effectiveInstanceName);
       } else {
-        toast.error(res?.message || 'Não foi possível desconectar a sessão.');
+        toast.error(extractSafeErrorMessage(res?.message, 'Não foi possível desconectar a sessão.'));
       }
     } catch (err) {
       console.error('[WhatsAppGatewayCard] Erro ao desconectar sessão:', err);
