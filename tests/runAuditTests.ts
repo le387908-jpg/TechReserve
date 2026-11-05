@@ -612,6 +612,13 @@ async function main(): Promise<void> {
     const adminFirestore = await import('firebase-admin/firestore');
     assert.equal(typeof adminFirestore.getFirestore, 'function');
 
+    // Valida que jwks-rsa carrega jose via CJS sem disparar ERR_REQUIRE_ESM
+    const jwksRsaModule = await import('jwks-rsa');
+    const jwksClientFactory = (typeof jwksRsaModule.default === 'function' ? jwksRsaModule.default : jwksRsaModule) as unknown as (options: { jwksUri: string }) => { getSigningKeys: unknown };
+    assert.equal(typeof jwksClientFactory, 'function', 'jwks-rsa deve exportar fábrica de cliente');
+    const jwksClientInstance = jwksClientFactory({ jwksUri: 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com' });
+    assert.equal(typeof jwksClientInstance.getSigningKeys, 'function');
+
     // Re-exports de compatibilidade
     const compatHandlers = await import('../server/whatsappHttpHandlers.ts');
     assert.equal(typeof compatHandlers.handleProtectedWhatsAppSend, 'function');
