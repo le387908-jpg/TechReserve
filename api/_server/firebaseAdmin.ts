@@ -6,9 +6,12 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { App, cert, getApps, initializeApp, ServiceAccount } from 'firebase-admin/app';
-import { DecodedIdToken, getAuth } from 'firebase-admin/auth';
-import { Firestore, getFirestore } from 'firebase-admin/firestore';
+import type { App, ServiceAccount } from 'firebase-admin/app';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import type { DecodedIdToken } from 'firebase-admin/auth';
+import { getAuth } from 'firebase-admin/auth';
+import type { Firestore } from 'firebase-admin/firestore';
+import { getFirestore } from 'firebase-admin/firestore';
 
 interface AppletFirebaseConfig {
   projectId: string;

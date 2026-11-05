@@ -597,6 +597,20 @@ async function main(): Promise<void> {
 
     const serverAdmin = await import('../api/_server/firebaseAdmin.ts');
     assert.equal(typeof serverAdmin.hashAdminAuthCode, 'function');
+    assert.equal(typeof serverAdmin.verifyFirebaseIdToken, 'function');
+    assert.equal(typeof serverAdmin.authenticateApiRequest, 'function');
+
+    // Valida que firebase-admin/app, auth e firestore importam valores nativos no runtime ESM do Node
+    const adminApp = await import('firebase-admin/app');
+    assert.equal(typeof adminApp.initializeApp, 'function');
+    assert.equal(typeof adminApp.getApps, 'function');
+    assert.equal(typeof adminApp.cert, 'function');
+
+    const adminAuth = await import('firebase-admin/auth');
+    assert.equal(typeof adminAuth.getAuth, 'function');
+
+    const adminFirestore = await import('firebase-admin/firestore');
+    assert.equal(typeof adminFirestore.getFirestore, 'function');
 
     // Re-exports de compatibilidade
     const compatHandlers = await import('../server/whatsappHttpHandlers.ts');
