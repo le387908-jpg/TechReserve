@@ -63,7 +63,7 @@ export function GlobalAlert() {
     void Promise.resolve(processMissedCheckIns()).catch(() => {});
     const interval = setInterval(() => {
       void Promise.resolve(processMissedCheckIns()).catch(() => {});
-    }, 5000);
+    }, 60000);
     return () => clearInterval(interval);
   }, [processMissedCheckIns, isInactiveUser, scanningResId, setScanningResId]);
 

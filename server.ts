@@ -17,6 +17,7 @@ import {
 } from './server/whatsappHttpHandlers.ts';
 import { processServerQrCheckIn } from './server/checkInHandler.ts';
 import { processAdminRegistration } from './server/adminAuthHandler.ts';
+import { processServerReservationExpiration } from './server/expireHandler.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -61,8 +62,15 @@ async function startServer() {
   });
 
   // Endpoint seguro de validação presencial de check-in via QR Code
-  app.post('/api/checkin', async (req, res) => {
+  app.post(['/api/checkin', '/api/reservations/checkin'], async (req, res) => {
     const result = await processServerQrCheckIn(req);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  // Endpoint seguro de processamento e reconciliação de reservas vencidas (No-Show)
+  app.post('/api/reservations/expire', async (req, res) => {
+    const result = await processServerReservationExpiration(req);
     res.setHeader('Cache-Control', 'no-store');
     res.status(result.httpStatus).json(result.body);
   });

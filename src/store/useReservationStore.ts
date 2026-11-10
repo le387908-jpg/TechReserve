@@ -7,13 +7,11 @@ import { create } from 'zustand';
 import {
   collection,
   onSnapshot,
-  addDoc,
   updateDoc,
   deleteDoc,
   doc,
   query,
   getDoc,
-  getDocFromServer,
   orderBy,
   runTransaction,
 } from 'firebase/firestore';
@@ -39,17 +37,21 @@ import {
   verifyAvailableSlotFirestore,
   verifyWeeklyQuotaFirestore,
 } from '../services/reservationService';
-import { createSafeLocalDateTime, formatDataBR } from '../utils/dateUtils';
+import { createSafeLocalDateTime } from '../utils/dateUtils';
 import { hydrateUserDocument } from '../services/authService';
 import {
-  notifyNoShowAutoCancelled,
   notifyReservationCancelled,
   notifyReservationConfirmed,
 } from '../services/whatsappService';
 import { buildAvailableSlotId } from './useAvailableSlotsStore';
 import { syncUserActiveReservationsToLocal } from '../services/offlineRecoveryService';
 import { useConnectivityStore } from './useConnectivityStore';
+import { buildAuthenticatedJsonHeaders } from '../services/apiClient';
 import { toast } from 'sonner';
+
+let isMissedCheckInsInProgress = false;
+let lastMissedCheckInsRun = 0;
+const MISSED_CHECKINS_THROTTLE_MS = 60 * 1000;
 
 interface ReservationState {
   reservations: Reservation[];
@@ -700,7 +702,12 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       }
     }
 
-    // 2. Processa No-Show (ausência de check-in em 5 minutos) aplicando punição EXCLUSIVA para o dia da falta
+    // 2. Processa No-Show de forma segura via backend serverless (`/api/reservations/expire`)
+    const nowMs = Date.now();
+    if (isMissedCheckInsInProgress || nowMs - lastMissedCheckInsRun < MISSED_CHECKINS_THROTTLE_MS) {
+      return;
+    }
+
     const missed = reservations.filter(
       (r) =>
         r &&
@@ -710,155 +717,41 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
         !r.checkInRealizado
     );
 
-    if (missed.length === 0) return;
+    // Se não há reservas vencidas identificadas em memória e o usuário não é admin, evita chamada desnecessária
+    if (missed.length === 0 && currentUser.role !== 'ADMIN') return;
 
-    for (const res of missed) {
-      try {
-        if (currentUser.role !== 'ADMIN' && res.usuarioId !== currentUser.id) {
-          continue;
-        }
+    isMissedCheckInsInProgress = true;
+    lastMissedCheckInsRun = nowMs;
 
-        if (res.observacoes === 'Reserva ADM' || res.observacoes === 'Reserva Administrativa') {
-          continue;
-        }
+    try {
+      const headers = await buildAuthenticatedJsonHeaders();
+      const response = await fetch('/api/reservations/expire', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({}),
+      });
 
-        // Reconfirma diretamente no servidor Firestore antes de aplicar No-Show (evita falso-positivo pós-queda de rede)
-        const serverResSnap = await getDocFromServer(doc(db, 'reservas', res.id));
-        if (!serverResSnap.exists()) {
-          continue;
-        }
-        const serverResData = serverResSnap.data();
-        const officialNow = useConnectivityStore.getState().getOfficialNow();
-        if (
-          serverResData.status !== 'PENDENTE' ||
-          serverResData.checkInRealizado === true ||
-          typeof serverResData.checkInExpiracao !== 'number' ||
-          serverResData.checkInExpiracao >= officialNow
-        ) {
-          continue;
-        }
+      if (response.ok) {
+        const data = (await response.json().catch(() => ({}))) as {
+          success?: boolean;
+          processedCount?: number;
+          message?: string;
+          results?: Array<{ salaNome?: string; data?: string; status?: string }>;
+        };
 
-        const punicaoRef = doc(db, 'users', res.usuarioId);
-        let targetUserName = currentUser.nome;
-        let targetUserEmail = currentUser.email;
-        let targetUserPhone = currentUser.phone || currentUser.phoneFormatted || '';
-        let targetWhatsappEnabled = currentUser.whatsappNotificationsEnabled !== false;
-
-        const userSnap = await withRetry(() => getDoc(punicaoRef), { silent: true });
-        if (userSnap.exists()) {
-          const uDoc = hydrateUserDocument(userSnap.data(), userSnap.id);
-          if (uDoc.role === 'ADMIN') {
-            continue;
-          }
-          targetUserName = uDoc.nome || targetUserName;
-          targetUserEmail = uDoc.email || targetUserEmail;
-          targetUserPhone = uDoc.phone || uDoc.phoneFormatted || targetUserPhone;
-          targetWhatsappEnabled = uDoc.whatsappNotificationsEnabled !== false;
-        }
-
-        const blockedDate = res.data; // Bloqueio estritamente no dia exato da falta (YYYY-MM-DD)
-        const punicaoMotivo = `${formatNoShowTag(
-          blockedDate
-        )} (ausência de check-in presencial via QR Code em 5 minutos)`;
-
-        await withRetry(() =>
-          updateDoc(punicaoRef, {
-            blockedDate,
-            punidoAte: null,
-            motivoPunicao: punicaoMotivo,
-            updatedAt: now,
-          })
-        );
-
-        // Dispara aviso de No-Show via Evolution API (`/message/sendText/{instance}`) antes de concluir a marcação
-        let noShowDelivered = Boolean(res.whatsappNoShowEnviado);
-        if (!res.whatsappNoShowEnviado) {
-          console.log('[Reservas][WhatsApp No-Show] Disparando alerta de No-Show automático:', {
-            reservaId: res.id,
-            usuarioId: res.usuarioId,
-            sala: res.salaNome,
-            data: res.data,
-          });
-
-          const noShowResult = await notifyNoShowAutoCancelled(
-            {
-              id: res.usuarioId,
-              nome: targetUserName,
-              phone: targetUserPhone,
-              whatsappNotificationsEnabled: targetWhatsappEnabled,
-            },
-            res
-          );
-          noShowDelivered = Boolean(noShowResult.delivered);
-          if (!noShowResult.delivered && !noShowResult.skipped) {
-            console.error(
-              '[Reservas][WhatsApp No-Show] Falha ao enviar alerta de No-Show:',
-              noShowResult
+        if (data.processedCount && data.processedCount > 0) {
+          const firstDetail = data.results?.find((d) => d.status === 'PUNIDA');
+          if (firstDetail) {
+            toast.info(
+              `Reserva em ${firstDetail.salaNome || 'ambiente'} cancelada por ausência (No-Show).`
             );
           }
         }
-
-        await withRetry(() =>
-          updateDoc(doc(db, 'reservas', res.id), {
-            status: 'PUNIDA',
-            updatedAt: now,
-            blockedDate,
-            punicaoMotivo,
-            observacoes: `Reserva cancelada automaticamente por No-Show. ${formatNoShowTag(
-              blockedDate
-            )} (cota semanal liberada para outras datas).`,
-            whatsappNoShowEnviado: noShowDelivered,
-          })
-        );
-
-        try {
-          await addDoc(collection(db, 'punishments'), {
-            usuarioId: res.usuarioId,
-            usuarioNome: targetUserName || 'Usuário',
-            usuarioEmail: targetUserEmail || '',
-            reservaId: res.id,
-            categoriaMotivo: 'NO_SHOW',
-            motivo: punicaoMotivo,
-            blockedDate,
-            dataInicio: now,
-            tipo: 'AUTOMATICA',
-            aplicadoPorId: 'SISTEMA',
-            aplicadoPorNome: 'Sistema (No-Show Automático)',
-            ativa: true,
-          });
-        } catch {
-          // Prossegue mesmo se o histórico secundário falhar
-        }
-
-        await useLogStore
-          .getState()
-          .addLog({
-            acao: 'NO_SHOW_AUTOMATICO',
-            usuarioId: res.usuarioId,
-            usuarioNome: targetUserName || 'SISTEMA',
-            entidade: 'RESERVAS',
-            detalhes: `No-Show em "${res.salaNome}" (${formatDataBR(
-              blockedDate
-            )} às ${res.inicio}). ${formatNoShowTag(
-              blockedDate
-            )}. Cota semanal liberada para outras datas.`,
-          })
-          .catch(() => {});
-
-        toast.error(
-          `Reserva em ${res.salaNome} cancelada por No-Show. ${formatNoShowTag(blockedDate)}.`
-        );
-      } catch (err: any) {
-        if (currentUser && res.usuarioId === currentUser.id) {
-          const isPermissionError =
-            err.message?.includes('permission') || err.code === 'permission-denied';
-          toast.error(
-            isPermissionError
-              ? 'Erro de permissão no cancelamento automático.'
-              : 'Erro ao processar cancelamento automático. Verifique sua conexão.'
-          );
-        }
       }
+    } catch (err) {
+      console.warn('[Reservas] Reconciliação serverless de No-Show indisponível no momento:', err);
+    } finally {
+      isMissedCheckInsInProgress = false;
     }
   },
 }));

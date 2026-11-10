@@ -44,6 +44,7 @@ import {
 } from '../src/services/reservationService';
 import { extractSafeErrorMessage } from '../src/services/whatsappService';
 import { getFriendlyErrorMessage } from '../src/services/firebase/utils';
+import { runExpireTests } from './expireHandler.test';
 import type { AvailableSlot, PunishmentRecord, Reservation, Room, ScheduleConfig, User } from '../src/types';
 
 interface TestResult {
@@ -686,6 +687,8 @@ async function main(): Promise<void> {
     const friendlyNet = getFriendlyErrorMessage(networkErr);
     assert.ok(friendlyNet.includes('conexão'));
   });
+
+  await runExpireTests();
 
   const failed = results.filter((r) => !r.passed);
   console.log(
