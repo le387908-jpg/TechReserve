@@ -32,7 +32,8 @@ import {
   Tv,
   Wind,
   Layers,
-  GraduationCap
+  GraduationCap,
+  Archive
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useNavigate } from 'react-router-dom';
@@ -177,6 +178,8 @@ export function ReservasPage() {
   const deleteReservation = useReservationStore(state => state.deleteReservation);
   const hideForUser = useReservationStore(state => state.hideForUser);
   const setScanningResId = useReservationStore(state => state.setScanningResId);
+  const archiveReservationWithoutPenalty = useReservationStore(state => state.archiveReservationWithoutPenalty);
+  const registerNoShowManual = useReservationStore(state => state.registerNoShowManual);
   
   const rawRooms = useRoomStore(state => state.rooms);
   const fetchRooms = useRoomStore(state => state.fetchRooms);
@@ -203,6 +206,34 @@ export function ReservasPage() {
   const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
   const [confirmingCancelId, setConfirmingCancelId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [confirmingNoShowRes, setConfirmingNoShowRes] = useState<Reservation | null>(null);
+  const [confirmingArchiveRes, setConfirmingArchiveRes] = useState<Reservation | null>(null);
+  const [archiveJustification, setArchiveJustification] = useState('Reserva regularizada administrativamente sem aplicação de falta.');
+  const [regularizingId, setRegularizingId] = useState<string | null>(null);
+
+  const handleArchiveWithoutPenalty = async (res: Reservation) => {
+    setRegularizingId(res.id);
+    try {
+      await archiveReservationWithoutPenalty(res.id, archiveJustification);
+      setConfirmingArchiveRes(null);
+    } catch (err: unknown) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao arquivar reserva.'));
+    } finally {
+      setRegularizingId(null);
+    }
+  };
+
+  const handleRegisterNoShow = async (res: Reservation) => {
+    setRegularizingId(res.id);
+    try {
+      await registerNoShowManual(res.id);
+      setConfirmingNoShowRes(null);
+    } catch (err: unknown) {
+      toast.error(getFriendlyErrorMessage(err, 'Erro ao registrar No-Show.'));
+    } finally {
+      setRegularizingId(null);
+    }
+  };
 
   useEffect(() => {
     if (!isAdmin && scope !== 'MINHAS') {
@@ -629,8 +660,11 @@ export function ReservasPage() {
             const isPending = res.status === 'PENDENTE';
             const isConfirmed = res.status === 'CONFIRMADA';
             const isToday = res.data === todayStr;
-            const canCheckIn = isPending && !isAdmin && isToday && (readyReservations[res.id] || new Date().toTimeString().slice(0, 5) >= (res.inicio || '23:59'));
-            const canCancel = isPending || isConfirmed;
+            const endDateTime = createSafeLocalDateTime(res.data, res.fim);
+            const isPastEndTime = endDateTime.getTime() < Date.now();
+            const isPendingExpired = isPending && isPastEndTime;
+            const canCheckIn = isPending && !isPendingExpired && !isAdmin && isToday && (readyReservations[res.id] || new Date().toTimeString().slice(0, 5) >= (res.inicio || '23:59'));
+            const canCancel = (isPending && !isPendingExpired) || isConfirmed;
             const canManage = !isPending && !isConfirmed;
             const isExpanded = expandedIds.has(res.id);
             const duration = calculateDuration(res.inicio, res.fim);
@@ -767,16 +801,69 @@ export function ReservasPage() {
                       )}
                     </div>
 
-                    {/* CHECK-IN COUNTER FOR USERS */}
-                    {isPending && isToday && !isAdmin && res.checkInExpiracao && (
+                    {/* CHECK-IN COUNTER FOR USERS (APENAS NÃO VENCIDAS) */}
+                    {isPending && !isPendingExpired && isToday && !isAdmin && res.checkInExpiracao && (
                       <CheckInCounter 
                         expiration={res.checkInExpiracao} 
                         onReady={(ready) => handleSetReady(res.id, ready)} 
                       />
                     )}
 
-                    {/* ADMIN CONFIRMATION CARD */}
-                    {isPending && isAdmin && (
+                    {/* VENCIDA: AVISO PARA USUÁRIO COMUM */}
+                    {isPending && isPendingExpired && !isAdmin && (
+                      <div className="mt-2 bg-slate-50 border border-slate-200 text-slate-700 p-3.5 rounded-2xl flex items-center gap-3 animate-in slide-in-from-top-1 duration-200">
+                        <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0" />
+                        <div>
+                          <p className="text-[11px] font-bold text-slate-800">
+                            Prazo de confirmação presencial encerrado
+                          </p>
+                          <p className="text-[10px] text-slate-500 font-medium">
+                            O horário desta reserva já foi ultrapassado. Aguardando regularização pela coordenação/administração.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ADMIN REGULARIZATION CARD PARA RESERVAS VENCIDAS */}
+                    {isPending && isPendingExpired && isAdmin && (
+                      <div className="mt-2 bg-amber-50 border border-amber-200 text-slate-800 p-4 rounded-2xl flex flex-col gap-2.5 animate-in slide-in-from-top-1 duration-200">
+                        <div className="flex items-center gap-2">
+                          <AlertTriangle className="h-4 w-4 text-amber-600" />
+                          <p className="text-[10px] font-black uppercase tracking-widest text-amber-900">
+                            Reserva Vencida — Regularização Administrativa
+                          </p>
+                        </div>
+                        <p className="text-xs font-semibold leading-relaxed text-slate-700">
+                          O horário desta reserva foi encerrado sem confirmação. O botão de confirmação retroativa foi desabilitado por segurança. Como administrador, escolha a forma de regularização:
+                        </p>
+                        <div className="flex flex-col sm:flex-row gap-2 pt-1">
+                          <button
+                            type="button"
+                            disabled={regularizingId === res.id}
+                            onClick={() => {
+                              setArchiveJustification('Reserva regularizada administrativamente sem aplicação de falta.');
+                              setConfirmingArchiveRes(res);
+                            }}
+                            className="flex-1 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 flex items-center justify-center gap-1.5 shadow-xs font-bold disabled:opacity-50"
+                          >
+                            <Archive className="h-3.5 w-3.5 text-slate-500" />
+                            Arquivar sem Falta
+                          </button>
+                          <button
+                            type="button"
+                            disabled={regularizingId === res.id}
+                            onClick={() => setConfirmingNoShowRes(res)}
+                            className="flex-1 bg-amber-600 hover:bg-amber-700 text-white border border-amber-500 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 flex items-center justify-center gap-1.5 shadow-md shadow-amber-600/10 font-bold disabled:opacity-50"
+                          >
+                            <AlertTriangle className="h-3.5 w-3.5 text-white" />
+                            Registrar No-Show
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ADMIN CONFIRMATION CARD (APENAS NÃO VENCIDAS) */}
+                    {isPending && !isPendingExpired && isAdmin && (
                       <div className="mt-2 bg-amber-500 text-white p-4 rounded-2xl flex flex-col gap-2.5 animate-in slide-in-from-top-1 duration-200">
                         <div className="flex items-center gap-2">
                           <Clock className="h-4 w-4 animate-spin-slow text-white" />
@@ -1053,6 +1140,139 @@ export function ReservasPage() {
           })
         )}
       </div>
+
+      {/* MODAL DE REGULARIZAÇÃO: ARQUIVAR SEM FALTA */}
+      <AnimatePresence>
+        {confirmingArchiveRes && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl border border-slate-200 space-y-4"
+            >
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-700">
+                  <Archive className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-slate-900">
+                    Arquivar Reserva sem Falta
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    Regularização administrativa
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-slate-50 border border-slate-100 rounded-2xl p-4 text-xs space-y-1.5 text-slate-600">
+                <p><span className="font-bold text-slate-700">Ambiente:</span> {confirmingArchiveRes.salaNome || 'Sala'}</p>
+                <p><span className="font-bold text-slate-700">Data e Horário:</span> {formatDataBR(confirmingArchiveRes.data)} ({confirmingArchiveRes.inicio} - {confirmingArchiveRes.fim})</p>
+                <p><span className="font-bold text-slate-700">Solicitante:</span> {usersMap[confirmingArchiveRes.usuarioId]?.nome || 'Usuário Fatec'}</p>
+              </div>
+
+              <p className="text-xs text-slate-600 leading-relaxed">
+                A reserva será marcada como <strong className="text-slate-900">CANCELADA</strong> sem qualquer penalidade ou bloqueio ao solicitante e sem disparo de mensagens no WhatsApp.
+              </p>
+
+              <div>
+                <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                  Justificativa Administrativa:
+                </label>
+                <textarea
+                  value={archiveJustification}
+                  onChange={(e) => setArchiveJustification(e.target.value)}
+                  rows={2}
+                  className="w-full text-xs p-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-slate-900 text-slate-800"
+                  placeholder="Informe o motivo da regularização..."
+                />
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={regularizingId === confirmingArchiveRes.id}
+                  onClick={() => setConfirmingArchiveRes(null)}
+                  className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 py-3 rounded-xl text-xs font-bold transition-all"
+                >
+                  Voltar
+                </button>
+                <button
+                  type="button"
+                  disabled={regularizingId === confirmingArchiveRes.id}
+                  onClick={() => handleArchiveWithoutPenalty(confirmingArchiveRes)}
+                  className="flex-1 bg-slate-900 hover:bg-black text-white py-3 rounded-xl text-xs font-bold transition-all shadow-md shadow-slate-900/20 disabled:opacity-50"
+                >
+                  {regularizingId === confirmingArchiveRes.id ? 'Arquivando...' : 'Confirmar Arquivamento'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL DE REGULARIZAÇÃO: REGISTRAR NO-SHOW */}
+      <AnimatePresence>
+        {confirmingNoShowRes && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl border border-rose-200 space-y-4"
+            >
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-2xl bg-rose-50 flex items-center justify-center text-fatec-red">
+                  <AlertTriangle className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-slate-900">
+                    Confirmar Registro de No-Show
+                  </h3>
+                  <p className="text-xs text-rose-600 font-semibold">
+                    Aplicação de penalidade disciplinar
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-rose-50/50 border border-rose-100 rounded-2xl p-4 text-xs space-y-1.5 text-slate-700">
+                <p><span className="font-bold text-slate-900">Ambiente:</span> {confirmingNoShowRes.salaNome || 'Sala'}</p>
+                <p><span className="font-bold text-slate-900">Data e Horário:</span> {formatDataBR(confirmingNoShowRes.data)} ({confirmingNoShowRes.inicio} - {confirmingNoShowRes.fim})</p>
+                <p><span className="font-bold text-slate-900">Solicitante:</span> {usersMap[confirmingNoShowRes.usuarioId]?.nome || 'Usuário Fatec'}</p>
+              </div>
+
+              <div className="bg-amber-50 border border-amber-200 text-amber-900 p-3.5 rounded-2xl text-xs space-y-1 leading-relaxed">
+                <p className="font-bold">Efeitos desta operação:</p>
+                <ul className="list-disc list-inside space-y-0.5 text-[11px] text-amber-800">
+                  <li>O status da reserva será alterado para <strong className="text-amber-950">PUNIDA</strong>.</li>
+                  <li>O solicitante ficará bloqueado para novos agendamentos <strong>estritamente na data {formatDataBR(confirmingNoShowRes.data)}</strong>.</li>
+                  <li>Um alerta institucional de No-Show será disparado via WhatsApp.</li>
+                  <li>O bloqueio da sala será liberado no histórico.</li>
+                </ul>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={regularizingId === confirmingNoShowRes.id}
+                  onClick={() => setConfirmingNoShowRes(null)}
+                  className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 py-3 rounded-xl text-xs font-bold transition-all"
+                >
+                  Voltar / Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={regularizingId === confirmingNoShowRes.id}
+                  onClick={() => handleRegisterNoShow(confirmingNoShowRes)}
+                  className="flex-1 bg-fatec-red hover:bg-red-700 text-white py-3 rounded-xl text-xs font-bold transition-all shadow-md shadow-red-600/20 disabled:opacity-50"
+                >
+                  {regularizingId === confirmingNoShowRes.id ? 'Registrando...' : 'Sim, Registrar No-Show'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

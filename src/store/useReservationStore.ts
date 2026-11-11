@@ -66,6 +66,11 @@ interface ReservationState {
   hideForUser: (id: string) => Promise<void>;
   deleteReservation: (id: string) => Promise<void>;
   processMissedCheckIns: () => Promise<void>;
+  archiveReservationWithoutPenalty: (
+    id: string,
+    justificativa?: string
+  ) => Promise<void>;
+  registerNoShowManual: (id: string) => Promise<void>;
   reconcileServerReservation: (
     id: string,
     serverData: Record<string, unknown> | null
@@ -436,6 +441,16 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       }
     }
 
+    if (data.status === 'CONFIRMADA' && target) {
+      const endMs = createSafeLocalDateTime(target.data, target.fim).getTime();
+      const isPastEndTime = endMs < Date.now();
+      if (isPastEndTime) {
+        throw new Error(
+          'Esta reserva está vencida e não pode ser confirmada retroativamente. Realize a regularização administrativa (Arquivar sem Falta ou Registrar No-Show).'
+        );
+      }
+    }
+
     try {
       const resRef = doc(db, 'reservas', id);
       const cleanData = stripUndefinedFields(data as unknown as Record<string, unknown>);
@@ -497,6 +512,9 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
               if (!ownerProfile) return;
 
               if (data.status === 'CANCELADA') {
+                if ((data as Record<string, unknown>).skipWhatsAppNotification) {
+                  return;
+                }
                 const cancelledBy: 'USUARIO' | 'ADMIN' =
                   user.role === 'ADMIN' && user.id !== snapshotTarget.usuarioId
                     ? 'ADMIN'
@@ -752,6 +770,70 @@ export const useReservationStore = create<ReservationState>((set, get) => ({
       console.warn('[Reservas] Reconciliação serverless de No-Show indisponível no momento:', err);
     } finally {
       isMissedCheckInsInProgress = false;
+    }
+  },
+
+  archiveReservationWithoutPenalty: async (id: string, justificativa?: string) => {
+    const { user } = useAuthStore.getState();
+    if (!user || user.role !== 'ADMIN') {
+      throw new Error('Apenas administradores podem regularizar reservas.');
+    }
+
+    const headers = await buildAuthenticatedJsonHeaders();
+    const response = await fetch('/api/reservations/archive', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        reservationId: id,
+        justificativa:
+          justificativa?.trim() ||
+          'Reserva regularizada administrativamente sem aplicação de falta.',
+      }),
+    });
+
+    const data = (await response.json().catch(() => ({}))) as {
+      success?: boolean;
+      message?: string;
+      code?: string;
+    };
+
+    if (!response.ok) {
+      throw new Error(data.message || 'Falha ao arquivar reserva.');
+    }
+
+    toast.success('Reserva arquivada sem aplicação de falta com sucesso.');
+  },
+
+  registerNoShowManual: async (id: string) => {
+    const { user } = useAuthStore.getState();
+    if (!user || user.role !== 'ADMIN') {
+      throw new Error('Apenas administradores podem registrar No-Show manualmente.');
+    }
+
+    const headers = await buildAuthenticatedJsonHeaders();
+    const response = await fetch('/api/reservations/expire', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        reservationId: id,
+        allowPastDateReview: true,
+      }),
+    });
+
+    const data = (await response.json().catch(() => ({}))) as {
+      success?: boolean;
+      message?: string;
+      code?: string;
+    };
+
+    if (!response.ok) {
+      throw new Error(data.message || 'Falha ao registrar No-Show.');
+    }
+
+    if (data.code === 'ALREADY_PROCESSED' || data.code === 'ALREADY_CONFIRMED') {
+      toast.info(data.message || 'A reserva já havia sido processada anteriormente.');
+    } else {
+      toast.success('No-Show registrado com sucesso. Usuário notificado e ambiente liberado.');
     }
   },
 }));

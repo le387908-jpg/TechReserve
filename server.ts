@@ -18,6 +18,7 @@ import {
 import { processServerQrCheckIn } from './server/checkInHandler.ts';
 import { processAdminRegistration } from './server/adminAuthHandler.ts';
 import { processServerReservationExpiration } from './server/expireHandler.ts';
+import { processServerReservationArchive } from './server/archiveHandler.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +72,13 @@ async function startServer() {
   // Endpoint seguro de processamento e reconciliação de reservas vencidas (No-Show)
   app.post('/api/reservations/expire', async (req, res) => {
     const result = await processServerReservationExpiration(req);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(result.httpStatus).json(result.body);
+  });
+
+  // Endpoint seguro de regularização administrativa: arquivar sem falta
+  app.post('/api/reservations/archive', async (req, res) => {
+    const result = await processServerReservationArchive(req);
     res.setHeader('Cache-Control', 'no-store');
     res.status(result.httpStatus).json(result.body);
   });
